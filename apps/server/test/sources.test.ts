@@ -1325,3 +1325,41 @@ describe('a location that names an arrangement', () => {
     });
   });
 });
+
+/**
+ * Whatever is left after the strippers have run is not automatically a place.
+ *
+ * Arbeitnow writes a fully-remote job's location as "Remote job". Stripping the remote
+ * wording leaves "job", and "job" was stored as the city: a real run has a posting whose
+ * recorded location reads exactly that, shown to the student as where the work is. It also
+ * cost the posting rank, because a remote role that names a city is treated as anchored to
+ * it — so a word that was never a place was pushing a genuinely-anywhere job down the queue.
+ */
+describe('a location that names no place', () => {
+  it('does not record the leftover word as a city', () => {
+    expect(parseLocation('Remote job', true)).toEqual({ remote: true });
+    // The same shape without the feed's flag to lean on.
+    expect(parseLocation('Remote position')).toEqual({ remote: true });
+    expect(parseLocation('Remote opportunity')).toEqual({ remote: true });
+  });
+
+  it('reads "nowhere in particular" as remote rather than as a town', () => {
+    // No flag passed: the words are all there is, and they do say something.
+    expect(parseLocation('Homeoffice')).toEqual({ remote: true });
+    expect(parseLocation('Worldwide')).toEqual({ remote: true });
+    expect(parseLocation('Anywhere')).toEqual({ remote: true });
+    expect(parseLocation('Work from home')).toEqual({ remote: true });
+  });
+
+  it('drops the furniture without dropping the geography beside it', () => {
+    expect(parseLocation('Berlin, Homeoffice')).toEqual({ city: 'Berlin', remote: true });
+  });
+
+  it('does not mistake a place for furniture', () => {
+    // The edge this rule has to stay clear of. These are real towns, and two of them are
+    // one letter from words in the list.
+    expect(parseLocation('Vogt').city).toBe('Vogt');
+    expect(parseLocation('Leer').city).toBe('Leer');
+    expect(parseLocation('York, PA').city).toBe('York');
+  });
+});

@@ -1451,6 +1451,52 @@ const ONSITE_RE = /\b(?:hybrid|on[-\s]?site|in[-\s]?office|vor\s+ort)\b/i;
 const ONSITE_TOKEN =
   /[\s\-–—/|]*[([]?\b(?:hybrid|on[-\s]?site|in[-\s]?office|vor\s+ort)\b[)\]]?[\s\-–—/|]*$/i;
 
+/**
+ * Words a board leaves behind that are furniture, not geography.
+ *
+ * Arbeitnow writes a fully-remote job's location as "Remote job", so stripping the remote
+ * wording left "job" — and "job" was stored as the CITY. The posting then told the student it
+ * was based in a place called job, and once a named city started costing a remote role rank
+ * (see score.ts) it cost this one too, on the strength of a word that was never a place.
+ */
+const NOT_A_PLACE = new Set([
+  'job',
+  'jobs',
+  'position',
+  'positions',
+  'role',
+  'roles',
+  'opening',
+  'openings',
+  'vacancy',
+  'vacancies',
+  'opportunity',
+  'opportunities',
+  'work',
+  'various',
+  'multiple',
+  'unknown',
+  'n/a',
+  'na',
+  'tbd',
+]);
+
+/**
+ * Ways of writing "nowhere in particular", which state remoteness rather than a place.
+ *
+ * The same mistake as NOT_A_PLACE with one addition: these carry the meaning the feed's
+ * `remote` flag would have, so they are read as remoteness before being dropped. German
+ * boards write it "Homeoffice", and a real run has a posting whose recorded city is exactly
+ * that.
+ */
+const ANYWHERE_RE =
+  /^(?:anywhere|worldwide|global(?:ly)?|home[-\s]?office|work\s+from\s+home|wfh)$/i;
+
+/** A part that survived the strippers above without naming a place. */
+function namesNoPlace(part: string): boolean {
+  return NOT_A_PLACE.has(part.toLowerCase()) || ANYWHERE_RE.test(part);
+}
+
 /** The word itself plus the qualifiers boards habitually attach to it. */
 const REMOTE_TOKEN = /\b(?:fully\s+|100%\s+)?remote(?:[- ](?:only|first|work|position|role))?\b/gi;
 
@@ -1594,18 +1640,25 @@ export function parseLocation(
   raw: string,
   remoteHint?: boolean,
 ): { city?: string; region?: string; country?: string; remote: boolean } {
-  // The hint is a board's boolean and the text is the board's own words about the same job.
-  // Where they disagree the words win — see ONSITE_RE. When the text says nothing either way
-  // the hint stands, which is the case it was added for.
   const saysOnsite = ONSITE_RE.test(raw);
-  const remote = saysOnsite ? false : (remoteHint ?? REMOTE_RE.test(raw));
-  const parts = raw
+  const cleaned = raw
     .split(/[,|]/)
     .map((s) => stripRemoteToken(s.trim()).replace(ONSITE_TOKEN, '').trim())
     // A part that was ONLY an arrangement word is not a place. "Austin, TX, Hybrid" used to
     // file "Hybrid" as the country — asCountry drops it — but "Austin, Hybrid" filed it as the
     // REGION, and that is what the posting then claimed to the user.
     .filter((s) => s !== '' && !ONSITE_RE.test(s));
+
+  // The hint is a board's boolean and the text is the board's own words about the same job.
+  // Where they disagree the words win — see ONSITE_RE. When the text says nothing either way
+  // the hint stands, which is the case it was added for.
+  const remote = saysOnsite
+    ? false
+    : (remoteHint ?? (REMOTE_RE.test(raw) || cleaned.some((s) => ANYWHERE_RE.test(s))));
+
+  // Read for remoteness first, dropped as geography second: a string that named nowhere in
+  // particular has now said everything it had to say.
+  const parts = cleaned.filter((s) => !namesNoPlace(s));
 
   // "Berlin, Germany" and "London, UK" are as common on these boards as "Austin, TX", and
   // reading the second part positionally as a region filed the country under region — so a
