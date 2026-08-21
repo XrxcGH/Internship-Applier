@@ -1259,11 +1259,50 @@ export function excludedCompany({ profile, posting }: RuleInput): RuleResult {
   );
 }
 
+/**
+ * A postdoctoral position, which by definition asks for a doctorate somebody has finished.
+ *
+ * Read off the TITLE rather than out of the requirements, because postings for these rarely
+ * bother to state the degree — the word carries it. "Post-doctoral" means after the doctorate;
+ * there is no reading of it that admits an undergraduate.
+ *
+ * This is the only rule in the file that infers a requirement from a title, and it is drawn as
+ * narrowly as the word allows. "Fellow" and "Fellowship" are NOT enough and must not be added:
+ * the Anthropic Fellows Program and a hundred like it are open to exactly the people this
+ * would then hide the list from. An eligibility failure removes a posting from the queue, so
+ * the bar for inferring one is that the word cannot mean anything else.
+ *
+ * Found by running a real search: a postdoctoral fellowship sat in the top fifteen eligible
+ * matches for an undergraduate, with the score breakdown noting "fellowship vs your
+ * entry_intern band" and nothing acting on it.
+ */
+const POSTDOCTORAL = /\bpost[-\s]?doc(?:toral|torate)?\b/i;
+
+export function postdoctoral({ profile, posting }: RuleInput): RuleResult {
+  if (!POSTDOCTORAL.test(posting.title)) {
+    return na('postdoctoral', 'The posting is not a postdoctoral position.');
+  }
+
+  const mine = ACADEMIC_TO_LEVEL[profile.derived.academicLevel] ?? 'none';
+  if (mine === 'doctorate') {
+    return pass('postdoctoral', 'A postdoctoral position, and you have a doctorate.', {
+      evidence: posting.title,
+    });
+  }
+
+  return fail(
+    'postdoctoral',
+    'This is a postdoctoral position, which asks for a doctorate you have not finished.',
+    { evidence: posting.title, profileRef: 'education' },
+  );
+}
+
 export const RULES = [
   postingOpen,
   deadline,
   ageMinimum,
   educationLevel,
+  postdoctoral,
   graduationWindow,
   enrollment,
   workAuthorization,

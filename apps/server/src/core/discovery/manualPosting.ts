@@ -129,6 +129,20 @@ export interface ManualResult {
   notes: string[];
 }
 
+/**
+ * Titles that belong to a LISTING, not to a job.
+ *
+ * `guessTitle` falls back to the page's own `<title>`, which on a search-results page is the
+ * site's furniture. A real run stored a posting called "Jobs search — Google Careers", company
+ * "Google", and it came back as one of fifteen eligible matches — a row naming a role that does
+ * not exist, in a queue the student is meant to work through.
+ *
+ * Only consulted when the page carried no structured JobPosting data, because a page that
+ * states it IS a posting whatever its `<title>` says. The phrases are ones no role is called:
+ * a "Search Engineer" posting is untouched, "job search" as a unit is never a job.
+ */
+const LISTING_TITLE = /\b(?:jobs?\s+search|search\s+jobs?|search\s+results?|job\s+search)\b/i;
+
 export async function fetchManualPosting(url: string): Promise<ManualResult> {
   const notes: string[] = [];
   // A user-directed fetch of a single page. robots.txt still applies.
@@ -141,6 +155,18 @@ export async function fetchManualPosting(url: string): Promise<ManualResult> {
   const companyFromLd =
     typeof ld?.hiringOrganization?.name === 'string' && ld.hiringOrganization.name.trim() !== '';
   const title = ld?.title ?? guessTitle(html) ?? 'Untitled posting';
+
+  /**
+   * A page that does not name one job is not a posting, and storing it as one is a lie the
+   * user then has to spot. Refused rather than kept: `webSearch` counts a refusal against the
+   * candidate, and a hand-pasted URL gets a sentence saying what to paste instead.
+   */
+  if (!titleFromLd && LISTING_TITLE.test(title)) {
+    throw new Error(
+      `That page does not name a single job — its title is "${title.slice(0, 60)}". If it is a ` +
+        'search or results page, open the posting itself and use that address.',
+    );
+  }
   const company = ld?.hiringOrganization?.name ?? guessCompany(url);
   const description = ld?.description ? stripHtml(ld.description) : pageText;
 

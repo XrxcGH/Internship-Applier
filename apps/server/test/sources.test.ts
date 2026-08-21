@@ -1264,3 +1264,64 @@ describe('greenhouse, lever and ashby row safety', () => {
     }
   });
 });
+
+/**
+ * A location string that says somebody has to be there.
+ *
+ * Several boards set a `remote` boolean on anything that is not fully in-office — Arbeitnow
+ * flags a Munich hybrid role remote — and `parseLocation` took that boolean over the words
+ * beside it. So "München (Hybrid)" was stored as remote, scored as well as a job at home for a
+ * student in Half Moon Bay, and six of the fifteen eligible matches in a real run were German
+ * roles that arrived this way.
+ *
+ * The words are the more specific statement about the same job, so where the two disagree the
+ * words win. Where the text says nothing either way the hint still stands, which is the case
+ * it was added for.
+ */
+describe('a location that names an arrangement', () => {
+  it('lets the words overrule a board flag that says remote', () => {
+    expect(parseLocation('München (Hybrid)', true)).toEqual({ city: 'München', remote: false });
+    expect(parseLocation('Austin, TX — Onsite', true)).toEqual({
+      city: 'Austin',
+      region: 'TX',
+      remote: false,
+    });
+  });
+
+  it('keeps the flag when the text says nothing about arrangement', () => {
+    // The case the hint exists for: a bare city on a feed that states remoteness structurally.
+    expect(parseLocation('Berlin', true)).toEqual({ city: 'Berlin', remote: true });
+    expect(parseLocation('Berlin', false)).toEqual({ city: 'Berlin', remote: false });
+  });
+
+  it('does not leave the arrangement word sitting in the place', () => {
+    // The city is what gets shown to the user and matched against where they live. "München
+    // (Hybrid)" and "NY —" are not places.
+    expect(parseLocation('Los Angeles (Hybrid)').city).toBe('Los Angeles');
+    expect(parseLocation('New York, NY — Onsite').region).toBe('NY');
+    // A part that was ONLY an arrangement word is not a place at all. This used to be filed
+    // as the region and reported to the user as one.
+    expect(parseLocation('Austin, Hybrid')).toEqual({ city: 'Austin', remote: false });
+    // And where the word does not sit at the END of its part, so trimming the tail cannot
+    // reach it — "Hybrid work" and "On-site only" are how boards write the same thing.
+    expect(parseLocation('Austin, Hybrid work')).toEqual({ city: 'Austin', remote: false });
+    expect(parseLocation('Austin, On-site only')).toEqual({ city: 'Austin', remote: false });
+    expect(parseLocation('Munich, Vor Ort')).toEqual({ city: 'Munich', remote: false });
+  });
+
+  it('leaves every remote spelling it already read alone', () => {
+    expect(parseLocation('Remote - US')).toEqual({ country: 'US', remote: true });
+    expect(parseLocation('New York, NY or Remote')).toEqual({
+      city: 'New York',
+      region: 'NY',
+      remote: true,
+    });
+    expect(parseLocation('Remote')).toEqual({ remote: true });
+    // Oregon's state code survives, which is the reason stripRemoteToken is careful.
+    expect(parseLocation('Portland, OR')).toEqual({
+      city: 'Portland',
+      region: 'OR',
+      remote: false,
+    });
+  });
+});

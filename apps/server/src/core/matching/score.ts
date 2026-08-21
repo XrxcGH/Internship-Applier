@@ -190,7 +190,35 @@ export function scoreMatch(input: ScoreInput): ScoreOutcome {
   const inTarget = posting.locations.some((l) =>
     relocations.some((t) => (l.city ?? '').toLowerCase().includes(t)),
   );
-  const locationDesirability = inHome ? 1 : isRemote ? 0.9 : inTarget ? 0.8 : 0.4;
+
+  /**
+   * Remote, but tied to a place — which is not the same as remote from anywhere.
+   *
+   * "Remote" used to score 0.9 whatever else the posting said, so a role advertised as
+   * "remote, Leipzig" ranked almost as well for a student in Half Moon Bay as one in Half
+   * Moon Bay. In a real run six of the fifteen eligible matches were German roles that got
+   * there this way, and five of them named a city.
+   *
+   * A posting that names a city has anchored itself to that city. Whether its remote reaches
+   * California is exactly what it has not said — so neither 0.9 nor the 0.4 for somewhere
+   * plainly out of range is honest, and the note says which part is unknown rather than
+   * picking one and asserting it.
+   *
+   * `remoteEligibleIn` is the field that would settle this outright, and two of the eight
+   * sources populate it. When more of them do, it belongs here ahead of this rule.
+   */
+  const anchoredElsewhere =
+    isRemote && !inHome && !inTarget && posting.locations.some((l) => (l.city ?? '').trim() !== '');
+
+  const locationDesirability = inHome
+    ? 1
+    : anchoredElsewhere
+      ? 0.55
+      : isRemote
+        ? 0.9
+        : inTarget
+          ? 0.8
+          : 0.4;
 
   // Undisclosed pay is neutral (0.5), never a penalty — silence is not a low salary.
   const comp = posting.compensation;
@@ -257,11 +285,15 @@ export function scoreMatch(input: ScoreInput): ScoreOutcome {
         : 'position type not stated',
       locationDesirability: inHome
         ? 'in your home city'
-        : isRemote
-          ? 'remote'
-          : inTarget
-            ? 'a relocation target'
-            : 'outside your stated areas',
+        : anchoredElsewhere
+          ? `remote, but based in ${
+              posting.locations.find((l) => (l.city ?? '').trim() !== '')?.city ?? 'another city'
+            } and it does not say where remote is allowed`
+          : isRemote
+            ? 'remote'
+            : inTarget
+              ? 'a relocation target'
+              : 'outside your stated areas',
       compensation:
         comp === null ? 'pay not disclosed — treated as neutral' : 'from the stated pay',
       applyEffort: effort

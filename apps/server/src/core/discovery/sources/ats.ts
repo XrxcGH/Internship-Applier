@@ -1430,6 +1430,27 @@ export const workable: JobSource = {
 
 const REMOTE_RE = /\bremote\b/i;
 
+/**
+ * A location string saying, in so many words, that somebody has to be there.
+ *
+ * Boards attach this to the place: "München (Hybrid)", "Austin, TX — Onsite". It is the more
+ * specific statement than a feed's `remote` boolean, which several boards set on anything not
+ * fully in-office — Arbeitnow flags a Munich hybrid role remote — so where the two disagree
+ * the words win. Read the wrong way round it is not a small error: a hybrid job in Munich
+ * scored as high as one at home for a student in Half Moon Bay, and six of the fifteen
+ * eligible matches in a real run were German roles that had arrived this way.
+ */
+const ONSITE_RE = /\b(?:hybrid|on[-\s]?site|in[-\s]?office|vor\s+ort)\b/i;
+
+/**
+ * The same words where they trail a place, so the CITY does not keep them.
+ *
+ * The separator goes with them. Boards write "New York, NY — Onsite" as often as they use a
+ * comma, and removing only the word left the region recorded as "NY —".
+ */
+const ONSITE_TOKEN =
+  /[\s\-–—/|]*[([]?\b(?:hybrid|on[-\s]?site|in[-\s]?office|vor\s+ort)\b[)\]]?[\s\-–—/|]*$/i;
+
 /** The word itself plus the qualifiers boards habitually attach to it. */
 const REMOTE_TOKEN = /\b(?:fully\s+|100%\s+)?remote(?:[- ](?:only|first|work|position|role))?\b/gi;
 
@@ -1573,11 +1594,18 @@ export function parseLocation(
   raw: string,
   remoteHint?: boolean,
 ): { city?: string; region?: string; country?: string; remote: boolean } {
-  const remote = remoteHint ?? REMOTE_RE.test(raw);
+  // The hint is a board's boolean and the text is the board's own words about the same job.
+  // Where they disagree the words win — see ONSITE_RE. When the text says nothing either way
+  // the hint stands, which is the case it was added for.
+  const saysOnsite = ONSITE_RE.test(raw);
+  const remote = saysOnsite ? false : (remoteHint ?? REMOTE_RE.test(raw));
   const parts = raw
     .split(/[,|]/)
-    .map((s) => stripRemoteToken(s.trim()))
-    .filter(Boolean);
+    .map((s) => stripRemoteToken(s.trim()).replace(ONSITE_TOKEN, '').trim())
+    // A part that was ONLY an arrangement word is not a place. "Austin, TX, Hybrid" used to
+    // file "Hybrid" as the country — asCountry drops it — but "Austin, Hybrid" filed it as the
+    // REGION, and that is what the posting then claimed to the user.
+    .filter((s) => s !== '' && !ONSITE_RE.test(s));
 
   // "Berlin, Germany" and "London, UK" are as common on these boards as "Austin, TX", and
   // reading the second part positionally as a region filed the country under region — so a

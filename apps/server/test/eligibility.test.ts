@@ -1793,6 +1793,72 @@ describe('young applicants are asked, not refused', () => {
 
 // ────────────────────────────────────────────────────────────── properties
 
+/**
+ * A postdoctoral position, for somebody who has not finished a doctorate.
+ *
+ * Found by running a real search: "Postdoctoral Fellow - Applied AI Document Understanding"
+ * sat in the top fifteen ELIGIBLE matches for an undergraduate. The score breakdown even noted
+ * "fellowship vs your entry_intern band" — and nothing acted on it, because postings for these
+ * rarely state the degree in the requirements. The word carries it.
+ *
+ * This is the only rule that infers a requirement from a title, so its edges matter more than
+ * its centre: "Fellow" and "Fellowship" must never trigger it. An eligibility failure removes a
+ * posting from the queue, and the Anthropic Fellows Program is exactly the sort of thing this
+ * student should be seeing.
+ */
+describe('a postdoctoral position', () => {
+  const verdict = (title: string, academicLevel: string) =>
+    statusOf(
+      evaluateEligibility(
+        input({
+          posting: posting({ title }),
+          profile: profile({
+            derived: { ...profile().derived, academicLevel } as ConfirmedProfile['derived'],
+          }),
+        }),
+      ),
+      'postdoctoral',
+    );
+
+  it('is not open to an undergraduate, however it is spelled', () => {
+    for (const title of [
+      'Postdoctoral Fellow - Applied AI Document Understanding',
+      'Post-Doctoral Researcher',
+      'Post Doctoral Associate',
+      'Postdoc, Machine Learning',
+    ]) {
+      expect(verdict(title, 'undergrad'), title).toBe('fail');
+    }
+  });
+
+  it("is not open to a master's student either", () => {
+    expect(verdict('Postdoctoral Fellow', 'masters')).toBe('fail');
+  });
+
+  it('is open to somebody at doctoral level', () => {
+    expect(verdict('Postdoctoral Fellow', 'phd')).toBe('pass');
+  });
+
+  it('says nothing at all about a fellowship that is not a postdoc', () => {
+    // The edge that matters. Widening this to "fellow" would hide the programmes an
+    // undergraduate most wants to see.
+    for (const title of [
+      'Anthropic Fellows Program - ML Systems & Performance',
+      'Research Fellowship',
+      'Summer Fellow, Public Policy',
+      'Software Engineering Intern',
+    ]) {
+      expect(verdict(title, 'undergrad'), title).toBe('not_applicable');
+    }
+  });
+
+  it('does not change the verdict on an ordinary posting', () => {
+    // The rule is inert unless the title says so, which is what keeps it from costing
+    // coverage everywhere else.
+    expect(evaluateEligibility(input()).eligibility).not.toBe('ineligible');
+  });
+});
+
 describe('properties that must always hold', () => {
   const scenarios: RuleInput[] = [
     input(),
