@@ -40,6 +40,9 @@ const REDACTED_PATHS = [
   // their street address coming straight back out of the form. See `PII_KEYS` below.
   'readBack',
   '*.readBack',
+  // The name the student's own file arrived under. See `PII_KEYS` below.
+  'filename',
+  '*.filename',
   // NO `url` PATH HERE, AND THAT IS THE POINT.
   //
   // Some source URLs carry credentials in the query string (Adzuna app_id/app_key), so this
@@ -86,6 +89,26 @@ const PII_KEYS = new Set([
   // the approved answer for an essay field, the street address for an address field. It is
   // the plaintext of the exact columns the rest of this app encrypts.
   'readBack',
+  // The name a resume file arrived under, which is nearly always the applicant's own:
+  // `Eric Dean - Resume 2026.pdf`. routes/resumes.ts logs `{ err, mime, filename }` when a
+  // DOCX or TXT yields no text, so the app's one upload path wrote the student's full name
+  // to stdout in plaintext — the same string `fullName` above is censored for, arriving
+  // under a different key. `resume_document.filename` is the only user-supplied filename in
+  // the app and that warning is the only line that logs one, so this is the whole class.
+  //
+  // This costs less than censoring `url` would have cost, but not nothing, and the honest
+  // version of that is worth writing down. The stored copy is named by the document's id
+  // rather than by this string (`storedResumeFilename`), so a failure that came from reading
+  // the file still names it in `err.path` — but `extractText` throws plain Errors for a
+  // malformed .docx, and on those the line is left identifying the upload by `mime` alone.
+  // The other half belongs at the call site: routes/resumes.ts already has the row's `id` in
+  // scope and should log `documentId: id` beside `mime`, the way its sibling warning at
+  // 'stored resume file is missing' already does.
+  //
+  // The student loses nothing either way. The UI reads the filename from the row, and the
+  // extraction refusal names it back to them in the response. What ends here is the copy in
+  // the log, which is the copy they never asked for.
+  'filename',
 ]);
 
 /**

@@ -72,20 +72,28 @@ export const FormField = z.object({
    * The heading of the block this control sits inside — a fieldset legend, the caption of a
    * history table, the heading of one repeated row — when the scanner can find one.
    *
-   * Not populated yet: nothing sets it, so it is undefined on every field today. Anything
+   * Populated by `formMap.ts` from the nearest legend, caption, aria-label or heading, and
+   * read by `classify.ts`. Still optional: the scanner cannot always find one, and anything
    * reading it must treat undefined as "no container known", never as "this field is at the
-   * top level of the form", because until the scanner fills it that is every field.
+   * top level of the form".
    *
-   * It is declared because a label on its own cannot tell two identical questions apart. The
+   * It exists because a label on its own cannot tell two identical questions apart. The
    * "Start Date" column of a work-history row and the "Start date" this internship asks about
-   * are the same six characters, and the label is all the classifier gets — so a row of the
-   * applicant's employment history receives the date they become available, at 0.92
+   * are the same six characters, and the label was all the classifier got — so a row of the
+   * applicant's employment history received the date they become available, at 0.92
    * confidence, verified by read-back and shown in the review as a field that went right.
    * That is a false statement about their work history in a form submitted in their name. The
    * rules can only disqualify the phrasings that name the container out loud ("Previous
-   * employer start date"); a bare column heading needs to know what it is a column of. The
-   * same gap makes repeated rows indistinguishable from one another, which is why every row
-   * of a repeated table currently receives the same profile value.
+   * employer start date"); a bare column heading has to know what it is a column of.
+   *
+   * The container may only ever DISQUALIFY a semantic, never confer one — a heading is a
+   * single string shared by every control in the block, so letting it satisfy a positive rule
+   * would classify everything under "Previous Employment" as employment whatever its own
+   * label said. See the rule loop in classify.ts.
+   *
+   * What it does NOT yet fix: repeated rows of one table share a section and so are still
+   * indistinguishable from each other, which is why every row of a repeated table receives
+   * the same profile value.
    */
   section: z.string().optional(),
   control: z.enum([

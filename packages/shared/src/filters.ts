@@ -19,8 +19,9 @@ import { z } from 'zod';
  *
  * 1. Every filter is OPTIONAL — nobody has to state a preference to get results. What an
  *    omitted filter falls back to is mostly permissive, but not uniformly, and the
- *    exceptions are deliberate: the term block (summer, 2027) and the internship-and-co-op
- *    position types narrow to the cycle a user is actually applying for. Nothing else here
+ *    exceptions are deliberate: the term block (summer, and the upcoming cycle read from the
+ *    clock — see `upcomingCycleYear`) and the internship-and-co-op position types narrow to
+ *    the cycle a user is actually applying for. Nothing else here
  *    narrows anything by default, because a tool that silently excludes opportunities is
  *    worse than one that shows too many. This rule used to cite `minOverlapWeeks` and the
  *    US `location.countries` default as narrowing too, and neither one narrows anything:
@@ -39,12 +40,60 @@ import { z } from 'zod';
 // ---------------------------------------------------------------- term & timing
 
 export const Season = z.enum(['summer', 'fall', 'winter', 'spring', 'year_round', 'flexible']);
+export type SeasonName = z.infer<typeof Season>;
+
+/** June. The month the summer term begins, as the UTC month index a Date reports. */
+const SUMMER_START_MONTH = 5;
+
+/**
+ * The month each season's term begins. A total Record, so a season added to the enum is a
+ * compile error here rather than one that silently inherits the summer calendar.
+ *
+ * `year_round` and `flexible` name no window, so there is no month at which one of them has
+ * started and nothing to roll over.
+ */
+const SEASON_START_MONTH: Record<SeasonName, number | null> = {
+  summer: SUMMER_START_MONTH,
+  fall: 8, // September
+  winter: 11, // December
+  spring: 0, // January
+  year_round: null,
+  flexible: null,
+};
+
+/**
+ * The cycle a search means when nobody named a year: the next one still worth applying to.
+ *
+ * The year used to be written down — `default([2027])` — so every install searched summer
+ * 2027 for ever. On 1 July 2027 that is a season that has already started and closed its
+ * applications, and the student got an empty queue with nothing on screen saying why. docs/05
+ * said "nothing in the system hardcodes summer or 2027" while this line did.
+ *
+ * The cycle turns over at the TERM'S START rather than when applications typically close
+ * (February for most large programs), because the two mistakes are not symmetric: rolling
+ * over early searches a cycle nobody has posted for yet and finds nothing, while rolling over
+ * at the start of the term keeps the late and rolling postings — exactly the ones a student
+ * searching in April still has a shot at — inside the search.
+ *
+ * The clock is a parameter because a default that drifts with the calendar cannot be tested
+ * by a suite that pins dates, and an untestable date rule is how 2027 came to be a constant.
+ */
+export function upcomingCycleYear(season: SeasonName = 'summer', now: Date = new Date()): number {
+  const startMonth = SEASON_START_MONTH[season] ?? SUMMER_START_MONTH;
+  return now.getUTCMonth() >= startMonth ? now.getUTCFullYear() + 1 : now.getUTCFullYear();
+}
 
 export const TermFilter = z.object({
   /** Empty = any season. */
   seasons: z.array(Season).default(['summer']),
-  /** Empty = any year. Default is the upcoming cycle. */
-  years: z.array(z.number().int()).default([2027]),
+  /**
+   * Empty = any year. The default is the upcoming cycle, READ FROM THE CLOCK.
+   *
+   * A thunk rather than a value: a zod default written as a literal is evaluated once when
+   * the module loads, so even a computed one would freeze at whatever the year was when the
+   * process started. This is parsed per request.
+   */
+  years: z.array(z.number().int()).default(() => [upcomingCycleYear()]),
   durationWeeks: z
     .object({ min: z.number().int().optional(), max: z.number().int().optional() })
     .default({}),

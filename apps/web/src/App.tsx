@@ -203,11 +203,21 @@ function Home({
       <RunningHead
         section="A working dossier"
         gate={profile === 'unconfirmed' ? 'G1' : undefined}
+        /* "Nothing is sent anywhere until you sign for it" was the first sentence of the
+           product and it was not true. Reading a resume sends it to the model; drafting an
+           answer sends the posting's text and the facts behind it. Both are the user's own
+           model access — their Claude subscription or their key — and neither is an employer,
+           but "nowhere" is not what a reader takes from "nothing is sent anywhere", and this
+           is the screen carrying the strongest privacy promise in the app.
+
+           The guarantee that IS true is the one worth making: nothing reaches an EMPLOYER
+           without the user, because no code path can submit. Settings lists what leaves the
+           machine and where it goes. */
         lede={
           <>
             Every filter decision here quotes the job description that caused it. Every drafted
-            sentence points at the fact behind it. <strong>Nothing is sent anywhere</strong> until
-            you sign for it.
+            sentence points at the fact behind it. <strong>Nothing reaches an employer</strong>{' '}
+            until you send it yourself — and what leaves this machine at all is listed in Settings.
           </>
         }
       />

@@ -17,7 +17,14 @@
  * site does not want that, the correct response is to stop and hand control back, which is
  * what `awaiting_user` exists for.
  */
-import { chromium, type BrowserContext, type Frame, type Page, type Route } from 'playwright';
+import {
+  chromium,
+  type BrowserContext,
+  type Frame,
+  type Page,
+  type Response,
+  type Route,
+} from 'playwright';
 import { mkdir } from 'node:fs/promises';
 import { config } from '../../config';
 import { logger } from '../../infra/logger';
@@ -32,9 +39,38 @@ export interface SessionOptions {
   profileDir?: string;
 }
 
+/**
+ * An address Chromium opened a socket to that this tool would never have allowed it to.
+ *
+ * Discovered after the fact, because the browser is the thing that resolves the name. See
+ * `dialledPrivately`.
+ */
+export interface PrivateDial {
+  /** The name in the address bar, which answered a public address when the guard asked it. */
+  host: string;
+  /** The address the document was actually served from. */
+  address: string;
+}
+
 export interface BrowserSession {
   context: BrowserContext;
   page: Page;
+  /**
+   * The first document this session was served from an address on this machine or its
+   * network, or null on every ordinary run.
+   *
+   * Read by run.ts before it reads a page and before it types into one: the request has
+   * already happened by the time this is set, and refusing everything after it is the only
+   * thing left that helps.
+   */
+  privateDial: PrivateDial | null;
+  /**
+   * Resolves once every document response seen so far has been judged.
+   *
+   * A verdict costs a lookup, so it is not in `privateDial` the instant `goto` returns.
+   * Reading the field without awaiting this is a check that passes for the wrong reason.
+   */
+  dialsJudged: () => Promise<void>;
   close: () => Promise<void>;
 }
 
@@ -74,16 +110,129 @@ export function keyDelay(): number {
  * analytics from all over, and a lookup per subresource would be both slow and wrong — a CDN
  * behind a split-horizon DNS is not an attack on anybody.
  */
-async function guardAddress(route: Route, url: string): Promise<void> {
+async function guardAddress(
+  route: Route,
+  url: string,
+  rebound: ReadonlySet<string>,
+): Promise<void> {
   // The suite drives the fixture site on 127.0.0.1, so the guard cannot run here — which is
   // why the DECISION is a separate function with no `config.isTest` in it, and is tested
   // directly. A guard whose only code path is switched off under test is a guard nothing holds.
-  if (!config.isTest && (await blocksNavigation(url))) {
-    logger.warn({ url: scrubUrl(url) }, 'blocked a navigation to a private address');
-    await route.abort('blockedbyclient');
-    return;
+  if (!config.isTest) {
+    // A name that has already served this browser a private address is not asked a second
+    // time. The next lookup is the attacker's to answer, and one relapse is all the evidence
+    // this needs: from here on the request never leaves, which is the outcome the lookup was
+    // only ever trying to reach.
+    const relapsed = rebound.has(hostOf(url));
+    if (relapsed || (await blocksNavigation(url))) {
+      logger.warn(
+        { url: scrubUrl(url), rebound: relapsed },
+        'blocked a navigation to a private address',
+      );
+      await route.abort('blockedbyclient');
+      return;
+    }
   }
   await route.continue();
+}
+
+/** The host of a URL, or '' if it is not one. Never used as a key when it is empty. */
+function hostOf(url: string): string {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * The same question `blocksNavigation` asks, put to the address Chromium ACTUALLY DIALLED.
+ *
+ * `blocksNavigation` resolves the NAME in this process and then hands the name to Chromium,
+ * which resolves it AGAIN with its own resolver a moment later. Nothing pins the answer between
+ * the two, so a host whose DNS the attacker controls answers a public address to the guard and
+ * `127.0.0.1` to the browser — classic rebinding, and the guard will have approved an address
+ * that was never used. infra/http/publicHost.ts names that gap in its own header and closes it
+ * for fetches with `guardedLookup`, which judges the address the connector dials. A browser
+ * takes no lookup hook, so this is the browser's half of the same pair.
+ *
+ * IT CANNOT UN-SEND THE REQUEST, and pretending otherwise would leave the wrong lesson here: by
+ * the time a response has an address behind it, this profile — the persistent one carrying the
+ * student's real logins and LAN cookies — has already made the request. What it stops is
+ * everything after. run.ts refuses the run before the page is read and before a key is pressed,
+ * and `guardAddress` latches the name so the next request to it never leaves at all.
+ *
+ * Asked as a URL because that is the shape the address check takes, and it costs nothing:
+ * `dns.lookup` hands a literal straight back without a network round trip, which is exactly the
+ * property publicHost.ts relies on to catch an address written directly into a link.
+ */
+export async function dialledPrivately(address: string): Promise<boolean> {
+  const url = literalUrl(address);
+  // An address that cannot be written as one is not an address this can vouch for. publicHost.ts
+  // errs the same way on bytes it cannot parse, for the same reason.
+  if (url === null) return true;
+  return blocksNavigation(url);
+}
+
+function literalUrl(address: string): string | null {
+  /**
+   * CHROMIUM HANDS BACK IPv6 ALREADY BRACKETED, AND THIS FAILS CLOSED.
+   *
+   * `response.serverAddr()` reports `{"ipAddress":"127.0.0.1"}` for v4 and
+   * `{"ipAddress":"[::1]"}` for v6 — measured against this repo's own Playwright. Wrapping a
+   * bracketed address again builds `http://[[2606:…]]/`, `new URL` throws, and
+   * `dialledPrivately` takes its fail-closed branch and calls a public employer's page
+   * private. Chromium prefers IPv6 wherever a AAAA record exists, so on an ordinary
+   * dual-stack connection that is not an edge case — it is most fills, refused with a 400
+   * telling the student their employer's careers page is "an address on this machine or its
+   * own network", and no override anywhere.
+   *
+   * publicHost.ts's own header warns about exactly this shape of mistake: a guard that tests
+   * for "the one spelling that never arrives", and over-blocking not being a safe direction.
+   *
+   * The brackets come off BEFORE the zone id is split, not after: a bracketed zoned address
+   * `[fe80::1%eth0]` split first leaves `[fe80::1` — an unclosed bracket that falls back into
+   * the same fail-closed branch this exists to stop.
+   */
+  const unbracketed = address.trim().replace(/^\[(.*)\]$/, '$1');
+  // A zone id names an interface rather than an address, and no URL parser will take one.
+  const bare = unbracketed.split('%')[0] ?? '';
+  try {
+    return new URL(`http://${bare.includes(':') ? `[${bare}]` : bare}/`).href;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Records the first document served from an address this tool refuses.
+ *
+ * Only documents, matching the route guard: a careers page legitimately loads fonts and
+ * analytics from all over, and where the SITE the student's browser visits lives is the whole
+ * question.
+ */
+async function noteDial(
+  session: BrowserSession,
+  response: Response,
+  rebound: Set<string>,
+): Promise<void> {
+  // The first one is enough. run.ts refuses on it, and a refused run reads nothing further.
+  if (session.privateDial) return;
+
+  // A response with no socket behind it — served from the cache, or by a service worker — says
+  // nothing about where this browser dialled, and inventing a verdict from it would stop runs
+  // on ordinary pages.
+  const addr = await response.serverAddr().catch(() => null);
+  if (!addr) return;
+  if (!(await dialledPrivately(addr.ipAddress))) return;
+
+  const host = hostOf(response.url());
+  session.privateDial = { host, address: addr.ipAddress };
+  if (host) rebound.add(host);
+  logger.warn(
+    { url: scrubUrl(response.url()), address: addr.ipAddress },
+    'a document was served from a private address by a name that resolved public',
+  );
 }
 
 /**
@@ -114,6 +263,9 @@ export async function openSession(opts: SessionOptions = {}): Promise<BrowserSes
     // file's header and docs/07 promise not to do. It was here, and it made those
     // promises false. The browser identifies as automated because it is.
   });
+
+  /** Names this session has already been served a private address by. See `guardAddress`. */
+  const rebound = new Set<string>();
 
   /**
    * The sourcing policy, enforced at the network layer rather than at the call site.
@@ -149,20 +301,44 @@ export async function openSession(opts: SessionOptions = {}): Promise<BrowserSes
       void route.abort('blockedbyclient');
       return;
     }
-    void guardAddress(route, request.url());
+    void guardAddress(route, request.url(), rebound);
   });
 
   const page = context.pages()[0] ?? (await context.newPage());
 
-  logger.info({ headless: opts.headless ?? false, profileDir }, 'browser session opened');
+  /** Every verdict so far, in order, so `dialsJudged` can be awaited rather than hoped over. */
+  let judged: Promise<void> = Promise.resolve();
 
-  return {
+  const session: BrowserSession = {
     context,
     page,
+    privateDial: null,
+    dialsJudged: () => judged,
     close: async () => {
       await context.close().catch(() => undefined);
     },
   };
+
+  /**
+   * What the route guard above cannot see: which address the request it approved went to.
+   *
+   * See `dialledPrivately`. Gated on `config.isTest` for the same reason the route guard is —
+   * the suite drives the fixture site on 127.0.0.1, which every one of these would refuse —
+   * and the decision it defers to is a separate function with no `config.isTest` in it, tested
+   * directly, while run.ts's half is tested against a stubbed session.
+   */
+  if (!config.isTest) {
+    context.on('response', (response) => {
+      if (response.request().resourceType() !== 'document') return;
+      // Chained rather than fired and forgotten: a verdict still in flight when run.ts asks is
+      // a verdict that arrives after the typing.
+      judged = judged.then(() => noteDial(session, response, rebound)).catch(() => undefined);
+    });
+  }
+
+  logger.info({ headless: opts.headless ?? false, profileDir }, 'browser session opened');
+
+  return session;
 }
 
 /**

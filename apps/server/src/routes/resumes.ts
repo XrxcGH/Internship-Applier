@@ -6,10 +6,11 @@ import type { FastifyInstance } from 'fastify';
 import { desc, eq } from 'drizzle-orm';
 import { ulid } from 'ulid';
 import { config } from '../config';
-import { db, schema } from '../infra/db/client';
+import { db, schema, sqlite } from '../infra/db/client';
 import { encryptField } from '../infra/crypto/fieldCrypto';
 import { describeAccess, NoModelAccessError } from '../infra/llm';
 import {
+  extensionForMime,
   extractText,
   mimeFromFilename,
   storedResumeFilename,
@@ -22,6 +23,158 @@ import { sweepApprovals } from './profile';
 import { logger } from '../infra/logger';
 
 const MAX_BYTES = 12 * 1024 * 1024;
+
+/** Long enough for any name a person types, short enough for every filesystem it may land on. */
+const MAX_ATTACHMENT_NAME = 120;
+
+/**
+ * The name an employer's form will receive this file under — which is NOT the name it is
+ * stored under.
+ *
+ * `storedResumeFilename` deliberately throws the student's name away when it builds the path,
+ * for the reasons written on it, so this column is the ONLY surviving copy of the name they
+ * would recognise and it is the one the attachment has to carry. That makes it a name another
+ * system will write down, and the raw multipart field is not obliged to be one:
+ *
+ *   - `resume`, with no extension at all — the type is decided by the MIME, not the name, so
+ *     this uploads fine and is then refused by every upload widget filtering on ".pdf,.docx";
+ *   - `resume.txt:evil`, the same colon that once stored a resume in an NTFS alternate data
+ *     stream here, pointed this time at whatever the employer's server saves it to;
+ *   - `../../etc/passwd.pdf`, which a file picker cannot produce but this endpoint can: it is
+ *     HTTP, and the multipart filename is just a string somebody sends;
+ *   - `resume<U+202E>fdp.exe`, which most file listings render as `resumeexe.pdf`;
+ *   - 300 characters of name, over the limit of nearly everything it will land on.
+ *
+ * Ordinary names go through untouched, because the point of keeping it is recognition: "My CV
+ * (final) 2027.txt" is what the student will look for in their own folder, and renaming it for
+ * them would be a worse answer than the bug.
+ */
+function attachmentFilename(raw: string | undefined, mime: string): string {
+  const ext = extensionForMime(mime);
+  // A separator means everything before it was a path, not a name. `pop()` on a split is the
+  // same last-segment rule `path.basename` applies, minus the platform disagreement about
+  // whether a backslash separates anything.
+  const base = (raw ?? '').split(/[\\/]/).pop() ?? '';
+  const cleaned = base
+    // Control characters, and the format characters that reorder what a name LOOKS like.
+    .replace(/[\p{Cc}\p{Cf}]/gu, '')
+    // Reserved on Windows; ':' also starts an alternate data stream.
+    .replace(/[:*?"<>|]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    // Windows silently drops a trailing dot or space and unix-likes hide a leading dot, so in
+    // either case the name that lands is not the name that was sent.
+    .replace(/^[. ]+/, '')
+    .replace(/[. ]+$/, '');
+  const named = cleaned === '' ? 'resume' : cleaned;
+  const room = MAX_ATTACHMENT_NAME - ext.length;
+  const capped =
+    named.length > room ? named.slice(0, room).replace(/[. ]+$/, '') || 'resume' : named;
+  // The extension follows the type the bytes were VALIDATED as, so the form's filter accepts
+  // it and the employer's reader opens it with the right thing.
+  return capped.toLowerCase().endsWith(ext) ? capped : `${capped}${ext}`;
+}
+
+/**
+ * The row goes in, and it is the primary one; whatever was primary before is not any more.
+ *
+ * This used to be `isPrimary: nothing else claims it`, which is true only of the FIRST upload
+ * ever. A student who fixed a typo, re-uploaded and carried on applying kept attaching the
+ * original file to every form afterwards — and nothing in the interface can undo that:
+ * `POST /api/resumes/:id/primary` exists and apps/web has never called it, so the first file
+ * they ever chose was the one every employer received, permanently.
+ *
+ * The newest upload wins, which is the rule the delete branch below already follows when it
+ * promotes a survivor. The two now agree: the most recent resume is the one this tool
+ * attaches unless the user names another through the endpoint above.
+ *
+ * Both statements together, because `is_primary` is a plain column with no uniqueness behind
+ * it. Inserting a second primary without clearing the first leaves two, and the fill route
+ * takes whichever `.find((r) => r.isPrimary)` reaches first — an order SQLite never promised.
+ */
+const insertAsPrimary = sqlite.transaction((row: typeof schema.resumeDocument.$inferInsert) => {
+  db.update(schema.resumeDocument).set({ isPrimary: false }).run();
+  db.insert(schema.resumeDocument)
+    .values({ ...row, isPrimary: true })
+    .run();
+});
+
+/**
+ * The sentence a failure wrote for the student, or nothing.
+ *
+ * Extraction fails in ways somebody sat down and wrote an answer to — "This .docx unpacks to
+ * 394MB… Export it again from your word processor, or save it as a PDF", "This resume is
+ * longer than one reading can return… Try the shorter version" — and the catch below replaced
+ * all of them with one fixed sentence ending "Try again", which for every one of these is
+ * advice that fails identically forever. That is the same defect `extractProfile.ts` names in
+ * its own comment about the max_tokens branch, one layer further out.
+ *
+ * The reason it flattened them was real, and is kept: `err.message` from the filesystem is an
+ * ABSOLUTE PATH, and from a parser an internal shape. Neither can be handed to a user. So this
+ * separates the two structurally rather than by trusting the thrower:
+ *
+ *   - exactly `Error`, never a subclass — a ZodError's message is a dump of its issues, a
+ *     SyntaxError from JSON.parse names a byte offset, an HttpError describes a request;
+ *   - none of the properties Node hangs on a system error, whose message is the syscall and
+ *     the path: "ENOENT: no such file or directory, open 'C:\\Users\\…\\01J….pdf'";
+ *   - one line, sentence-length, and carrying no separator — which is what a path is made of.
+ *
+ * Everything authored above passes; the one message in these modules that does not is
+ * `Unsupported document type: ${mime}`, whose slash comes from the MIME. That one describes an
+ * upstream type check having been fooled, so falling back to the generic sentence is right.
+ * The bias is deliberate: an authored message that stops matching these rules degrades to the
+ * generic one, and a path never becomes a message.
+ */
+function authoredMessage(err: unknown): string | undefined {
+  if (!(err instanceof Error)) return undefined;
+  if (Object.getPrototypeOf(err) !== Error.prototype) return undefined;
+  const sys = err as { code?: unknown; errno?: unknown; syscall?: unknown; path?: unknown };
+  if (
+    sys.code !== undefined ||
+    sys.errno !== undefined ||
+    sys.syscall !== undefined ||
+    sys.path !== undefined
+  ) {
+    return undefined;
+  }
+  const message = err.message.trim();
+  if (message === '' || message.length > 400) return undefined;
+  if (/[\n\r\\/]/.test(message)) return undefined;
+  return message;
+}
+
+/**
+ * How a document that could not be read is reported, either way.
+ *
+ * The opening clause is the same in both branches on purpose — it names the file, which is the
+ * one thing the student needs when three uploads are in flight — so the two replies differ
+ * only in the part that carries information.
+ *
+ * 422 rather than 502 for the authored ones: "bad gateway" tells a client something upstream
+ * had a blip and the request is worth repeating, and every message that reaches this branch is
+ * a deterministic property of the file or of its length. Nothing about repeating it changes.
+ */
+function unreadable(
+  filename: string,
+  err: unknown,
+): { status: number; body: { error: { code: string; message: string } } } {
+  const authored = authoredMessage(err);
+  const opening = `Reading "${filename}" did not finish.`;
+  return authored
+    ? {
+        status: 422,
+        body: { error: { code: 'VALIDATION_FAILED', message: `${opening} ${authored}` } },
+      }
+    : {
+        status: 502,
+        body: {
+          error: {
+            code: 'INTERNAL',
+            message: `${opening} The server log has the details. Try again, or upload the file in a different format.`,
+          },
+        },
+      };
+}
 
 export async function resumeRoutes(app: FastifyInstance): Promise<void> {
   app.post('/api/resumes', async (req, reply) => {
@@ -48,6 +201,10 @@ export async function resumeRoutes(app: FastifyInstance): Promise<void> {
     const bytes = await file.toBuffer();
     const id = ulid();
     const sha256 = createHash('sha256').update(bytes).digest('hex');
+    // Two names, for two jobs: this one is shown to the student and attached to the form, the
+    // one below is where the bytes go. See `attachmentFilename` for why they are not the same
+    // string and why neither is `file.filename` verbatim.
+    const filename = attachmentFilename(file.filename, mime);
     // The extension comes from the validated type, never from the name the student's file
     // arrived under. See `extensionForMime` for what a name was able to do to this path.
     const stored = path.join(config.paths.resumes, storedResumeFilename(id, mime));
@@ -68,36 +225,32 @@ export async function resumeRoutes(app: FastifyInstance): Promise<void> {
      * The upload is still accepted and the text stored as null, because the failure is worth
      * seeing at extraction time — where the student is told, in a sentence naming the file —
      * rather than as a rejected upload that leaves them guessing which of the two steps broke.
+     *
+     * That promise was not being kept, and could not be from here: the message below goes to
+     * the log, the row keeps a null, and extraction had nothing to say but its own generic
+     * "No text could be read from this document." The extract route reads the file again when
+     * it finds that null, which is what carries these sentences — the ones that say to export
+     * the .docx again or save it as a PDF — to the person actually holding the file.
      */
     const text = await extractText(stored, mime).catch((err: unknown) => {
       logger.warn(
-        { err, mime, filename: file.filename },
-        'could not read any text out of this document; extraction will refuse it',
+        { err, mime, filename },
+        'could not read any text out of this document; extraction will read it again and refuse it',
       );
       return null;
     });
 
-    db.insert(schema.resumeDocument)
-      .values({
-        id,
-        filename: file.filename,
-        path: encryptField(stored, id),
-        mime,
-        bytes: bytes.byteLength,
-        sha256,
-        rawText: text ? encryptField(text, id) : null,
-        // Primary when nothing else claims it — not merely when the table is empty.
-        // That older test left the app with no primary at all after the primary was
-        // deleted, and no later upload could ever become one.
-        isPrimary: !db
-          .select()
-          .from(schema.resumeDocument)
-          .all()
-          .some((r) => r.isPrimary),
-      })
-      .run();
+    insertAsPrimary({
+      id,
+      filename,
+      path: encryptField(stored, id),
+      mime,
+      bytes: bytes.byteLength,
+      sha256,
+      rawText: text ? encryptField(text, id) : null,
+    });
 
-    return reply.code(201).send({ documentId: id, filename: file.filename, mime, sha256 });
+    return reply.code(201).send({ documentId: id, filename, mime, sha256 });
   });
 
   app.get('/api/resumes', async () => {
@@ -199,7 +352,36 @@ export async function resumeRoutes(app: FastifyInstance): Promise<void> {
         },
       });
     }
-    const text = doc.rawText ? decryptField(doc.rawText, doc.id) : undefined;
+    let text = doc.rawText ? decryptField(doc.rawText, doc.id) : undefined;
+
+    /**
+     * Read again here when the upload stored no text, which is the only way the sentence
+     * explaining WHY it could not be read ever reaches the person holding the file.
+     *
+     * The upload above accepts the file and logs the failure, saying the student "is told, in
+     * a sentence naming the file" at this step. They were not: with `rawText` null,
+     * `extractResume` throws its own generic "No text could be read from this document", and
+     * the four authored sentences that actually say what to do about a .docx — export it
+     * again, save it as a PDF, upload the resume rather than an archive of one — died in the
+     * log at upload time and were never anywhere the student could see them.
+     *
+     * PDFs are excluded because `extractText` returns null for them WITHOUT failing: they go
+     * to the model as bytes, so no stored text is the normal case rather than a failure.
+     *
+     * Doing the read again also makes the "Try again" the old reply offered true for once: a
+     * transient failure at upload — a descriptor exhausted, a file still being written by the
+     * syncing client that put it there — poisoned the document permanently, because nothing
+     * ever revisited that null and the only cure was uploading the same file a second time.
+     */
+    if (!text?.trim() && doc.mime !== 'application/pdf') {
+      try {
+        text = (await extractText(filePath, doc.mime)) ?? undefined;
+      } catch (err) {
+        logger.warn({ err, documentId: doc.id }, 'the stored document still yields no text');
+        const failure = unreadable(doc.filename, err);
+        return reply.code(failure.status).send(failure.body);
+      }
+    }
 
     try {
       const extraction = await extractResume({ path: filePath, mime: doc.mime, text });
@@ -282,21 +464,15 @@ export async function resumeRoutes(app: FastifyInstance): Promise<void> {
         return reply.code(503).send({ error: { code: 'NO_MODEL_ACCESS', message: err.message } });
       }
       /**
-       * A generic failure says so generically, and the detail goes to the log.
+       * A failure that wrote its own sentence keeps it; everything else says so generically
+       * and leaves the detail in the log above, which has it in full and with its stack.
        *
-       * This returned `err.message` verbatim, which for anything thrown by the filesystem is
-       * an absolute path and for anything thrown by a parser is an internal shape. The user
-       * can act on neither, and the response is the wrong place for both — the log above
-       * already has the error in full, with its stack.
+       * This returned `err.message` verbatim once — an absolute path, for anything thrown by
+       * the filesystem — and then nothing but the generic sentence, which threw away every
+       * message written to be read. `authoredMessage` is the difference between the two.
        */
-      return reply.code(502).send({
-        error: {
-          code: 'INTERNAL',
-          message:
-            `Reading "${doc.filename}" did not finish. The server log has the details. Try ` +
-            'again, or upload the file in a different format.',
-        },
-      });
+      const failure = unreadable(doc.filename, err);
+      return reply.code(failure.status).send(failure.body);
     }
   });
   /** Which resume gets attached to applications by default. */
@@ -341,19 +517,27 @@ export async function resumeRoutes(app: FastifyInstance): Promise<void> {
      * Deleting the primary used to leave none, and the fill run then had no resume to
      * attach — reported as a skipped field with "No file to attach", which is honest but
      * easy to miss on a form with thirty rows. The most recent survivor is promoted.
+     *
+     * Asked of the rows that remain rather than of the row just removed, so it also heals a
+     * table that arrived here with no primary at all — which is the state every database
+     * written before the upload rule was fixed is in, if its primary was ever deleted.
+     *
+     * The id breaks a tie on the timestamp. `created_at` is stamped to the millisecond, which
+     * two uploads over HTTP will not share but two rows written by a test or a restore
+     * certainly can, and a ULID sorts by the time it was minted — so this is the same
+     * "newest" by a finer clock rather than a second rule.
      */
-    if (row.isPrimary) {
-      const next = db
-        .select()
-        .from(schema.resumeDocument)
-        .orderBy(desc(schema.resumeDocument.createdAt))
-        .all()[0];
-      if (next) {
-        db.update(schema.resumeDocument)
-          .set({ isPrimary: true })
-          .where(eq(schema.resumeDocument.id, next.id))
-          .run();
-      }
+    const remaining = db
+      .select()
+      .from(schema.resumeDocument)
+      .orderBy(desc(schema.resumeDocument.createdAt), desc(schema.resumeDocument.id))
+      .all();
+    const newest = remaining[0];
+    if (newest && !remaining.some((r) => r.isPrimary)) {
+      db.update(schema.resumeDocument)
+        .set({ isPrimary: true })
+        .where(eq(schema.resumeDocument.id, newest.id))
+        .run();
     }
 
     return reply.code(204).send();

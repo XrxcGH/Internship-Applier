@@ -243,13 +243,24 @@ describe('the web_search adapter', () => {
     expect(result.notes.join(' ')).toMatch(/found no open postings/i);
   });
 
-  it('honours the candidate cap and reports the remainder', async () => {
+  /**
+   * Reported as a GAP, because a note sets neither `degraded` nor `skipped`.
+   *
+   * A run that named fourteen pages, read three and left eleven unfetched used to report
+   * itself as complete: the summary said "web_search: 3 found" with a green tick, and the
+   * sentence about the other eleven sat among the ordinary status lines. Coverage that was
+   * not obtained belongs in `gaps` — which is where the Workday and SmartRecruiters
+   * detail-page caps already put theirs.
+   */
+  it('honours the candidate cap and reports the remainder as a gap', async () => {
     h.answer = found(
       Array.from({ length: 14 }, (_, i) => `https://boards.greenhouse.io/c${i}/jobs/1`),
     );
     const result = await webSearch.fetch({ limit: 3 });
     expect(h.fetched).toHaveLength(3);
-    expect(result.notes.join(' ')).toMatch(/left 11 unfetched/);
+    expect(result.gaps?.join(' ')).toMatch(/left 11 unfetched/);
+    // And not left in the status lines as well, or the run says it twice.
+    expect(result.notes.join(' ')).not.toMatch(/left 11 unfetched/);
   });
 
   it('sends the brief it was given, and defaults to the product’s premise', async () => {

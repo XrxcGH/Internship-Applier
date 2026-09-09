@@ -5,9 +5,17 @@ import type { JobRequirementRow } from '../lib/matches';
 /**
  * The trust surface of the whole application — docs/08 § Matches.
  *
- * Every rule shows its outcome, the reason, and the verbatim job-description text that
- * caused it. If the tool filtered something out, this is where the user checks whether
- * it was right. Colour is never the only signal: each state carries a mark and a label.
+ * Every rule shows its outcome, the reason, and what it read. If the tool filtered something
+ * out, this is where the user checks whether it was right. Colour is never the only signal:
+ * each state carries a mark and a label.
+ *
+ * "What it read" is two different things and they are typeset differently, because saying so
+ * is the whole point of the screen. A rule that cites a REQUIREMENT shows that requirement's
+ * `sourceQuote` — verbatim job-description text, checked against the description before it
+ * was stored — as a quotation. A rule that read the posting row directly shows the value it
+ * read, plainly labelled, because for several rules that value is an internal token
+ * (`isOpen=false`, `workArrangement=hybrid`) or something this app synthesised, and the
+ * sentence above used to promise all of it was the employer's own words.
  */
 
 /**
@@ -60,7 +68,25 @@ export function RequirementChecklist({
     <ul className="space-y-3">
       {sorted.map((r) => {
         const mark = MARK[r.status];
-        const quote = r.requirementId ? byId.get(r.requirementId)?.sourceQuote : r.evidence;
+        /**
+         * ONLY A REAL SOURCE QUOTE IS SHOWN AS A QUOTATION.
+         *
+         * `sourceQuote` is verbatim job-description text, checked against the description by
+         * quoteGuard before it is stored. `evidence` is not: it is whatever the rule read
+         * directly off the posting row, and for several rules that is an internal token —
+         * `isOpen=false`, `workArrangement=hybrid`, `term 2027-06-01..2027-08-15` — or a
+         * value this app synthesised, like the " / "-joined city list the location rule
+         * builds. All of it went into the same blockquote, under a component whose own
+         * header promises "the verbatim job-description text that produced it", so the G2
+         * screen showed a student `isOpen=false` typeset as a quotation from the employer.
+         *
+         * The evidence is still worth showing — it is what the rule actually looked at — so
+         * it stays, as the plain supporting detail it is rather than as words the posting
+         * never said.
+         */
+        const requirement = r.requirementId ? byId.get(r.requirementId) : undefined;
+        const quote = requirement?.sourceQuote;
+        const readValue = quote ? undefined : r.evidence;
 
         return (
           <li key={r.rule} className="flex gap-3">
@@ -86,6 +112,12 @@ export function RequirementChecklist({
                 <blockquote className="u-quote mt-2 py-1">
                   {quote.length > 260 ? `${quote.slice(0, 260)}…` : quote}
                 </blockquote>
+              )}
+              {readValue && (
+                <p className="u-data text-faint mt-1.5 text-2xs">
+                  read from the posting:{' '}
+                  {readValue.length > 160 ? `${readValue.slice(0, 160)}…` : readValue}
+                </p>
               )}
             </div>
           </li>

@@ -142,6 +142,9 @@ export interface TrackedApplication {
    * a student who interviewed four times and was turned down four times saw "Reached
    * interview: 0%" and concluded they had never once got past the screen.
    *
+   * It is also where the silence clock starts once an application reaches `interview` — see
+   * `derive` — which is why an absent value is left as no verdict rather than guessed at.
+   *
    * Optional only because a caller that has not read the event history has nothing to put
    * here; when it is absent the present status is all there is to go on, and the undercount
    * is back.
@@ -213,15 +216,44 @@ export function derive(app: TrackedApplication, now = new Date()): Derived {
    *
    * Falls back to the submission date when nothing has come back yet, which is also what a
    * row carried over from before the history was read looks like.
+   *
+   * `interview` is the third of these and had the same hole `acknowledged` had: an interview
+   * that goes quiet never ghosted, never nudged, and went on being counted as an interview
+   * in progress, so a student who was screened in March and never heard another word still
+   * had that card sitting under "Talking" in September with nothing written on it.
+   *
+   * Its anchor is `advancedAt` — when the application reached the interview stage — and
+   * there is deliberately NO fallback to the submission date for it. Someone who applied in
+   * January and interviewed last week is not silent for eight months, and anchoring on
+   * `submittedAt` would have dropped a live interview into "Closed" under "No word for 230
+   * days. Worth following up, or letting go." A false ghost on a live interview is far worse
+   * than no verdict at all, so an interview we cannot date is left alone: `daysQuiet` is
+   * null, and `silent` below needs a number.
+   *
+   * `advancedAt` is the FIRST round, so a loop running past forty-five days reads as quiet
+   * even while it is live. That is the same trade the acknowledged clock makes and it is
+   * taken for the same reason: a second round and a stray re-click of "Interviewing" write
+   * an identical `interview → interview` event, so anchoring on the latest one would hand
+   * back the way to postpone the verdict for ever by touching the row. The cost here is a
+   * card moved to "Closed" with a follow-up offered beside it, which after that much silence
+   * is worth doing anyway, and the stored status is untouched so an offer can still be
+   * recorded against it.
    */
   const quietSince =
-    app.status === 'acknowledged' ? (app.respondedAt ?? app.submittedAt) : app.submittedAt;
+    app.status === 'acknowledged'
+      ? (app.respondedAt ?? app.submittedAt)
+      : app.status === 'interview'
+        ? (app.advancedAt ?? null)
+        : app.submittedAt;
   const daysQuiet = quietSince === null ? null : daysBetween(quietSince, now);
 
-  const silent =
-    (app.status === 'submitted' || app.status === 'acknowledged') &&
-    daysQuiet !== null &&
-    daysQuiet >= GHOST_AFTER_DAYS;
+  // The three statuses that are waiting on an employer to say something. `offer` is not one
+  // of them — the silence there is the student's to break, and calling an offer ghosted
+  // would be telling them an offer they still hold has evaporated.
+  const waitingOnThem =
+    app.status === 'submitted' || app.status === 'acknowledged' || app.status === 'interview';
+
+  const silent = waitingOnThem && daysQuiet !== null && daysQuiet >= GHOST_AFTER_DAYS;
 
   const effectiveStatus: ApplicationStatus = silent ? 'ghosted' : app.status;
 

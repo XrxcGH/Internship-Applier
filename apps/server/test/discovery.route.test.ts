@@ -208,6 +208,7 @@ describe('POST /api/companies/resolve, then POST /api/discovery/plan', () => {
     expect(res.statusCode, res.body).toBe(200);
     const body = JSON.parse(res.body) as {
       matches: Array<{ source: string; board: string; fromFullName: boolean }>;
+      notes: string[];
     };
     expect(body.matches).toEqual([
       { source: 'ashby', board: 'vector', jobCount: 2, fromFullName: false },
@@ -215,5 +216,32 @@ describe('POST /api/companies/resolve, then POST /api/discovery/plan', () => {
 
     const after = await plan();
     expect(after.targets.filter((t) => t.board === 'vector')).toEqual([]);
+
+    /**
+     * And it SAYS so, naming the board.
+     *
+     * `fromFullName` rode in the response and no consumer read it — Discovery.tsx renders
+     * every element of `matches` identically, vendor, board, "2 open jobs" and an Add button
+     * whose plan target reads "Vector Health, resolved to this board". So the guess reached
+     * the student as a resolution and one press put somebody else's board into a run. `notes`
+     * is the one channel that screen prints verbatim under the list.
+     */
+    const note = body.notes.find((n) => n.includes('ashby:vector'));
+    expect(note, body.notes.join(' | ')).toBeTruthy();
+    expect(note).toMatch(/first word/i);
+  });
+
+  it('says nothing about first words when the full name is what answered', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/companies/resolve',
+      payload: { name: 'Wdcorp' },
+    });
+    expect(res.statusCode, res.body).toBe(200);
+    // The caveat has to be absent from a confirmed resolution, or it is noise on every
+    // answer and the reader stops reading it — which is where the unread flag started.
+    expect((JSON.parse(res.body) as { notes: string[] }).notes.join(' ')).not.toMatch(
+      /first word/i,
+    );
   });
 });

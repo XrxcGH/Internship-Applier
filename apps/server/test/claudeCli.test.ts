@@ -54,7 +54,10 @@ function writeFakeCli(
     | 'silent_exit_0'
     | 'no_flag_but_mentions_a_limit'
     | 'no_cost'
-    | 'silly_cost',
+    | 'silly_cost'
+    | 'truncated'
+    | 'refused'
+    | 'no_stop_reason',
 ) {
   const script = `
 const fs = require('fs');
@@ -82,6 +85,11 @@ process.stdin.on('end', () => {
     delete env.is_error;
     env.result = 'Our team hit the API usage limit reached last quarter, so I built a queue.';
   }
+  // The envelope carries BOTH: subtype is the CLI's outcome for the run, stop_reason is
+  // the model's own word, in the same vocabulary the API backend reports.
+  else if (mode === 'truncated') { env.stop_reason = 'max_tokens'; env.result = 'ECHO:' + stdin.trim(); }
+  else if (mode === 'refused') { env.stop_reason = 'refusal'; env.result = ''; }
+  else if (mode === 'no_stop_reason') { env.result = 'ECHO:' + stdin.trim(); }
   else if (mode === 'no_cost') { delete env.total_cost_usd; env.result = 'ECHO:' + stdin.trim(); }
   else if (mode === 'silly_cost') { env.total_cost_usd = 'lots'; env.result = 'ECHO:' + stdin.trim(); }
   else { env.result = 'ECHO:' + stdin.trim(); }
@@ -744,4 +752,52 @@ describe('a CLI call that reports no cost', () => {
     const row = rows[rows.length - 1];
     expect(row?.costUsd == null || typeof row.costUsd === 'number').toBe(true);
   }, 30_000);
+});
+
+/**
+ * THE MODEL'S REASON FOR STOPPING, IN THE VOCABULARY THE CALLERS SPEAK.
+ *
+ * `stopReason` was read off the envelope's `subtype`, which is the CLI's outcome for the whole
+ * run — "success" on every ordinary call. The callers compare it against the API's vocabulary:
+ * `extractResume` has a `refusal` branch and a `max_tokens` branch, and on the default backend
+ * neither could ever fire. A resume long enough to exhaust the output budget fell through both
+ * and came back as "the model returned something this app could not read as a resume", which
+ * blames the format, suggests nothing, and says the same thing on every retry.
+ *
+ * The envelope carries `stop_reason` alongside `subtype`, in exactly the API's words. It is
+ * that field the seam has to hand on.
+ */
+describe('the stop reason the seam reports', () => {
+  it("hands on the model's word, not the CLI's outcome for the run", async () => {
+    writeFakeCli('truncated');
+    const r = await claudeCliBackend.generate({
+      purpose: 'resume_extraction',
+      system: 's',
+      user: 'u',
+    });
+    expect(r.stopReason).toBe('max_tokens');
+  });
+
+  it('reports a refusal as a refusal, so the caller can say so', async () => {
+    writeFakeCli('refused');
+    const r = await claudeCliBackend.generate({
+      purpose: 'resume_extraction',
+      system: 's',
+      user: 'u',
+    });
+    expect(r.stopReason).toBe('refusal');
+  });
+
+  it('falls back to the subtype when the envelope states no stop reason', async () => {
+    // Every field on CliEnvelope is optional on purpose — the contract belongs to a
+    // separately released program — so an older CLI that sends no `stop_reason` must not
+    // start reporting null and lose the little the envelope does say.
+    writeFakeCli('no_stop_reason');
+    const r = await claudeCliBackend.generate({
+      purpose: 'resume_extraction',
+      system: 's',
+      user: 'u',
+    });
+    expect(r.stopReason).toBe('success');
+  });
 });

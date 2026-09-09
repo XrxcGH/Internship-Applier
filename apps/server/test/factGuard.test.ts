@@ -1546,3 +1546,122 @@ describe('a why-this-company answer', () => {
     }
   });
 });
+
+/**
+ * A NUMBER THE PROFILE CONTRADICTS, quoted underneath as if it agreed.
+ *
+ * "I led the build subteam of sixty students" came back GREEN against a profile bullet
+ * reading "Led the build subteam of six students", with that bullet printed beside it as the
+ * evidence. Nothing looked at the number — the lexical layer saw "build subteam" and
+ * "students" overlap and was satisfied — so a draft that had inflated a six-person team
+ * tenfold reached G3 wearing a tick and its own refutation.
+ *
+ * Amber rather than red, deliberately, like the language ladder: a larger number is not always
+ * an inflated one, a student who ran two six-person cohorts may honestly write twelve, and
+ * blocking that at a gate with no override is the worse error. What must not happen is the
+ * green tick.
+ */
+describe('a count the profile puts lower', () => {
+  const team = evidenceFor({
+    experience: [
+      {
+        ...fixture().experience[0]!,
+        bullets: [
+          'Led the build subteam of six students',
+          'Grew the club from four members to thirty-one members',
+        ],
+      },
+    ],
+  } as Partial<ConfirmedProfile>);
+
+  const verdict = (claim: string): string | null =>
+    guardDraft(claim, team).claims[0]?.verdict ?? null;
+
+  it('stops calling an inflated headcount supported, however the number is spelled', () => {
+    // Three spellings of the same inflation. The digits case matters on its own: the shared
+    // COUNT_PATTERN caps at two digits because it feeds the duration extractor, so a check
+    // built on it silently ignored every number over 99 — the largest claims of all.
+    expect(verdict('I led the build subteam of sixty students.')).toBe('inferred');
+    expect(verdict('I grew the club to three hundred members.')).toBe('inferred');
+    expect(verdict('I grew the club to 300 members.')).toBe('inferred');
+  });
+
+  it('says which line disagrees, since a reason naming no source cannot be acted on', () => {
+    const claim = guardDraft('I led the build subteam of sixty students.', team).claims[0]!;
+    expect(claim.reason).toMatch(/60 students/);
+    expect(claim.reason).toMatch(/profile says 6/);
+    expect(claim.quote).toMatch(/Led the build subteam of six students/);
+  });
+
+  it('never blocks on it, because a bigger number can be an honest total', () => {
+    expect(guardDraft('I led the build subteam of sixty students.', team).blocking).toEqual([]);
+  });
+
+  /**
+   * The half that keeps this from becoming noise. Every one of these is true of the profile
+   * above, and an amber on a true sentence is what teaches a student to click through the
+   * warnings that matter.
+   */
+  it('leaves the honest numbers alone', () => {
+    expect(verdict('I led the build subteam of six students.')).toBe('supported');
+    expect(verdict('I grew the club to thirty-one members.')).toBe('supported');
+    expect(verdict('I grew the club from four members to thirty-one members.')).toBe('supported');
+  });
+
+  /**
+   * A decimal is one number, not two.
+   *
+   * `3.968` read as the count 968 of a thing called "GPA", and `4.0` as the count 0 of a thing
+   * called "scale" — so "I have a 3.968 GPA on a 4.0 scale", a sentence the freshman-resume
+   * suite already asserts is true, came back amber. A guard that flags a student's real GPA is
+   * the noise this whole rule is capped at amber to avoid.
+   */
+  it('does not read a piece of a decimal as a count', () => {
+    expect(verdict('I have a 3.968 GPA on a 4.0 scale.')).not.toBe('inferred');
+    expect(verdict('My weighted GPA is 4.35 on a 5.0 scale.')).not.toBe('inferred');
+  });
+
+  it('leaves spans to the duration check, which reads them far more carefully', () => {
+    // "two years" and "six students" in one sentence: comparing the 2 against the 6 would
+    // flag two true numbers about two different things. Time words are excluded outright.
+    expect(verdict('I spent two years on a team of six students.')).toBe('supported');
+  });
+});
+
+/**
+ * Which language a proficiency word is about.
+ *
+ * `levelOf` read the highest word anywhere in the sentence and charged it to every language
+ * the profile holds, so a student who really is a native Igbo speaker and really is
+ * conversational in Spanish had "I am fluent in Igbo and conversational in Spanish" — true of
+ * both halves — flagged, because "fluent" was measured against Spanish. That is the ordinary
+ * way anyone writes two proficiencies.
+ */
+describe('a proficiency belongs to the language it modifies', () => {
+  const speaks = evidenceFor({
+    languages: [
+      { name: 'Spanish', proficiency: 'conversational' },
+      { name: 'Igbo', proficiency: 'native' },
+    ],
+  } as Partial<ConfirmedProfile>);
+
+  const verdict = (claim: string): string | null =>
+    guardDraft(claim, speaks).claims[0]?.verdict ?? null;
+
+  it('does not charge one language with another language’s level', () => {
+    expect(verdict('I am fluent in Igbo and conversational in Spanish.')).toBe('supported');
+    expect(verdict('I am conversational in Spanish.')).toBe('supported');
+  });
+
+  it('still catches a level the profile does not support', () => {
+    // The false green this rule exists for: the profile says conversational.
+    expect(verdict('I am fluent in Spanish.')).toBe('inferred');
+    expect(verdict('My Spanish is native.')).toBe('inferred');
+  });
+
+  it('reads one clause naming two languages as being about both', () => {
+    // "conversational in Spanish and Igbo" is one clause, and it says conversational about
+    // each — so the Igbo half is under its native level and nothing is flagged.
+    expect(verdict('I am conversational in Spanish and Igbo.')).toBe('supported');
+  });
+});

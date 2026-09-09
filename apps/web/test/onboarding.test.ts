@@ -10,10 +10,12 @@ import {
   EducationEditor,
   gpaBoxesFor,
   gpaBoxKey,
+  hasUnsavedEdits,
   mergeWithdrawn,
   nextReviewFlags,
   readGpaBoxes,
   tidyProfileLists,
+  tookConfirmationOff,
   WithdrawnNotice,
 } from '../src/pages/Onboarding';
 // Moved out of the wizard when the experience, project and skill editors arrived and needed
@@ -629,7 +631,8 @@ describe('the education editor on screen', () => {
  * path being added without it.
  */
 describe('the save buttons', () => {
-  it('holds every path that writes the profile while a school row has no name', () => {
+  /** Every button on the wizard that calls the server with this profile, and its hold. */
+  function writingButtons(): Map<string, string> {
     const src = readFileSync(new URL('../src/pages/Onboarding.tsx', import.meta.url), 'utf8');
     const found = new Map<string, string>();
     // A fixed window rather than a match up to the closing angle bracket: the hold itself
@@ -646,7 +649,22 @@ describe('the save buttons', () => {
     // six facts typed there were found to live only in React state.
     expect(calls.filter((c) => c === 'persist()')).toHaveLength(4);
     expect([...new Set(calls)].sort()).toEqual(['checkedOff(', 'confirm()', 'persist()']);
-    for (const [call, hold] of found) expect(hold, call).toContain('nameless.length > 0');
+    return found;
+  }
+
+  it('holds every path that writes the profile while a school row has no name', () => {
+    for (const [call, hold] of writingButtons())
+      expect(hold, call).toContain('nameless.length > 0');
+  });
+
+  it('holds every one of them while a write is already in flight, Confirm included', () => {
+    // Confirm was the exception, and it is the worst button to leave live. It SAVES before it
+    // confirms, so a second click ran a second save; that save sweeps a profile whose stale
+    // approvals the first run had already withdrawn, comes back with nothing to report, and
+    // — before the notice learned to merge — the empty list landed on top of the one thing
+    // telling the student which answers were no longer approved, on its way to the
+    // "profile established" stamp. Its five siblings were all held on `busy` already.
+    for (const [call, hold] of writingButtons()) expect(hold, call).toContain('busy !== null');
   });
 });
 
@@ -681,6 +699,40 @@ describe('mergeWithdrawn', () => {
 
   it('is empty when neither write cost anything', () => {
     expect(mergeWithdrawn([], [])).toEqual([]);
+  });
+
+  it('keeps what an earlier write reported when the later one has nothing to add', () => {
+    // The property every call site on the wizard now leans on. The server reports an answer
+    // AT MOST ONCE — `withdrawStaleApprovals` skips any row with no `approvedAt`, so the sweep
+    // after a withdrawal has nothing left to say about it — which is exactly why assigning the
+    // second list wiped the first one's notice off the screen.
+    expect(mergeWithdrawn([w('a', 'Why us?')], [])).toHaveLength(1);
+  });
+});
+
+/**
+ * The notice a second click used to erase.
+ *
+ * Every write on this screen sweeps, and the server names an answer once. So the Save that
+ * withdrew two approvals reported them, and the very next write — usually Confirm, which saves
+ * before it confirms — came back with nothing to report and put `[]` over the notice on its way
+ * to the "profile established" stamp. The last the student saw of two answers they now have to
+ * re-review at G3 was a paragraph that vanished as they left G1.
+ *
+ * Asserted against the source because the state lives inside a hook-driven screen with no way
+ * to drive it from here, and the failure being guarded is a sixth write path assigning again.
+ */
+describe('the withdrawal notice across two writes', () => {
+  it('has every write path merge, and leaves exactly one honest reset', () => {
+    const src = readFileSync(new URL('../src/pages/Onboarding.tsx', import.meta.url), 'utf8');
+    const bare: string[] = [];
+    for (const m of src.matchAll(/setWithdrawn\(/g)) {
+      const call = src.slice(m.index, m.index + 160);
+      if (!call.includes('mergeWithdrawn')) bare.push(call.slice(0, call.indexOf(';') + 1).trim());
+    }
+    // The one assignment that survives is the re-extraction, and it is right: a new resume is
+    // a new profile, and those withdrawals were taken against one that no longer exists.
+    expect(bare).toEqual(['setWithdrawn(withdrawn);']);
   });
 });
 
@@ -724,6 +776,14 @@ describe('WithdrawnNotice', () => {
     const said = text([item, { ...item, answerId: 'a2', question: 'Tell us about a project.' }]);
     expect(said).toContain('2 answers');
     expect(said).toContain('Tell us about a project.');
+  });
+
+  it('does not pin itself to the last save, which is no longer what it holds', () => {
+    // It read "That save took the approval off one answer." The list accumulates across every
+    // write on this screen now, so that sentence would be describing one click while printing
+    // the cost of three — and an approval withdrawn two saves ago is still withdrawn.
+    expect(text([item])).not.toContain('That save');
+    expect(text([item])).toContain('taken the approval off');
   });
 
   it('prints every claim on an answer that lost several', () => {
@@ -958,5 +1018,99 @@ describe('the permutation the education editor produces', () => {
     expect(remapTypedBoxes({ 'education.2.gpa.value': '4.0' }, 'education', moved)).toEqual({
       'education.1.gpa.value': '4.0',
     });
+  });
+});
+/**
+ * A confirmation an upload took off, and the two ways of getting that wrong.
+ *
+ * `routes/resumes.ts` writes a whole new profile and resets `confirmedAt` to null — the same
+ * event `sweepApprovals` is exported for. Nothing on the window said so: the nav's lock and its
+ * status pill are drawn from a single health fetch made when the app mounts, so it went on
+ * reading "local" over Discover, Queue, Applications and Tracker, and every one of those routes
+ * answers 409 to an unconfirmed profile. The student was sent through an unlocked door into a
+ * refusal whose cause was two screens behind them.
+ */
+describe('tookConfirmationOff', () => {
+  const at = (confirmedAt: string | null): CandidateProfile =>
+    ({ confirmedAt }) as unknown as CandidateProfile;
+
+  it('catches the re-extraction that revoked a confirmation the student had', () => {
+    expect(tookConfirmationOff(at('2026-02-01T00:00:00.000Z'), at(null), true)).toBe(true);
+  });
+
+  it('says nothing to a student who never had one to lose', () => {
+    // The other direction, and it is not harmless: this is the gate whose business is saying
+    // what is and is not true of the file, and a first upload telling someone their
+    // confirmation had been revoked would be an invented alarm on their very first screen.
+    expect(tookConfirmationOff(at(null), at(null), true)).toBe(false);
+    expect(tookConfirmationOff(null, at(null), true)).toBe(false);
+  });
+
+  it('leaves the by-hand door alone, which stores nothing and so revokes nothing', () => {
+    // `POST /api/profile/blank` builds the draft and writes it nowhere, and PUT keeps what it
+    // finds — `confirmedAt: existing?.confirmedAt ?? null`. A confirmed student who clicks
+    // "Fill the profile in yourself" still has their confirmation.
+    expect(tookConfirmationOff(at('2026-02-01T00:00:00.000Z'), at(null), false)).toBe(false);
+  });
+});
+
+/**
+ * Corrections that exist nowhere but the browser.
+ *
+ * Both steps grew Save buttons for this, and a button is half of it: the student has to
+ * remember to press it, and nothing said they had not. One nav click, one browser Back, one
+ * reload — a corrected school name, a typed GPA, the six facts a resume never contains, all
+ * gone with no message. The facts step is the sharp case, since its Confirm is disabled while
+ * any flag is open, which is exactly the state a person is in while filling it in.
+ */
+describe('hasUnsavedEdits', () => {
+  const p = { fullName: 'Rosa Dean' } as unknown as CandidateProfile;
+
+  it('is quiet on a screen nobody has touched', () => {
+    // The object the server handed back IS the object on screen, so an untouched wizard must
+    // not nag — a warning shown on every visit is one people learn to click past.
+    expect(hasUnsavedEdits(p, p)).toBe(false);
+    expect(hasUnsavedEdits(null, null)).toBe(false);
+  });
+
+  it('catches an edit, which builds a new object every time', () => {
+    // `patch` and `editList` both spread, so identity is exact here rather than approximate.
+    expect(hasUnsavedEdits({ ...p }, p)).toBe(true);
+  });
+
+  it('treats a profile the server has never stored as unsaved from the first keystroke', () => {
+    // The blank-profile door, and the reason this is not merely a nicety. `POST
+    // /api/profile/blank` deliberately writes nothing, so the student with no model types
+    // their entire profile into a screen that has never stored a word of it.
+    expect(hasUnsavedEdits(p, null)).toBe(true);
+  });
+});
+
+/**
+ * The wiring the two fixes above need, which lives inside effects no test here can drive:
+ * this project's web tests render to static markup, where no effect runs and there is no
+ * `window`. Asserted against the source for the same reason the save-button holds are.
+ */
+describe('leaving G1 with something unsaved', () => {
+  const src = readFileSync(new URL('../src/pages/Onboarding.tsx', import.meta.url), 'utf8');
+
+  it('arms the browser leave prompt only while there is something to lose, and disarms it', () => {
+    expect(src).toContain("window.addEventListener('beforeunload', warn)");
+    expect(src).toContain("window.removeEventListener('beforeunload', warn)");
+    // Guarded on the unsaved flag. A prompt on every leave is one people learn to click
+    // through, and this one has to still mean something on the day it is right.
+    expect(src).toContain('if (!unsaved) return;');
+  });
+
+  it('offers the same fact to the host, since the nav that unmounts this screen is not ours', () => {
+    // The nav lives above this component and blocks on `busy` alone. This is the wizard's half
+    // of the guard; the host has to hold the click.
+    expect(src).toContain('onUnsaved?.(unsaved)');
+  });
+
+  it('asks the host to re-ask the server after the two writes that move G1', () => {
+    // Confirming sets `confirmedAt` and a re-extraction resets it; nothing else on this screen
+    // moves it, and the nav's lock and pill come from one health fetch made at mount.
+    expect(src.match(/onProfileChanged\?\.\(\)/g)).toHaveLength(2);
   });
 });

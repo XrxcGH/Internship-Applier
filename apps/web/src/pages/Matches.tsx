@@ -13,7 +13,7 @@ import {
   type MatchDetail,
   type MatchRow,
 } from '../lib/matches';
-import { queueKeyAction } from '../lib/queueKeys';
+import { queueKeyAction, type QueueKeyAction } from '../lib/queueKeys';
 import { Page, RunningHead, Section } from '../components/Chrome';
 import { Button, Empty, Notice } from '../components/Controls';
 import { RequirementChecklist, ScoreBreakdownBars } from '../components/RequirementChecklist';
@@ -65,6 +65,56 @@ export type PaneState = 'failed' | 'loading' | 'ready';
 export function detailPaneState(detail: MatchDetail | null, error: string | null): PaneState {
   if (error !== null) return 'failed';
   return detail === null ? 'loading' : 'ready';
+}
+
+/**
+ * Whether a keypress may act, given what the detail pane is actually showing.
+ *
+ * The four decision keys were armed from the moment a row was selected, and a row is
+ * selected the instant the list lands — a whole round trip before its posting arrives, and
+ * for good after that posting fails to arrive. So `a` pressed over "Reading the posting…"
+ * created a real application, and `a` pressed over "This posting would not open." created one
+ * too: an approval at G2 for a posting whose title, requirements, score and rationale the
+ * user had never been shown. The buttons were not the hole — they render inside
+ * `current && detail` and so are simply absent in both states — but this screen calls itself
+ * keyboard-first, and the keys had no such door.
+ *
+ * `j`, `k` and Escape stay live in every state deliberately. Moving off a posting that will
+ * not load is exactly what someone stuck at a dead pane needs to do, and a sheet that cannot
+ * be closed is worse than one that cannot be opened.
+ */
+export function keyActionAllowed(action: QueueKeyAction, pane: PaneState): boolean {
+  if (action === 'next' || action === 'prev' || action === 'close-sheet') return true;
+  return pane === 'ready';
+}
+
+/**
+ * The deadline chip on a queue row: what it says, and whether it is drawn in urgency red.
+ *
+ * `daysUntil` reads `closesAt` with `Date.parse`, and a date with no time — which is what
+ * USAJOBS's ApplicationCloseDate and JSON-LD's validThrough both hand over — parses to the
+ * FIRST instant of that day. So a posting closing "2026-09-09" turned red and read `closed`
+ * from midnight UTC on the 9th, for the whole of the last day the student could still apply;
+ * anywhere west of Greenwich it read `closed` before the 9th had begun locally.
+ *
+ * The server does not agree with that reading anywhere: `deadline` in eligibility.ts and the
+ * closing sweep in refresh.ts both stretch a bare date to the end of its day, so the
+ * checklist in the pane beside this chip said "Closes 2026-09-09 — met" while the row it was
+ * opened from called the posting closed. A false `closed` is this queue hiding a job the
+ * student could still have got, which is the direction this repo does not take.
+ *
+ * End of day in UTC, matching those two, rather than a local or generous one: eligibility.ts
+ * records that a wider stretch was tried and reverted because it carries the deadline into
+ * the following day. The other direction is untouched — a timestamp that has genuinely
+ * passed, and a bare date from yesterday, both still read `closed`.
+ */
+export function deadlineChip(closesAt: string | null): { text: string; urgent: boolean } | null {
+  const trimmed = closesAt?.trim() ?? null;
+  const instant =
+    trimmed !== null && /^\d{4}-\d{2}-\d{2}$/.test(trimmed) ? `${trimmed}T23:59:59.999Z` : trimmed;
+  const days = daysUntil(instant);
+  if (days === null) return null;
+  return { text: days < 0 ? 'closed' : `${days}d left`, urgent: days < 7 };
 }
 
 /**
@@ -189,6 +239,14 @@ export function Matches({
     // And the previous posting's failure with it, or moving off a match that would not load
     // left its error sitting over the next one, which loads fine.
     setDetailError(null);
+    // And the reject sheet, which belongs to the posting it was opened over. Clicking a
+    // different row with the sheet open left `rejecting` true while the pane holding it was
+    // unmounted: the seven reason buttons vanished, every key but Escape stayed swallowed by
+    // a sheet nobody could see, and when the new posting landed the sheet reappeared over IT
+    // — one press from filing "Pay is too low" against a posting picked for another reason
+    // entirely. Same class as the armed keys above: a G2 decision must land on the posting
+    // the user was actually judging.
+    setRejecting(false);
     if (!selected) return;
     let cancelled = false;
     getMatch(selected)
@@ -271,12 +329,21 @@ export function Matches({
     [selected],
   );
 
+  // Read once and shared, because the pane's three states now decide two things: what the
+  // detail column draws, and whether a decision key is allowed to fire over it.
+  const pane = detailPaneState(detail, detailError);
+
   // Keyboard triage. What each press means — and the chords that mean nothing here — is
-  // decided by queueKeyAction, which is tested on its own.
+  // decided by queueKeyAction, which is tested on its own; whether that meaning may be acted
+  // on over what is currently drawn is decided by keyActionAllowed, likewise.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const action = queueKeyAction(e, { rejecting });
       if (action === null) return;
+      // Not ours to swallow either: a key that may not act does not get preventDefault. The
+      // pane says out loud, in both states where this returns false, that decisions are held
+      // — a press that vanishes without a word is the thing being fixed, not the fix.
+      if (!keyActionAllowed(action, pane)) return;
       // Escape is left alone deliberately: it closes dialogs and leaves full screen, and
       // taking it over so the sheet can close is not worth breaking either of those.
       if (action !== 'close-sheet') e.preventDefault();
@@ -306,7 +373,7 @@ export function Matches({
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [move, act, rejecting]);
+  }, [move, act, rejecting, pane]);
 
   /**
    * Focus follows the selection, not just the scroll.
@@ -481,7 +548,7 @@ export function Matches({
             className="u-card divide-rule/50 max-h-[calc(100dvh-13rem)] divide-y overflow-y-auto lg:sticky lg:top-20"
           >
             {rows.map((m) => {
-              const days = daysUntil(m.closesAt);
+              const deadline = deadlineChip(m.closesAt);
               const badge = BADGE[m.eligibility]!;
               return (
                 <li key={m.id} data-id={m.id}>
@@ -511,12 +578,14 @@ export function Matches({
                         {badge.label}
                       </span>
                       <span className="u-data text-faint text-2xs">{locationLabel(m)}</span>
-                      {days !== null && (
+                      {deadline && (
                         <span
                           className="u-data text-2xs"
-                          style={{ color: days < 7 ? 'var(--redline)' : 'var(--ink-faint)' }}
+                          style={{
+                            color: deadline.urgent ? 'var(--redline)' : 'var(--ink-faint)',
+                          }}
                         >
-                          {days < 0 ? 'closed' : `${days}d left`}
+                          {deadline.text}
                         </span>
                       )}
                     </div>
@@ -531,10 +600,22 @@ export function Matches({
             {/* A slow read and a dead one said the same thing, which was nothing at all.
                 Both now speak, and the failure carries the control that actually re-runs the
                 fetch that failed rather than one that quietly re-reads something else. */}
-            {detailPaneState(detail, detailError) === 'loading' && (
-              <p className="text-dim a-pulse">Reading the posting…</p>
+            {pane === 'loading' && (
+              <>
+                <p className="text-dim a-pulse">Reading the posting…</p>
+                {/* Said, not merely done. The decision keys are held in both of these
+                    states — see keyActionAllowed — and a key that stops working without a
+                    word is how someone comes to believe they approved something. */}
+                <p className="text-faint mt-3 u-prose text-sm">
+                  <span className="u-data">a</span>, <span className="u-data">s</span>,{' '}
+                  <span className="u-data">l</span> and <span className="u-data">x</span> are held
+                  until it is on screen — G2 is a decision about a posting you have read.{' '}
+                  <span className="u-data">j</span> and <span className="u-data">k</span> still
+                  move.
+                </p>
+              </>
             )}
-            {detailPaneState(detail, detailError) === 'failed' && (
+            {pane === 'failed' && (
               <Notice tone="redline">
                 <strong>This posting would not open.</strong> {detailError}
                 <div className="mt-3">
@@ -542,6 +623,11 @@ export function Matches({
                     Try again
                   </Button>
                 </div>
+                <p className="mt-3 u-prose text-sm">
+                  Nothing about this posting is on screen, so the decision keys are held here too.{' '}
+                  <span className="u-data">j</span> and <span className="u-data">k</span> still move
+                  you off it.
+                </p>
               </Notice>
             )}
             {current && detail && (

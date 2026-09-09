@@ -112,20 +112,31 @@ function browserHeldBy(applicationId: string): FillRun | undefined {
      * open — until the user worked out which panel held the ghost and pressed a Close button
      * for a window that had already gone. Before the mutual exclusion existed, starting the
      * next application simply worked.
-     *
-     * `page.isClosed()` answers synchronously off Playwright's own state, so it costs nothing
-     * and cannot itself throw at a browser that has gone. The context is closed as well as
-     * forgotten: dropping the entry alone would leave the object holding the profile-directory
-     * lock that every later run needs, which is the orphan this file already fixed once.
      */
-    if (run.session.page.isClosed()) {
-      void run.session.close().catch(() => undefined);
-      runs.delete(run.applicationId);
-      continue;
-    }
+    if (forgetClosedWindow(run)) continue;
     return run;
   }
   return undefined;
+}
+
+/**
+ * Whether this run's window has gone, and forgets the run if it has.
+ *
+ * `page.isClosed()` answers synchronously off Playwright's own state, so it costs nothing and
+ * cannot itself throw at a browser that has gone. The context is closed as well as forgotten:
+ * dropping the entry alone would leave the object holding the profile-directory lock that every
+ * later run needs, which is the orphan this file already fixed once.
+ *
+ * Asked in the two places that are about to USE the browser — the mutual exclusion above, and a
+ * continue below — and deliberately nowhere else. `getRun` leaves a finished run alone on
+ * purpose: the field-by-field review it holds, and the "I submitted it" button beside it, are
+ * exactly what the user still needs after they have submitted the form and closed the window.
+ */
+function forgetClosedWindow(run: FillRun): boolean {
+  if (!run.session?.page.isClosed()) return false;
+  void run.session.close().catch(() => undefined);
+  runs.delete(run.applicationId);
+  return true;
 }
 
 export function getRun(applicationId: string): FillRun | undefined {
@@ -227,6 +238,36 @@ function refuseIfAggregator(run: FillRun): void {
       `This application's page redirected to ${new URL(here).hostname}. ${AGGREGATOR_REFUSAL}`,
     );
   }
+}
+
+/**
+ * Where the browser ACTUALLY DIALLED, which is not the address the guard checked.
+ *
+ * `openSession` resolves the name and refuses a private answer before the request leaves, and
+ * then Chromium resolves the same name AGAIN for itself. Nothing pins the answer between the
+ * two, so a host whose DNS the attacker controls answers a public address to the guard and
+ * 127.0.0.1 to the browser a moment later — and the browser doing the dialling is the persistent
+ * profile carrying the student's real logins and LAN cookies. browser.ts judges the address
+ * behind each document response; this is the point where the run acts on that verdict.
+ *
+ * It cannot un-send the request. What it can do is make sure nothing READS that page and nothing
+ * types the student's name, email and approved answers into it, which is why it runs at the same
+ * two moments `refuseIfAggregator` does.
+ *
+ * `dialsJudged` is awaited rather than skipped past: a verdict costs a lookup and `goto` returns
+ * before it lands, so reading `privateDial` on its own is a check that passes for the wrong
+ * reason on the one page it exists for.
+ */
+async function refuseIfPrivateAddress(run: FillRun): Promise<void> {
+  await run.session?.dialsJudged();
+  const dial = run.session?.privateDial;
+  if (!dial) return;
+  throw new SourceRefusedError(
+    `This application's page was served from ${dial.address}, an address on this machine or ` +
+      `its own network, although ${dial.host} resolved to a public address when the request ` +
+      'was checked a moment earlier. Nothing on that page was read, and nothing was typed ' +
+      'into it.',
+  );
 }
 
 /** The scheme of a URL, or null if it is not one. */
@@ -372,6 +413,8 @@ async function open(input: StartInput): Promise<FillRun> {
     await run.session.page.goto(input.applyUrl, { waitUntil: 'domcontentloaded' });
     // Where it landed, which is not always where it was sent.
     refuseIfAggregator(run);
+    // And which address it landed ON, which the browser chose for itself.
+    await refuseIfPrivateAddress(run);
 
     run.state = 'reading';
     const blocked = await detectIntervention(run.session.page);
@@ -451,6 +494,30 @@ export async function continueRun(input: StartInput): Promise<FillRun> {
   }
 
   /**
+   * A window the user closed is not a page that has been slow to load.
+   *
+   * Nothing listened for the X on the Chromium window here, so a continue after it went the
+   * whole way through: `detectIntervention` reads every frame of a dead page and each read
+   * throws, which `detectIntervention` treats as "that frame proves nothing" and answers null;
+   * `buildFormMap` scans the same frames and `scanFrame` matches Playwright's "target closed"
+   * against FRAME_GONE, so it returns no fields rather than raising. An empty plan then landed
+   * on the one branch below that describes an empty page — "Check the page in the browser
+   * window — the form may not have loaded yet." — about a browser window that was not there.
+   * The user's next move, going to look at that window, is the one move that cannot help.
+   *
+   * The run is forgotten rather than left `failed`, so the panel falls back to the card that
+   * opens a fresh browser: the way forward is a new window, and this run has nothing left in it.
+   * The prefix is the one routes/filling.ts already maps to 409 NO_RUN, because that is what
+   * this is — not a 502 saying the employer's site broke.
+   */
+  if (forgetClosedWindow(run)) {
+    throw new Error(
+      'No open fill run for this application. The browser window was closed, so there was ' +
+        'nothing left to fill or to read. Start the fill again to open the page.',
+    );
+  }
+
+  /**
    * One caller in the page at a time, claimed before the first await.
    *
    * This was `run.state === 'filling'`, which is the wrong question: a continue spends its
@@ -475,10 +542,27 @@ async function drive(run: FillRun, input: StartInput): Promise<FillRun> {
     throw new Error('No open fill run for this application. Start one first.');
   }
 
-  // Again here, because this re-reads and types into whatever the page currently shows — and
-  // between the start of a run and a continue, the person has been using that browser: they
-  // signed in, they clicked through a wizard, they may be somewhere else entirely.
-  refuseIfAggregator(run);
+  /**
+   * Again here, because this re-reads and types into whatever the page currently shows — and
+   * between the start of a run and a continue, the person has been using that browser: they
+   * signed in, they clicked through a wizard, they may be somewhere else entirely.
+   *
+   * AND THE WINDOW IS CLOSED WITH THE REFUSAL, which it was not. These two throw from outside
+   * the try below, so the run stayed in `runs` with its page still open on the host that had
+   * just rebound to a private address — and that page is the PERSISTENT profile, carrying the
+   * student's real logins and LAN cookies. `context.route` guards documents only, so the
+   * attacker page's own XHR back to the now-private name is not judged by `guardAddress` at
+   * all: leaving the tab open is precisely what lets the read the rebinding attack exists to
+   * perform continue happening. The start path already discards on this branch (`open()`'s
+   * catch); the continue path is where it was missing.
+   */
+  try {
+    refuseIfAggregator(run);
+    await refuseIfPrivateAddress(run);
+  } catch (err) {
+    await discardRun(input.applicationId);
+    throw err;
+  }
 
   // Everything past this point ends in a state the user can act on, the same way starting a
   // run does. A throw from the re-read or from the fill used to leave the run parked in

@@ -305,6 +305,12 @@ applications or missed ones.
   standing moderate is assessed in docs/13. **Dependabot is not configured** — `.github`
   holds `workflows/ci.yml` and nothing else, so upgrades are done by hand.
 - Lockfile committed; `npm ci` in CI.
-- Playwright browsers pinned to a specific revision.
+- Playwright browsers are pinned, in the sense that the revision is a property of the
+  `playwright` version the lockfile holds — but **nothing downloads them**. The package
+  declares no install script and no npm script runs `playwright install`, so a fresh clone has
+  the driver and no browser until someone runs `npx playwright install chromium` themselves
+  (docs/07 § Browser). Worth stating in this section and not only as a first-run annoyance: a
+  binary fetched by a manual command outside `npm ci` is one `npm audit` and the lockfile
+  never see.
 - New runtime dependencies need a one-line justification in the PR — this app handles a
   resume and drives a browser, and the supply-chain surface should stay small.

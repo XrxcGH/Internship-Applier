@@ -264,11 +264,7 @@ export function decodeEntities(html: string): string {
  * exactly what its regex did, one scan at a time instead of by backtracking.
  */
 export function stripHtml(html: string): string {
-  const withoutScripts = removeSpans(
-    removeSpans(html, '<script', '</script>'),
-    '<style',
-    '</style>',
-  );
+  const withoutScripts = removeElements(removeElements(html, 'script'), 'style');
 
   return decodeAll(
     removeTags(
@@ -281,30 +277,54 @@ export function stripHtml(html: string): string {
 }
 
 /**
- * What `/<script[\s\S]*?<\/script>/gi` did: each opener, to its nearest closer, replaced by a
- * space — and an opener with no closer after it left exactly as it was found.
+ * A script or style element and everything inside it, replaced by a space — INCLUDING when
+ * its closing tag never arrives.
  *
- * The opener is matched as a bare prefix with no word boundary, because the regex had none
- * either: `<scriptural>` opened a script span, and adding the boundary now would start
- * keeping page furniture that used to be dropped.
+ * This was exactly what `/<script[\s\S]*?<\/script>/gi` did, an opener with no closer after it
+ * left in the text as it was found. So a page whose `<script>` was never closed put its
+ * JAVASCRIPT SOURCE into the stored job description, and that is not a cosmetic leak: a string
+ * inside one such script — `var gate = "Applicants must be U.S. citizens."` — was read by the
+ * deterministic requirement pass as a citizenship rule the employer had stated, and hard-failed
+ * a student who is not a citizen out of a posting nobody had closed to them. An unterminated
+ * element now runs to the end of the input, which is what a browser does with one too: nothing
+ * after it is content, and a description that comes back short is a posting the reader tells
+ * the user it could barely read, which is the recoverable half of this trade.
+ *
+ * Malformed closers are the same failure arriving late. `</script >`, `</SCRIPT\n>` and
+ * `</script/>` all end the element in a browser and none of them is the literal `</script>`
+ * this used to search for, so each one leaked the whole rest of the page as well.
+ *
+ * THE OPENER'S PRECISION IS NOW LOAD-BEARING, where before an over-eager match only cost a
+ * little extra furniture. The old prefix match had no tag boundary — `<scriptural>` opened a
+ * script span — and against the rule above, one custom element named `<script-loader>` or
+ * `<style-guide>` with no `</script>` behind it would have deleted the rest of the posting.
+ * Both ends therefore require what an HTML parser requires: the name followed by whitespace,
+ * `/` or `>`.
  *
  * Once no closer can be found ahead of one opener, none can be found ahead of any later one,
- * and the search stops. Without that, a body of repeated `<script` would scan to the end of
- * the string once per occurrence — the same quadratic cost arriving by a different road.
+ * and the scan stops there. Without that, a body of repeated `<script` would scan to the end
+ * of the string once per occurrence — the same quadratic cost arriving by a different road.
  */
-function removeSpans(html: string, open: string, close: string): string {
+function removeElements(html: string, name: string): string {
+  const open = `<${name}`;
+  const close = `</${name}`;
   const out: string[] = [];
   let at = 0;
 
   for (;;) {
-    const start = findTag(html, open, at);
+    const start = findElement(html, open, at);
     if (start === -1) break;
 
-    const end = findTag(html, close, start + open.length);
-    if (end === -1) break;
-
     out.push(html.slice(at, start), ' ');
-    at = end + close.length;
+
+    const end = findElement(html, close, start + open.length);
+    if (end === -1) return out.join('');
+
+    // The closing tag runs to its own `>`, which is where a browser resumes reading content.
+    // A closer with no `>` after it is another unterminated tag: the rest is not content.
+    const shut = html.indexOf('>', end + close.length);
+    if (shut === -1) return out.join('');
+    at = shut + 1;
   }
 
   out.push(html.slice(at));
@@ -354,12 +374,26 @@ function removeTags(html: string): string {
  * exists to remove, arriving by a third road. And lowercasing can change a string's length —
  * `'İ'.toLowerCase()` is two characters — so an index found in the copy can point somewhere
  * else in the original, which is a wrong answer rather than a slow one.
+ *
+ * `tag` is `<script` or `</script`, and what follows the name has to be something an HTML
+ * parser accepts as the end of it. See `removeElements` for why that boundary is not optional.
  */
-function findTag(html: string, tag: string, from: number): number {
+function findElement(html: string, tag: string, from: number): number {
   for (let at = html.indexOf('<', from); at !== -1; at = html.indexOf('<', at + 1)) {
-    if (html.slice(at, at + tag.length).toLowerCase() === tag) return at;
+    if (html.slice(at, at + tag.length).toLowerCase() !== tag) continue;
+    if (endsTagName(html[at + tag.length])) return at;
   }
   return -1;
+}
+
+/**
+ * What may follow a tag name — the five characters HTML counts as whitespace, the self-closing
+ * slash, and the bracket. End of input is deliberately not one of them: `<script` with nothing
+ * after it is the literal text a truncated page ended on, never an element that swallows the
+ * rest of the document.
+ */
+function endsTagName(ch: string | undefined): boolean {
+  return ch !== undefined && (ch === '>' || ch === '/' || /[ \t\n\f\r]/.test(ch));
 }
 
 /**

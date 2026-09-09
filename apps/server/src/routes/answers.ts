@@ -12,7 +12,13 @@ import type { FastifyInstance } from 'fastify';
 import { desc, eq } from 'drizzle-orm';
 import { ulid } from 'ulid';
 import { z } from 'zod';
-import type { AnswerEvidence, AnswerFlag, ConfirmedProfile, StyleProfile } from '@ia/shared';
+import type {
+  AnswerEvidence,
+  AnswerFlag,
+  ApplicationStatus,
+  ConfirmedProfile,
+  StyleProfile,
+} from '@ia/shared';
 import { db, schema } from '../infra/db/client';
 import { decryptField } from '../infra/crypto/fieldCrypto';
 import {
@@ -26,6 +32,7 @@ import {
 import { publish } from '../infra/events';
 import { logger } from '../infra/logger';
 import { getProfile } from '../core/profile/repository';
+import { SET_BY } from '../core/tracking/status';
 import { gatePostingContext, WHOLE_PROFILE } from '../core/filling/plan';
 import { draftAnswer } from '../core/writing/draft';
 import { guardDraft, type GuardResult } from '../core/writing/factGuard';
@@ -110,6 +117,79 @@ function loadContext(applicationId: string): ApplicationContext | null {
 function confirmedProfile(): ConfirmedProfile | null {
   const p = getProfile();
   return p?.confirmedAt ? (p as ConfirmedProfile) : null;
+}
+
+// ───────────────────────────────────────────── the record, once it has been sent
+
+/**
+ * The statuses this tool sets for itself, worked out from who is allowed to set each one.
+ *
+ * Derived rather than listed, and derived a second time here rather than shared out of
+ * routes/matches.ts, which needs the same set for the same reason: both read the one table in
+ * core/tracking/status.ts, so a status added to the model later reaches both at once. A
+ * hand-written list is how it would reach neither.
+ */
+const TOOL_STATUSES: ReadonlySet<ApplicationStatus> = new Set(
+  (Object.keys(SET_BY) as ApplicationStatus[]).filter((s) => SET_BY[s] === 'tool'),
+);
+
+/**
+ * Refuses to touch the answers of an application the user has already sent.
+ *
+ * Every endpoint under `/api/answers/:id` rewrote or destroyed rows with no idea what the
+ * application beneath them had become. The worst was DELETE, which took the id, ran the
+ * delete and answered 204 whatever it hit: an essay approved at G3, filled into an employer's
+ * form and submitted six weeks ago was one request away from being gone, and it is the ONLY
+ * copy — `draft_text` and `final_text` are where what the employer was told is written down,
+ * and nothing else in this app keeps a version of it. The same hole let a redraft overwrite
+ * that text with a fresh model answer, an edit save over it, and unapprove strip the G3 stamp
+ * off a sent application so the tracker asked for approval on something already gone.
+ *
+ * So the whole mutation surface is covered, not just the reported DELETE: DELETE, PATCH,
+ * POST :id/draft, POST :id/approve, POST :id/unapprove, and POST
+ * /api/applications/:id/questions — the last because a question added to a sent application
+ * can no longer be drafted or deleted by the rules above, leaving a permanently unapproved
+ * answer that reads on the tracker as work still owed.
+ *
+ * The rule itself is not new here, only its reach: `withdrawStaleApprovals` in
+ * routes/profile.ts already leaves a sent application's answers alone, because "that text
+ * reached the employer" and re-flagging it would be the tool telling a story about something
+ * it cannot change. That held for the one pass that runs by itself while every endpoint a
+ * client can call walked straight past it. "Already sent" is then the definition
+ * routes/matches.ts uses to refuse reversing a G2 approval: `submitted_at` written, or a
+ * status only the user can set. Reading endpoints are untouched — a sent application stays
+ * fully readable, which is the entire point of keeping it.
+ */
+function refuseIfSent(
+  applicationId: string,
+  attempt: string,
+): { error: { code: 'APPLICATION_IN_PROGRESS'; message: string; details: unknown } } | null {
+  const row = db
+    .select({ status: schema.application.status, submittedAt: schema.application.submittedAt })
+    .from(schema.application)
+    .where(eq(schema.application.id, applicationId))
+    .all()[0];
+  if (!row) return null;
+  if (row.submittedAt === null && TOOL_STATUSES.has(row.status as ApplicationStatus)) return null;
+
+  return {
+    error: {
+      code: 'APPLICATION_IN_PROGRESS',
+      // Two sentences, because the two cases are not the same claim. An application the user
+      // withdrew was quite possibly never sent to anybody, and telling them these answers are
+      // "what this employer was told" would be the app asserting something it does not know —
+      // the mistake this repo cares most about not making.
+      message:
+        row.submittedAt !== null
+          ? `You have already sent application ${applicationId}, so its answers are the record ` +
+            `of what this employer was actually told. ${attempt} is refused: this is the only ` +
+            'copy of that text.'
+          : `Application ${applicationId} is ${row.status.replace(/_/g, ' ')}, which is past ` +
+            `the point this tool acts on it. ${attempt} is refused: its answers stay as the ` +
+            'record of what was prepared.',
+      details: { applicationId, status: row.status },
+    },
+  };
 }
 
 /** What the posting contributes to a draft and to the gate. */
@@ -374,6 +454,9 @@ export async function answerRoutes(app: FastifyInstance): Promise<void> {
         .send({ error: { code: 'NOT_FOUND', message: 'No such application.' } });
     }
 
+    const sent = refuseIfSent(req.params.id, 'Adding a question to it');
+    if (sent) return reply.code(409).send(sent);
+
     const parsed = QuestionBody.safeParse(req.body);
     if (!parsed.success) {
       return reply.code(400).send({
@@ -385,7 +468,7 @@ export async function answerRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const id = ulid();
-    const { questionText, fieldKey, answerType } = parsed.data;
+    const { questionText, fieldKey, answerType, maxWords } = parsed.data;
 
     // Offer a previously approved answer, if one is safe to reuse for this company.
     const reusable = findReusable(questionText, ctx.company);
@@ -424,13 +507,48 @@ export async function answerRoutes(app: FastifyInstance): Promise<void> {
     return reply.code(201).send({
       ...answerPayload(row),
       reusedFrom: reusable ? { useCount: reusable.useCount, company: reusable.company } : null,
+      /**
+       * The word ceiling, handed straight back, because there is nowhere to put it.
+       *
+       * `maxWords` was validated here — a caller sending 3000 got a 400 naming the field —
+       * and then dropped on the floor, which is the one behaviour that cannot be right: a
+       * limit worth rejecting is a limit somebody believes is being honoured. There is no
+       * `max_words` column on `application_answer` to store it in, and drafting takes the
+       * ceiling per request (`POST /api/answers/:id/draft`, docs/06 § ③), so this is as far
+       * as the question route can carry it: echoed, with the sentence below saying who has
+       * to carry it the rest of the way. Same answer as `ignoredFilters` in
+       * routes/discovery.ts gives for the filters the query planner does not read — say it
+       * out loud rather than let an API caller infer it by reading the source.
+       */
+      maxWords: maxWords ?? null,
+      notes:
+        maxWords === undefined
+          ? []
+          : [
+              `The ${String(maxWords)}-word limit is not stored with the question. Send it as ` +
+                `{ "maxWords": ${String(maxWords)} } on POST /api/answers/${id}/draft, which is ` +
+                'the only place a ceiling reaches the prompt.',
+            ],
     });
   });
 
-  app.delete<{ Params: { id: string } }>('/api/answers/:id', async (_req, reply) => {
-    db.delete(schema.applicationAnswer)
-      .where(eq(schema.applicationAnswer.id, _req.params.id))
-      .run();
+  app.delete<{ Params: { id: string } }>('/api/answers/:id', async (req, reply) => {
+    // The row is read before it is deleted, which it was not: the delete ran against
+    // whatever id arrived and answered 204 either way, so a caller could not tell a deleted
+    // answer from one that never existed — and a typo in an id read as success.
+    const row = db
+      .select({ applicationId: schema.applicationAnswer.applicationId })
+      .from(schema.applicationAnswer)
+      .where(eq(schema.applicationAnswer.id, req.params.id))
+      .all()[0];
+    if (!row) {
+      return reply.code(404).send({ error: { code: 'NOT_FOUND', message: 'No such answer.' } });
+    }
+
+    const sent = refuseIfSent(row.applicationId, 'Deleting this answer');
+    if (sent) return reply.code(409).send(sent);
+
+    db.delete(schema.applicationAnswer).where(eq(schema.applicationAnswer.id, req.params.id)).run();
     return reply.code(204).send();
   });
 
@@ -446,6 +564,9 @@ export async function answerRoutes(app: FastifyInstance): Promise<void> {
       if (!row) {
         return reply.code(404).send({ error: { code: 'NOT_FOUND', message: 'No such answer.' } });
       }
+
+      const sent = refuseIfSent(row.applicationId, 'Redrafting it');
+      if (sent) return reply.code(409).send(sent);
 
       const profile = confirmedProfile();
       if (!profile) {
@@ -565,6 +686,9 @@ export async function answerRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(404).send({ error: { code: 'NOT_FOUND', message: 'No such answer.' } });
     }
 
+    const sent = refuseIfSent(row.applicationId, 'Editing it');
+    if (sent) return reply.code(409).send(sent);
+
     const parsed = EditBody.safeParse(req.body);
     if (!parsed.success) {
       return reply
@@ -618,6 +742,9 @@ export async function answerRoutes(app: FastifyInstance): Promise<void> {
     if (!row) {
       return reply.code(404).send({ error: { code: 'NOT_FOUND', message: 'No such answer.' } });
     }
+
+    const sent = refuseIfSent(row.applicationId, 'Approving it now');
+    if (sent) return reply.code(409).send(sent);
 
     const text = row.finalText || row.draftText;
     if (text.trim().length === 0) {
@@ -698,10 +825,9 @@ export async function answerRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.post<{ Params: { id: string } }>('/api/answers/:id/unapprove', async (req, reply) => {
-    db.update(schema.applicationAnswer)
-      .set({ approvedAt: null })
-      .where(eq(schema.applicationAnswer.id, req.params.id))
-      .run();
+    // Read, then check, then write — it used to clear the approval first and look for the
+    // row afterwards, so the one endpoint that strips a G3 stamp did its write before it
+    // knew whose answer it was writing to.
     const row = db
       .select()
       .from(schema.applicationAnswer)
@@ -710,7 +836,21 @@ export async function answerRoutes(app: FastifyInstance): Promise<void> {
     if (!row) {
       return reply.code(404).send({ error: { code: 'NOT_FOUND', message: 'No such answer.' } });
     }
-    return answerPayload(row);
+
+    const sent = refuseIfSent(row.applicationId, 'Withdrawing your approval of it');
+    if (sent) return reply.code(409).send(sent);
+
+    db.update(schema.applicationAnswer)
+      .set({ approvedAt: null })
+      .where(eq(schema.applicationAnswer.id, row.id))
+      .run();
+
+    const updated = db
+      .select()
+      .from(schema.applicationAnswer)
+      .where(eq(schema.applicationAnswer.id, row.id))
+      .all()[0]!;
+    return answerPayload(updated);
   });
 
   /** What model access this install has, and why drafting may be unavailable. */
@@ -740,6 +880,21 @@ export async function answerRoutes(app: FastifyInstance): Promise<void> {
   app.get('/api/answer-library', async () => ({ entries: listLibrary() }));
 
   app.delete<{ Params: { id: string } }>('/api/answer-library/:id', async (req, reply) => {
+    // The same existence check as DELETE /api/answers/:id above, for the same reason: a 204
+    // over an id that was never there tells the caller their delete worked. No sent-record
+    // guard, though — a library entry is a copy kept for reuse, and removing it changes
+    // nothing about what any employer was told.
+    const row = db
+      .select({ id: schema.answerTemplate.id })
+      .from(schema.answerTemplate)
+      .where(eq(schema.answerTemplate.id, req.params.id))
+      .all()[0];
+    if (!row) {
+      return reply
+        .code(404)
+        .send({ error: { code: 'NOT_FOUND', message: 'No such saved answer.' } });
+    }
+
     db.delete(schema.answerTemplate).where(eq(schema.answerTemplate.id, req.params.id)).run();
     return reply.code(204).send();
   });

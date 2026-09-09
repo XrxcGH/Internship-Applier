@@ -140,6 +140,29 @@ npm run dev
   Playwright browser.
 - `apps/web` — Vite dev server on `127.0.0.1:5173`, proxying `/api` to the server.
 - Playwright browser launches lazily on the first fill request and persists for the session.
+  The Chromium it launches is **not** installed by `npm install` — see docs/07 § Browser and
+  the README's § Running it for the one command that installs it.
+
+**Two processes, one `.env`, and only one of them reads it.** `config.ts` calls
+`process.loadEnvFile` on the repo-root `.env`. `apps/web/vite.config.ts` does not: it reads
+`process.env.SERVER_PORT` and `process.env.WEB_PORT` off the environment it was started in,
+and Vite's own env handling would not help even if it were asked — that populates
+`import.meta.env` for client code from `VITE_`-prefixed keys, not `process.env` for the
+config file. Both variables sit in `.env.example` under headings that invite exactly the
+wrong move, and the two fail in opposite directions:
+
+- **`SERVER_PORT` in `.env` breaks `npm run dev`.** This is what the server's own EADDRINUSE
+  message recommends, and under `npm start` — one process, no proxy — it is correct. Under
+  `npm run dev` the API moves to 8788 while the proxy target stays at 8787, which is
+  usually the stale server that caused the conflict: still listening, still answering, so
+  the interface talks to yesterday's process rather than failing cleanly. Stop the process
+  the message names, or export the variable for the whole command
+  (`SERVER_PORT=8788 npm run dev`) so both halves see one number.
+- **`WEB_PORT` in `.env` moves nothing.** The server reads it — it is where `config.web.origin`
+  comes from — and Vite does not, so the CORS allowlist moves to 5174 and the dev server goes
+  on listening on 5173. Nothing breaks, because the dev proxy makes the browser's `/api`
+  requests same-origin and CORS never engages, and the Host check in `app.ts` ignores the port
+  on purpose. It simply does not do the one thing the person setting it wanted.
 
 In production packaging (M8), `apps/web` is built to static files served by Fastify, and the
 whole thing ships as a single `npx internship-applier` command that opens the browser to
@@ -236,8 +259,13 @@ internship-applier/
    JD; `eligibility` runs hard rules (pure functions); survivors get a `score` with a
    per-dimension breakdown and a `rationale`.
 5. **G2 · Approve.** Matches land in the review queue. User approves, skips, or rejects with
-   a reason. The reason and its tags are stored on the `decision` row and **nothing reads
-   them**: `score.ts` never sees a decision, and no query in the server joins that table.
+   a reason. The reason and its tags are stored on the `decision` row and **nothing acts on
+   them**: `score.ts` never sees a decision. Two queries touch that table and neither is a
+   use — `?hideDecided` selects `matchId` and nothing else, and `GET /api/matches/:id` hands
+   the whole row back to a screen that displays none of it. `Matches.tsx` says so on its own
+   face: "nothing here reads any of them back yet, so treat all three as final." Stated this
+   way round rather than as "no query reads it", because a reader auditing where their reject
+   reason goes will find those two and needs to know what they do.
    This step used to say they "feed preference learning", which is a promise that ranking
    improves as you triage — so a user giving honest reject reasons was paying a real cost
    into a mechanism that does not exist.

@@ -14,6 +14,16 @@
  * question text is; and any stored answer whose own text names the company it was written
  * for is refused for a different company whatever its archetype says.
  *
+ * THE COMPANY IS NOT THE ONLY THING AN ANSWER CAN BE WRONG ABOUT. A stored answer also
+ * commits to a city and a start date, and those belong to the POSTING rather than to the
+ * employer: "Yes — I can be on-site in Columbus three days a week" pre-filled itself into an
+ * Austin application, and "I am available from June 8 through August 14" pre-filled itself
+ * into a fall co-op. Neither names a company, so neither check above saw anything, and at G3
+ * both read as the student's own sentence — because they are. A third mechanism therefore
+ * refuses to reuse an answer that PROMISES a place or a date; past narration ("I tutored in
+ * Columbus last summer") is untouched, because a fact about the writer stays true whichever
+ * posting reads it. See `promisesAParticular`.
+ *
  * Reuse pre-fills; it does not approve. Gate G3 still applies to every answer on every
  * application. What reuse buys is a fast confirm instead of a fresh review, and the card
  * says where the text came from.
@@ -304,6 +314,101 @@ function namesCompany(text: string, company: string): boolean {
     .some((w) => haystack.includes(` ${w.toLowerCase()} `));
 }
 
+// ───────────────────────────────────── particulars that belong to one posting
+
+/**
+ * Sentences that PROMISE something, rather than describe something that happened.
+ *
+ * This is the whole distinction the place and date check below rests on. "I tutored in
+ * Columbus every Saturday" is a fact about the writer and stays true on every application
+ * they ever send; "I can be on-site in Columbus three days a week" is an undertaking to one
+ * employer about one posting, and carrying it to the next posting hands the student a
+ * commitment they never made. Refusing every answer that mentions a city or a month would
+ * empty the library — most good answers narrate — so only the promising clause is read.
+ *
+ * The vocabulary is the one an applicant actually uses for availability, location and
+ * travel. `start` is deliberately narrow: bare "started" opens half the sentences on a
+ * resume, so only its forward-looking forms ("can start", "start date", "starting in June")
+ * count.
+ */
+const COMMITMENT_CLAUSE = new RegExp(
+  [
+    String.raw`\bavailab(?:le|ility)\b`,
+    String.raw`\b(?:can|could|able to|willing to|happy to|ready to|free to|hoping to|planning to|plan to|expect to|intend to)\s+(?:\w+\s+){0,2}?(?:start|begin|work|be|commute|attend|relocate|move|join|intern|travel)\b`,
+    String.raw`\bstart(?:ing)?\s+(?:date|in|on|from|as early as|no earlier than)\b`,
+    String.raw`\b(?:relocat|commut)\w*`,
+    String.raw`\bon-?site\b`,
+    String.raw`\bin person\b`,
+    String.raw`\bwork(?:ing)?\s+(?:from|out of)\b`,
+  ].join('|'),
+  'i',
+);
+
+/**
+ * A date the next posting can disagree with: a month, a season, a year, a calendar date.
+ *
+ * The numeric form takes a slash and not a hyphen. "6/8" is a date; "I can work 3-5 days a
+ * week" is a range, and refusing that would throw away the most reusable availability answer
+ * there is. An ISO date keeps its year, so `20\d{2}` still catches it.
+ */
+const DATED = new RegExp(
+  [
+    String.raw`\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b`,
+    String.raw`\b(?:spring|summer|fall|autumn|winter)\b`,
+    String.raw`\b20\d{2}\b`,
+    String.raw`\b\d{1,2}\s*/\s*\d{1,2}\b`,
+    String.raw`\b\d{1,2}(?:st|nd|rd|th)\b`,
+  ].join('|'),
+  'i',
+);
+
+/**
+ * May, the one month that is also the commonest modal verb in this kind of writing.
+ *
+ * In the list above it would have refused every answer containing "I may be free earlier",
+ * which is most of them. Capitalised it is the month; lowercase it is the month only where a
+ * modal cannot stand — next to a day number, or behind a preposition.
+ */
+const MAY_CAPITALISED = /\bMay\b/;
+const MAY_AS_MONTH =
+  /\bmay\s+\d{1,2}\b|\b\d{1,2}\s+may\b|\b(?:in|from|by|until|till|before|after|during|through)\s+may\b/i;
+
+const statesADate = (s: string): boolean =>
+  DATED.test(s) || MAY_CAPITALISED.test(s) || MAY_AS_MONTH.test(s);
+
+/**
+ * A place the next posting can disagree with.
+ *
+ * There is no gazetteer here and there does not need to be one: inside a clause that is
+ * already promising something, a capitalised word after a locative preposition is a city, a
+ * campus or an employer, and all three are things the next posting may not share. "in
+ * Columbus", "to Austin, TX", "out of the Cleveland office". Case matters — "at your office"
+ * promises nothing anybody can be wrong about.
+ */
+const PLACED =
+  /\b(?:in|at|to|near|around|outside|from|within|inside|of)\s+(?:the\s+)?[A-Z][A-Za-z.'’-]+(?:[ -](?:of\s+)?[A-Z][A-Za-z.'’-]+){0,3}/;
+
+/** Sentences, roughly. Enough to keep a promise in one line from tainting the next. */
+const sentences = (text: string): string[] => text.split(/(?<=[.!?;])\s+|\n+/);
+
+/**
+ * Does this stored answer promise a place or a date that the next posting may not share?
+ *
+ * The `availability` and `relocation` archetypes hand over the WHOLE text rather than the
+ * promising clauses within it, because for those two the question itself is the promise and
+ * the answer is frequently a fragment with no verb at all: "June 8 through August 14.",
+ * "Columbus or remote." Nothing in those sentences matches a commitment vocabulary, and they
+ * are the two answers most certain to be wrong on the next posting.
+ */
+function promisesAParticular(text: string, archetype: Archetype): boolean {
+  const clauses =
+    archetype === 'availability' || archetype === 'relocation'
+      ? [text]
+      : sentences(text).filter((s) => COMMITMENT_CLAUSE.test(s));
+
+  return clauses.some((c) => statesADate(c) || PLACED.test(c));
+}
+
 /**
  * An approved answer to reuse, or null.
  *
@@ -311,7 +416,7 @@ function namesCompany(text: string, company: string): boolean {
  * refuses anything never approved: an unapproved draft is not a library entry.
  */
 export function findReusable(question: string, company: string | null): LibraryEntry | null {
-  const { key, companySpecific } = classifyQuestion(question);
+  const { key, companySpecific, archetype } = classifyQuestion(question);
 
   const row = db
     .select()
@@ -338,6 +443,24 @@ export function findReusable(question: string, company: string | null): LibraryE
   // about Acme. What matters is whether the text names its own company, not which bucket
   // the question fell into.
   if (!sameCompany && entry.company && namesCompany(entry.text, entry.company)) return null;
+
+  /**
+   * And the same argument for the two things a stored answer promises that are not the
+   * company: where the student will be, and when they can start.
+   *
+   * `sameCompany` buys no exemption here, and that is the point rather than an oversight.
+   * The unit this file can see is the employer; the unit a start date and an office belong
+   * to is the POSTING, and one employer posts a summer internship and a fall co-op in two
+   * cities. A stored "I am available from June 8 through August 14" is wrong for the second
+   * Northwind posting exactly as it is wrong for Beta Corp's, and nothing reaching this
+   * function can tell the two apart.
+   *
+   * The honest fix one layer up is for the caller to hand over the posting's city and term
+   * alongside its company, so this becomes a comparison instead of a refusal; until then a
+   * refusal costs one re-draft of a one-line answer, and the alternative is a commitment the
+   * student never made arriving at G3 already written in their own voice.
+   */
+  if (promisesAParticular(entry.text, archetype)) return null;
 
   return entry;
 }

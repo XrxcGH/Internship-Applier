@@ -172,6 +172,11 @@ describe('dedupe', () => {
     expect(unique[0]!.mergedBy).toContain('fingerprint');
   });
 
+  /**
+   * Stage 3's reason for existing: one job, two boards, two spellings of the title. The
+   * aggregator carries no location at all, which is the ordinary shape — it contradicts
+   * nothing, so it still merges.
+   */
   it('catches near-duplicate titles across different sources', () => {
     const { unique } = dedupe([
       { posting: posting({ canonicalUrl: 'https://a.com/1' }), source: 'greenhouse:acme' },
@@ -179,7 +184,7 @@ describe('dedupe', () => {
         posting: posting({
           canonicalUrl: 'https://b.com/2',
           title: 'Software Engineering Intern',
-          locations: [{ city: 'Cambridge', remote: false }],
+          locations: [],
         }),
         source: 'adzuna:us',
       },
@@ -189,17 +194,164 @@ describe('dedupe', () => {
   });
 
   /**
+   * The same title in two offices is two requisitions with two apply URLs, and this used to
+   * be one row. Stage 3 ignored the city entirely, so the Boston sighting survived, the
+   * Seattle one was discarded whole — its location, its URL, its apply link — and a student
+   * in Seattle was shown the job in Boston instead of the one down the road. Stage 2 cannot
+   * catch it: its key already holds the city, so these two never meet there.
+   *
+   * This test previously asserted the opposite, with Boston and Cambridge.
+   */
+  it('keeps the same role in two cities as two postings', () => {
+    const { unique, duplicates } = dedupe([
+      { posting: posting({ canonicalUrl: 'https://a.com/1' }), source: 'greenhouse:acme' },
+      {
+        posting: posting({
+          canonicalUrl: 'https://b.com/2',
+          applyUrl: 'https://b.com/2/apply',
+          title: 'Software Engineering Intern',
+          locations: [{ city: 'Seattle', region: 'WA', remote: false }],
+        }),
+        source: 'adzuna:us',
+      },
+    ]);
+    expect(unique).toHaveLength(2);
+    expect(duplicates).toBe(0);
+    // Both apply URLs survive, which is the half of this the student actually clicks.
+    expect(unique.map((u) => u.posting.applyUrl)).toEqual([
+      'https://example.com/jobs/1',
+      'https://b.com/2/apply',
+    ]);
+  });
+
+  it('is not fooled by two cities that share a name on different continents', () => {
+    // Cambridge, MA and Cambridge, GB are the same word and a visa apart. The city alone
+    // matches, so only the country stops these merging into one row.
+    const { unique } = dedupe([
+      {
+        posting: posting({
+          canonicalUrl: 'https://a.com/1',
+          locations: [{ city: 'Cambridge', region: 'MA', country: 'US', remote: false }],
+        }),
+        source: 'greenhouse:acme',
+      },
+      {
+        posting: posting({
+          canonicalUrl: 'https://b.com/2',
+          title: 'Software Engineering Intern',
+          locations: [{ city: 'Cambridge', country: 'GB', remote: false }],
+        }),
+        source: 'adzuna:uk',
+      },
+    ]);
+    expect(unique).toHaveLength(2);
+  });
+
+  /**
+   * The other direction, which the guard above must not break: one office, written two ways.
+   * A board that states the region and an aggregator that gives the bare city are still the
+   * same posting, and leaving them apart would be the duplicate stage 3 exists to remove.
+   */
+  it('still merges one office written with and without its region', () => {
+    const { unique } = dedupe([
+      {
+        posting: posting({
+          canonicalUrl: 'https://a.com/1',
+          locations: [{ city: 'Boston', region: 'MA', remote: false }],
+        }),
+        source: 'greenhouse:acme',
+      },
+      {
+        posting: posting({
+          canonicalUrl: 'https://b.com/2',
+          title: 'Software Engineering Intern',
+          locations: [{ city: 'boston ', remote: false }],
+        }),
+        source: 'adzuna:us',
+      },
+    ]);
+    expect(unique).toHaveLength(1);
+    expect(unique[0]!.mergedBy).toContain('title');
+  });
+
+  /**
+   * A merge must not throw away where the other source said the job is.
+   *
+   * The eligibility `location` rule fails a posting outright when every location it has is
+   * remote and the user has remote turned off. The survivor here is a remote-only listing, so
+   * keeping only its own locations turned a job with an office in the student's city into a
+   * hard ineligible with no override.
+   */
+  it('keeps the city the other sighting named', () => {
+    const { unique } = dedupe([
+      {
+        posting: posting({ canonicalUrl: 'https://a.com/1', locations: [{ remote: true }] }),
+        source: 'greenhouse:acme',
+      },
+      {
+        posting: posting({
+          canonicalUrl: 'https://b.com/2',
+          title: 'Software Engineering Intern',
+          locations: [{ city: 'Boston', region: 'MA', remote: false }],
+        }),
+        source: 'adzuna:us',
+      },
+    ]);
+    expect(unique).toHaveLength(1);
+    expect(unique[0]!.posting.locations).toEqual([
+      { remote: true },
+      { city: 'Boston', region: 'MA', remote: false },
+    ]);
+    // Appended, never prepended: `fingerprint` keys on locations[0].city, and persistence
+    // matches stored rows on that key across runs.
+    expect(fingerprint(unique[0]!.posting)).toBe(fingerprint(posting({ locations: [] })));
+  });
+
+  it('does not stack a place both sightings named', () => {
+    const { unique } = dedupe([
+      { posting: posting({ canonicalUrl: 'https://a.com/1' }), source: 'greenhouse:acme' },
+      {
+        posting: posting({
+          canonicalUrl: 'https://a.com/1',
+          locations: [{ city: 'Boston', remote: false }],
+        }),
+        source: 'adzuna:us',
+      },
+    ]);
+    expect(unique[0]!.posting.locations).toEqual([{ city: 'Boston', remote: false }]);
+  });
+
+  it('leaves the postings it was handed alone', () => {
+    // These objects belong to the adapters that built them. Growing their `locations` in
+    // place would leak one run's merges into the next sighting of the same object.
+    const remote = posting({ canonicalUrl: 'https://a.com/1', locations: [{ remote: true }] });
+    dedupe([
+      { posting: remote, source: 'greenhouse:acme' },
+      {
+        posting: posting({
+          canonicalUrl: 'https://b.com/2',
+          title: 'Software Engineering Intern',
+          locations: [{ city: 'Boston', remote: false }],
+        }),
+        source: 'adzuna:us',
+      },
+    ]);
+    expect(remote.locations).toEqual([{ remote: true }]);
+  });
+
+  /**
    * Two similar titles from the SAME source are usually genuinely distinct requisitions
    * (a frontend and a backend intern posting, say). Merging them would silently hide one.
    */
   it('does not merge similar titles within a single source', () => {
+    // Same city on purpose, so the only thing keeping these apart is the source guard. With
+    // two different cities this passed whether that guard existed or not.
     const { unique } = dedupe([
       { posting: posting({ canonicalUrl: 'https://a.com/1' }), source: 'greenhouse:acme' },
       {
         posting: posting({
           canonicalUrl: 'https://a.com/2',
           title: 'Software Engineering Intern',
-          locations: [{ city: 'Cambridge', remote: false }],
         }),
         source: 'greenhouse:acme',
       },

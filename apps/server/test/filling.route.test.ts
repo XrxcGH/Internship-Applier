@@ -4,8 +4,9 @@
  * Nothing here opens a browser: these assert that the server REFUSES before it would. The
  * behavioural fill tests live in fill.test.ts against the fixture.
  */
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import type { CandidateProfile, FormField } from '@ia/shared';
@@ -1226,5 +1227,52 @@ describe('the application detail carries the application’s own state', () => {
     const body = res.json() as { status?: string; submittedAt?: string | null };
     expect(body.status).toBe('draft');
     expect(body.submittedAt).toBeNull();
+  });
+});
+
+/**
+ * The list of fields the student still has to fill in themselves, and when it is written down.
+ *
+ * The write used to sit inside `if (run.state === 'done' && run.result && run.result.filled >
+ * 0)`, together with the status advance and the `filled` event. Those two want that guard —
+ * a form nothing was typed into must not be walked to `awaiting_submit`, and a `filled` event
+ * over it tells the tracker the form is ready to submit when it is not.
+ *
+ * The skipped list does not. A form whose every field is redlined — an SSN, an EEO block, an
+ * attestation, nothing this tool may type — fills ZERO and produces the longest such list
+ * there is. It was computed, shown once in the review panel, and never persisted: that panel
+ * reads the run held in memory, which is gone when the browser closes, when a second run
+ * starts and when the server stops. The student came back and the column
+ * `GET /api/applications/:id` reads was empty, so the app had nothing to say about the work
+ * it had left them.
+ *
+ * Asserted against the source because the alternative is driving a real Chromium through a
+ * redline-only form to observe one column — the same reason runConflicts.test.ts reads
+ * core/filling/run.ts rather than provoking each conflict. What is being pinned is which
+ * condition each write sits under.
+ */
+describe('what a fill run records when it filled nothing', () => {
+  const source = readFileSync(
+    path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../src/routes/filling.ts'),
+    'utf8',
+  );
+
+  it('records the skipped fields on any finished run, not only a productive one', () => {
+    // The outer condition is the one that says a run finished at all.
+    expect(source).toMatch(/if \(run\.state === 'done' && run\.result\) \{/);
+    // And the fill count is a separate decision, taken once and named.
+    expect(source).toMatch(/const filledSomething = run\.result\.filled > 0;/);
+  });
+
+  it('still holds the status and the event behind an actual fill', () => {
+    // `next && filledSomething` — a status advance needs both a legal transition and a form
+    // that was really filled.
+    expect(source).toMatch(/\.\.\.\(next && filledSomething \? \{ status: next \} : \{\}\)/);
+    expect(source).toMatch(/if \(filledSomething\) \{[\s\S]*?type: 'filled'/);
+  });
+
+  it('does not put the skipped list behind the fill count again', () => {
+    // The regression this exists to catch, stated as the shape it would take.
+    expect(source).not.toMatch(/run\.result\.filled > 0\) \{[\s\S]{0,600}skippedFields: skipped/);
   });
 });

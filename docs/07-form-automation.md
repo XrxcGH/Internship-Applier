@@ -14,6 +14,23 @@ user logs in once per vendor and the session survives. Storage state per domain 
 referenced from `credential_ref` — which stores **a path to a Playwright storage-state file,
 never a password**.
 
+**Nothing installs the browser, so the first fill on a fresh clone fails.** `npm install`
+brings in the `playwright` package and no browser: this version declares no install script
+(the lockfile records no `hasInstallScript` for `playwright` or `playwright-core`), and no
+script in `package.json` runs `playwright install`. Every other part of the tool works
+without one — ingestion, discovery, matching and drafting never open a browser — so the
+gap does not show up until `openSession` calls `launchPersistentContext`, which is on a real
+application at the moment the user asked for a form to be filled. What they get is a 502
+`FILL_FAILED` carrying Playwright's own message, which does at least name the remedy:
+
+```bash
+npx playwright install chromium
+```
+
+Chromium is the only browser `openSession` ever launches, so that is the whole download. The
+right home for it is a `postinstall` in the root `package.json`; until that exists, it is a
+manual first-run step, documented in the README's § Running it and here.
+
 **One profile directory means one browser, which means one application at a time.** Chromium
 locks `data/browser-profile/`, so a second `launchPersistentContext` against it cannot
 succeed. Runs are keyed per application and nothing used to stop a second one being started —
@@ -256,6 +273,25 @@ Per field, by control type:
 > `cover_letter_upload` field, but nothing in the server produces such a document, so those
 > fields are skipped like any other non-resume upload.
 
+> **Not built:** anywhere to *enter* a street address, so the address block on every form is
+> the user's. The plumbing on this side is complete — `classify.ts` recognizes
+> `street-address` and `postal-code`, and `valueFor` reads `profile.address.line1` and
+> `.postal` straight out — but nothing ever writes them. Ingestion refuses to guess
+> (`toProfile.ts` drops a postcode out of "Portland, OR 97214" rather than "asserting a piece
+> of the user's address that nobody has checked") and defers to G1; the G1 editor collects a
+> home city and a state and stops. So `line1`, `line2` and `postal` are empty on every profile
+> this tool has ever held, and the pre-submit review says *"Your profile has no street address
+> to fill in."* and *"Your profile has no postal code to fill in."* — the same sentence used
+> for a GPA nobody entered, which reads as a gap the user could go and close when there is no
+> control anywhere to close it with. `NO_PROFILE_SOURCE` exists for exactly that mismatch and
+> these two do not qualify for it: unlike "How did you hear about us?", this is a field the
+> profile is *supposed* to have.
+>
+> The rest of the block survives on fallbacks, so what is actually retyped by hand each time
+> is the street line and the postcode: `city` and `region` fall back to `locationPrefs.base`,
+> and `country` defaults to `US`. The fix is a field on the G1 screen (docs/08 § Onboarding),
+> not a change here.
+
 Every write is followed by a read of what the page then holds, and a field that did not take
 is reported rather than assumed. On a `<select>` or a combobox that read is worth less than
 it looks: the control holds whatever it was told, so re-reading cannot tell a right choice
@@ -373,7 +409,11 @@ static and behavioural; there is no runtime guard.
   declares no dependencies at all) serving deliberately nasty forms: React-controlled
   inputs, shadow-DOM widgets, an iframe form, a 3-step wizard, a fake login wall, a combobox
   with near-miss options, and a page containing every redlined field type. Playwright tests
-  run headless against it in CI.
+  run headless against it — but read § Browser before trusting that they run *in CI*:
+  `.github/workflows/ci.yml` goes straight from `npm ci` to `npm test` with no browser install
+  between them, and `selectors.test.ts` and `fill.test.ts` both call `chromium.launch()`
+  unconditionally. Whatever the browser-backed tests are worth, they are worth it on a machine
+  where someone has run the install command by hand.
 - **Redline test** — asserts that no redlined field is ever written, on every fixture.
 - **The plan step** — `buildFillPlan` produces the complete list of intended values, with a
   reason attached to every skip, before anything is typed. It is a pure function over the

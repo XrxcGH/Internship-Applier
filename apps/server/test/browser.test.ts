@@ -15,6 +15,7 @@ import { startFixtureServer, submissions, type FixtureServer } from '@ia/fixture
 import {
   blocksNavigation,
   detectIntervention,
+  dialledPrivately,
   openSession,
   type BrowserSession,
 } from '../src/core/filling/browser';
@@ -201,5 +202,78 @@ describe('which addresses the signed-in browser may be navigated to', () => {
     for (const url of ['not a url at all', 'http://this-name-does-not-resolve.invalid/']) {
       expect(await blocksNavigation(url), url).toBe(false);
     }
+  }, 30_000);
+});
+
+/**
+ * The other half of that guard: the address Chromium ACTUALLY dialled.
+ *
+ * `blocksNavigation` resolves the NAME in this process and then hands the name to Chromium,
+ * which resolves it AGAIN with its own resolver a moment later. Nothing pins the answer between
+ * the two, so a host whose DNS the attacker controls answers a public address to the guard and
+ * 127.0.0.1 to the browser — classic rebinding, and the guard will have approved an address that
+ * was never used. infra/http/publicHost.ts names that gap in its own header and closes it for
+ * fetches with `guardedLookup`, which judges the address the connector dials; a browser takes no
+ * lookup hook, so this is the browser's half of that pair.
+ *
+ * Tested as a function for the same reason `blocksNavigation` is: the listener that feeds it is
+ * gated on `config.isTest`, because this suite is served from 127.0.0.1 and every response in it
+ * would otherwise be a verdict. run.ts's half — refusing the run on the verdict, before the page
+ * is read and before a key is pressed — is pinned against a stubbed session in fillRun.test.ts.
+ */
+describe('the address the browser turned out to dial', () => {
+  it('refuses this machine and its network, in every notation one arrives in', async () => {
+    for (const address of [
+      '127.0.0.1',
+      '10.0.0.5',
+      '192.168.1.1',
+      '169.254.169.254', // the cloud metadata address
+      '::1',
+      // The v4 address inside a v6 one. Chromium reports a socket to 127.0.0.1 over a v6
+      // stack like this, and it delivers packets to 127.0.0.1 whatever it is spelled like.
+      '::ffff:127.0.0.1',
+      // A link-local address arrives carrying the interface it is scoped to, which is not
+      // part of the address and which no URL parser will take.
+      'fe80::1%eth0',
+      /**
+       * THE SPELLING CHROMIUM ACTUALLY SENDS. Measured against this repo's own Playwright:
+       * `response.serverAddr()` reports v4 bare — `{"ipAddress":"127.0.0.1"}` — and v6
+       * BRACKETED, `{"ipAddress":"[::1]"}`. Every case above this one is a spelling the
+       * browser never produces for v6, so the guard was tested entirely on inputs it does not
+       * receive. Brackets are stripped before the zone id, or a bracketed zoned address is
+       * left with an unclosed bracket and lands in the fail-closed branch again.
+       */
+      '[::1]',
+      '[::ffff:127.0.0.1]',
+      '[fe80::1%eth0]',
+    ]) {
+      expect(await dialledPrivately(address), address).toBe(true);
+    }
+  }, 30_000);
+
+  it('allows an ordinary employer, or every fill would stop on its first page', async () => {
+    for (const address of [
+      '93.184.216.34',
+      '2606:2800:220:1:248:1893:25c8:1946',
+      /**
+       * And the same address as the browser sends it. Without the bracket strip this built
+       * `http://[[2606:…]]/`, `new URL` threw, and the fail-closed branch called a public
+       * employer's page private — so the run was refused with a 400 saying the careers page
+       * was "an address on this machine or its own network", and there is no override. Chromium
+       * prefers IPv6 wherever a AAAA record exists, so on a dual-stack connection that is not
+       * an edge case; it is most fills.
+       */
+      '[2606:2800:220:1:248:1893:25c8:1946]',
+      '[2a00:1450:4001:80b::200e]',
+    ]) {
+      expect(await dialledPrivately(address), address).toBe(false);
+    }
+  }, 30_000);
+
+  it('refuses an address it cannot read at all', async () => {
+    // Unreadable means refused, the same way publicHost.ts treats bytes it cannot parse: this
+    // is a verdict on something already served to the signed-in profile, and the safe direction
+    // is to stop the run rather than to vouch for an address nothing here understands.
+    expect(await dialledPrivately('not an address')).toBe(true);
   }, 30_000);
 });

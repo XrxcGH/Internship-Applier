@@ -456,15 +456,89 @@ export function mergeWithdrawn(
   return [...first, ...second.filter((w) => !seen.has(w.answerId))];
 }
 
+/**
+ * Whether this screen is holding corrections the server has never seen.
+ *
+ * `stored` is the profile object the server last handed back. The comparison is by REFERENCE,
+ * which is exact here rather than approximate: every edit path builds a new object — `patch`
+ * and `editList` both spread — and every path that writes replaces `stored` with the response
+ * it got, so there is no deep compare to keep in step with the schema and no false "saved"
+ * from two objects that merely stringify alike. It errs towards saying unsaved, which is the
+ * safe direction for a warning whose remedy is one click.
+ *
+ * A profile on screen with `stored` null is the case worth naming out loud: "Fill the profile
+ * in yourself" builds its draft through `POST /api/profile/blank`, which deliberately writes
+ * nothing, so the student with no model types their entire profile into a screen that has
+ * never stored a word of it — and until this existed, one nav click took the lot.
+ */
+export function hasUnsavedEdits(
+  profile: CandidateProfile | null,
+  stored: CandidateProfile | null,
+): boolean {
+  return profile !== null && profile !== stored;
+}
+
+/**
+ * Whether the read that just finished has taken a G1 confirmation off.
+ *
+ * `routes/resumes.ts` writes a whole new profile and resets `confirmedAt` to null — the same
+ * event `sweepApprovals` is exported for — and nothing on the window said so. The nav's lock
+ * and its status pill come from a health fetch made once at mount, so it kept reading "local"
+ * over Discover, Queue, Applications and Tracker, every one of which answers 409 to an
+ * unconfirmed profile.
+ *
+ * Both directions are load-bearing, and the false positive is not harmless. `savedOnServer`
+ * is what keeps the blank-profile door out of this: `POST /api/profile/blank` stores nothing,
+ * so a confirmed student who clicks "Fill the profile in yourself" still has their
+ * confirmation — and PUT keeps it, `confirmedAt: existing?.confirmedAt ?? null`. Warning them
+ * that it had been revoked would be a fabricated alarm at the gate whose whole business is
+ * telling people what is and is not true of their file. A first-time student, who never had a
+ * confirmation to lose, must not be told they lost one either.
+ */
+export function tookConfirmationOff(
+  before: CandidateProfile | null,
+  after: CandidateProfile,
+  savedOnServer: boolean,
+): boolean {
+  return savedOnServer && before?.confirmedAt != null && after.confirmedAt === null;
+}
+
 export function Onboarding({
   onDone,
   onBusy,
   onFindPostings,
+  onProfileChanged,
+  onUnsaved,
 }: {
   onDone: () => void;
   onBusy?: (what: string | null) => void;
   /** Absent in tests and in any host with no Discover screen; the button hides itself. */
   onFindPostings?: () => void;
+  /**
+   * "The server's answer to `profileConfirmed` is no longer what you last heard."
+   *
+   * Two writes on this screen move it and nothing else does: confirming sets `confirmedAt`,
+   * and a re-extraction resets it to null — `routes/resumes.ts` saves a whole new profile,
+   * and `sweepApprovals` is exported precisely because that path unconfirms. The host derives
+   * the nav's lock and its status pill from one health fetch made at mount, so after a
+   * re-upload the bar still read "local" with Discover, Queue, Applications and Tracker all
+   * live, and every one of those routes answers 409 to an unconfirmed profile. The student
+   * was sent through an unlocked door into a screen that refuses them, with the reason two
+   * screens back.
+   *
+   * Optional because this screen is also rendered by tests and by hosts with no nav.
+   */
+  onProfileChanged?: () => void;
+  /**
+   * Whether this screen is holding corrections that exist nowhere but React state.
+   *
+   * The nav above this component blocks on `busy` alone, so a click on it while an edit was
+   * unsaved unmounted the wizard and took the edit with it — silently, which is the part that
+   * matters: nothing on screen had said the correction was not stored. `beforeunload` below
+   * covers the browser's own Back, reload and close; this is the same fact offered to the host
+   * so the nav can ask before it unmounts us.
+   */
+  onUnsaved?: (unsaved: boolean) => void;
 }) {
   const [step, setStep] = useState<Step>('upload');
   const [profile, setProfile] = useState<CandidateProfile | null>(null);
@@ -478,17 +552,75 @@ export function Onboarding({
    */
   const [typed, setTyped] = useState<Record<string, string>>({});
   /**
-   * What the last save cost at G3, if it cost anything.
+   * What the edits made on this screen have cost at G3 so far.
    *
-   * Set from the save response on every path that writes, and reset by the same assignment
-   * when a save costs nothing, so this never describes a write two writes ago.
+   * ACCUMULATED, not replaced, and that is the whole of the fix. Every write sweeps, and the
+   * server reports an answer at most once — `withdrawStaleApprovals` skips any row without an
+   * `approvedAt`, so the second sweep after a withdrawal finds nothing to say about it. A save
+   * that cost two approvals therefore reported them, and the very next write, having nothing
+   * left to report, assigned `[]` over the notice and the news was gone. The click that did it
+   * was usually Confirm — which saves before it confirms — so the last thing the student saw
+   * of two answers they now have to re-review was a notice that vanished as they left G1.
+   *
+   * `mergeWithdrawn` is what makes accumulating safe: an answer named by two writes in a row
+   * is one withdrawal, not two. The one honest reset is a re-extraction, where the profile
+   * these were withdrawn against is itself gone; see `onExtracted`.
    */
   const [withdrawn, setWithdrawn] = useState<api.WithdrawnApproval[]>([]);
+  /**
+   * The profile exactly as the server last handed it back, so "unsaved" is a fact rather than
+   * a guess.
+   *
+   * Compared by reference, which is precise here: `patch` and `editList` build a new object
+   * for every keystroke, and every path that stores replaces this with the response it got.
+   * Null while nothing is stored at all — which is the state "Fill the profile in yourself"
+   * starts in, since `POST /api/profile/blank` deliberately writes nothing.
+   */
+  const [stored, setStored] = useState<CandidateProfile | null>(null);
+  /**
+   * Set when a re-extraction has just taken a G1 confirmation off a profile that had one.
+   *
+   * The client can see this for itself — `confirmedAt` is on `CandidateProfile` — and the
+   * student cannot see it anywhere else: the nav above is drawn from a health fetch that is
+   * not repeated, so it goes on saying "local". See `onProfileChanged`.
+   */
+  const [unconfirmedByUpload, setUnconfirmedByUpload] = useState(false);
 
   // The nav lives above this screen. Reading a resume takes a model call and the better part
   // of a minute, and unmounting mid-read loses the extraction with no way to know it happened.
   // See the comment on `Nav`.
   useEffect(() => onBusy?.(busy), [busy, onBusy]);
+
+  /**
+   * Corrections that exist nowhere but this component.
+   *
+   * The confirm step and the facts step both grew Save buttons for this, and a button is only
+   * half of it: the student has to remember to press it, and nothing anywhere said they had
+   * not. One nav click, one browser Back, one accidental reload, and a corrected school name,
+   * a typed GPA, a work-authorization answer — the six facts a resume never contains are
+   * typed on a step whose Confirm is disabled while any flag is open, which is exactly the
+   * state a person is in while filling it in — were gone with no message.
+   */
+  const unsaved = hasUnsavedEdits(profile, stored);
+  useEffect(() => onUnsaved?.(unsaved), [unsaved, onUnsaved]);
+
+  /**
+   * The browser's own leave. `onUnsaved` above covers the in-app nav, which is the host's to
+   * act on; this covers Back, reload and closing the tab, which nothing in this app can see.
+   *
+   * `preventDefault` plus `returnValue` because browsers disagree about which one arms the
+   * prompt, and neither shows a message of ours — so the sentence a student can act on is the
+   * one rendered beside the save buttons, not this.
+   */
+  useEffect(() => {
+    if (!unsaved) return;
+    const warn = (e: BeforeUnloadEvent): void => {
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', warn);
+    return () => window.removeEventListener('beforeunload', warn);
+  }, [unsaved]);
 
   /**
    * Picks up the profile that already exists, if there is one.
@@ -507,6 +639,10 @@ export function Onboarding({
         // produces is newer than what was on disk when this request went out.
         setStep((s) => (s === 'upload' ? 'confirm' : s));
         setProfile((prev) => prev ?? p);
+        // Same `prev ?? p`, so the two stay the same object and the screen does not open
+        // claiming unsaved edits nobody has made. If an upload got here first, that path
+        // has already recorded what it stored.
+        setStored((prev) => prev ?? p);
       })
       .catch((e: unknown) => {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e));
@@ -616,7 +752,12 @@ export function Onboarding({
     try {
       const saved = await api.saveProfile(tidyProfileLists(profile));
       setProfile(saved.profile);
-      setWithdrawn(saved.withdrawnApprovals);
+      // What the server just stored, held so `unsaved` can be a fact. Same object as the one
+      // going into `profile`, so this save leaves nothing pending behind it.
+      setStored(saved.profile);
+      // Merged, never assigned. A second Save with nothing new to withdraw would otherwise
+      // wipe the first one's notice — see the comment on `withdrawn`.
+      setWithdrawn((shown) => mergeWithdrawn(shown, saved.withdrawnApprovals));
       return true;
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -644,10 +785,15 @@ export function Onboarding({
       const saved = await api.saveProfile(tidyProfileLists(profile));
       const cleared = await api.clearReviewFlag(path);
       setProfile(cleared.profile);
+      setStored(cleared.profile);
       // Both calls write, so both sweep. The second one finds nothing the first already took
       // — an answer only loses its approval once — but merging is what keeps that a fact
-      // about the server rather than an assumption made here.
-      setWithdrawn(mergeWithdrawn(saved.withdrawnApprovals, cleared.withdrawnApprovals));
+      // about the server rather than an assumption made here. Merged into what is already on
+      // screen for the same reason, one write further out: clearing a second flag must not
+      // erase what clearing the first one cost.
+      setWithdrawn((shown) =>
+        mergeWithdrawn(shown, mergeWithdrawn(saved.withdrawnApprovals, cleared.withdrawnApprovals)),
+      );
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -660,8 +806,25 @@ export function Onboarding({
     setError(null);
     try {
       const saved = await api.saveProfile(tidyProfileLists(profile!));
-      setWithdrawn(saved.withdrawnApprovals);
-      await api.confirmProfile();
+      // Recorded between the two calls, not after both. `confirmProfile` can still refuse —
+      // PROFILE_INCOMPLETE if a flag was raised under us — and the save before it went
+      // through either way, so leaving this until the end left the screen warning about
+      // unsaved corrections that were already on disk.
+      setProfile(saved.profile);
+      setStored(saved.profile);
+      // The click that used to erase the notice. Confirm saves first, that save has nothing
+      // left to withdraw that the Save beside it did not already take, and the assignment put
+      // `[]` over the list on its way to the "profile established" stamp — so the last word a
+      // student got about answers they now have to re-review was one that disappeared.
+      setWithdrawn((shown) => mergeWithdrawn(shown, saved.withdrawnApprovals));
+      const confirmed = await api.confirmProfile();
+      setProfile(confirmed);
+      setStored(confirmed);
+      setUnconfirmedByUpload(false);
+      // The nav's lock and its status pill come from a health fetch made once at mount, and
+      // this is the write that unlocks four destinations. Said here rather than only from the
+      // two buttons on the confirmation screen, which the user need never press.
+      onProfileChanged?.();
       setStep('done');
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -709,6 +872,22 @@ export function Onboarding({
     </Notice>
   );
 
+  /**
+   * The sentence that stands beside every set of save buttons while something is only in the
+   * browser.
+   *
+   * `beforeunload` cannot carry a message of our own — browsers show their own wording — and
+   * the nav belongs to the host, so this is the one place a student can actually be told which
+   * click will cost them what they typed. Rendered next to the buttons that fix it rather than
+   * at the top of the page, because a warning is only useful within reach of the remedy.
+   */
+  const unsavedNotice = unsaved && (
+    <p className="text-caution u-prose mb-3 text-sm">
+      Not saved yet. What you have typed is in this browser and nowhere else — leaving this screen,
+      through the bar at the top or the browser&apos;s own Back, throws it away.
+    </p>
+  );
+
   return (
     <Page>
       <RunningHead
@@ -723,12 +902,44 @@ export function Onboarding({
       {/* Above the step, not inside one, so that the withdrawal a Confirm caused is still on
           screen on the step Confirm moves to. */}
       <WithdrawnNotice items={withdrawn} />
+      {/* A confirmation the last upload took off, which nothing else on the window says. The
+          nav's pill is drawn from one health fetch made at mount, so it goes on reading
+          "local" over four destinations that will answer 409. */}
+      {unconfirmedByUpload && (
+        <Notice tone="caution">
+          Reading that resume replaced every fact on your profile, and took its G1 confirmation off
+          with them. Searching, the queue, the applications and filling all refuse an unconfirmed
+          profile, so work through the steps below and confirm again at the end — otherwise the
+          first of them you open simply turns you away, and the reason is back here.
+        </Notice>
+      )}
       {busy && <p className="u-data text-accent mb-6">{busy}</p>}
 
       {step === 'upload' && (
         <UploadStep
-          onExtracted={(p, withdrawn) => {
+          onExtracted={(p, withdrawn, savedOnServer) => {
+            /**
+             * A G1 confirmation that has just come off, noticed before `profile` is replaced.
+             *
+             * `routes/resumes.ts` writes a whole new profile and resets `confirmedAt` to null
+             * — the same event `sweepApprovals` is exported for. Nothing on screen said so:
+             * the nav's pill still read "local", Discover / Queue / Applications / Tracker
+             * were all still live, and each of those routes answers 409 to an unconfirmed
+             * profile. The student was walked through an unlocked door into a refusal whose
+             * cause was two screens behind them.
+             *
+             * Only on the stored path. "Fill the profile in yourself" writes nothing —
+             * `POST /api/profile/blank` says so outright — so an existing confirmation is
+             * untouched, and PUT preserves `confirmedAt` when that draft is finally saved.
+             */
+            setUnconfirmedByUpload(tookConfirmationOff(profile, p, savedOnServer));
+            // The nav is drawn from a health fetch this screen cannot see; ask for it again.
+            if (savedOnServer) onProfileChanged?.();
             setProfile(p);
+            // An extraction is on disk the moment it answers; a blank profile is not, so it
+            // opens with everything unsaved — which is the truth, and the whole reason the
+            // leave guard exists for the student who has no model and types it all in.
+            setStored(savedOnServer ? p : null);
             // What this read cost, said on the screen that cost it. Re-extraction replaces
             // every fact at once, so it withdraws more approvals than any other write —
             // and this was the one write path that read the list off the wire and dropped
@@ -873,6 +1084,7 @@ export function Onboarding({
           </Section>
 
           {namelessNotice}
+          {unsavedNotice}
 
           <div className="flex flex-wrap gap-3">
             <Button disabled={busy !== null || nameless.length > 0} onClick={() => void persist()}>
@@ -1106,7 +1318,9 @@ export function Onboarding({
                 this in. So everything typed here lived in React state alone, and leaving
                 through the nav — which blocks only on `busy` — unmounted the screen and took
                 it. The confirm step already had this fixed; this one did not. */}
-            <div className="mt-4 flex flex-wrap gap-3">
+            <div className="mt-4">{unsavedNotice}</div>
+
+            <div className="flex flex-wrap gap-3">
               <Button
                 disabled={busy !== null || nameless.length > 0}
                 onClick={() => {
@@ -1123,9 +1337,16 @@ export function Onboarding({
               >
                 Save
               </Button>
+              {/* The `busy !== null` hold was missing here, and Confirm is the one button on this
+                  screen where a second click costs something the user cannot get back: it
+                  saves before it confirms, so the second run's save sweeps a profile whose
+                  approvals the first run already withdrew, comes back with nothing to report,
+                  and — before the notice learned to merge — put an empty list over the one
+                  thing telling the student which answers had just been un-approved. Every
+                  other button that writes was already held. */}
               <Button
                 variant="primary"
-                disabled={remaining > 0 || nameless.length > 0}
+                disabled={busy !== null || remaining > 0 || nameless.length > 0}
                 onClick={() => void confirm()}
               >
                 Confirm profile
@@ -1177,7 +1398,20 @@ function UploadStep({
   setBusy,
   busy,
 }: {
-  onExtracted: (p: CandidateProfile, withdrawn: api.WithdrawnApproval[]) => void;
+  /**
+   * `savedOnServer` tells the two doors apart, and they are not the same door.
+   *
+   * An extraction is written before it answers, and writing it resets `confirmedAt`. A blank
+   * profile is deliberately not written at all — `POST /api/profile/blank` builds the draft,
+   * hands it over and stores nothing — so it arrives with every box unsaved and any existing
+   * confirmation still standing. One boolean rather than two callbacks, because everything
+   * else about the handover is identical.
+   */
+  onExtracted: (
+    p: CandidateProfile,
+    withdrawn: api.WithdrawnApproval[],
+    savedOnServer: boolean,
+  ) => void;
   onError: (m: string) => void;
   setBusy: (m: string | null) => void;
   busy: string | null;
@@ -1197,7 +1431,7 @@ function UploadStep({
       const { documentId } = await api.uploadResume(file);
       setBusy('Reading it. This takes a few seconds…');
       const read = await api.extractResume(documentId);
-      onExtracted(read.profile, read.withdrawnApprovals);
+      onExtracted(read.profile, read.withdrawnApprovals, true);
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -1218,7 +1452,9 @@ function UploadStep({
     try {
       setBusy('Setting up an empty profile…');
       const started = await api.blankProfile();
-      onExtracted(started.profile, started.withdrawnApprovals);
+      // False, and it is not a detail: the blank route stores nothing, so every box on the
+      // screen this hands over to is unsaved from the first keystroke.
+      onExtracted(started.profile, started.withdrawnApprovals, false);
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -1594,7 +1830,11 @@ function EducationRow({
 }
 
 /**
- * What the last save cost at G3, said out loud on the screen that cost it.
+ * What the edits made on this screen have cost at G3, said out loud on the screen that cost it.
+ *
+ * "The last save" once, which is why this said "That save took…". A withdrawal survives every
+ * later write — the server never gives an approval back — so the caller accumulates and this
+ * says so; see the comment on `withdrawn` in the wizard.
  *
  * The server re-checks every approved answer against the profile a write just stored and
  * takes the approval off the ones it no longer supports. The client used to throw that list
@@ -1614,10 +1854,15 @@ export function WithdrawnNotice({ items }: { items: api.WithdrawnApproval[] }) {
   const one = items.length === 1;
   return (
     <Notice tone="caution">
-      That save took the approval off {one ? 'one answer' : `${items.length} answers`}. Your profile
-      no longer supports something {one ? 'it says' : 'they say'}, so {one ? 'it is' : 'they are'}{' '}
-      back to unapproved and {one ? 'has' : 'have'} to be reviewed again at G3 before anything can
-      be filled in with {one ? 'it' : 'them'}. Nothing was sent anywhere.
+      {/* "That save took…" — which was true of one write and wrong the moment the list
+          started accumulating across them. It is also the honest wording either way: an
+          approval withdrawn two saves ago is still withdrawn, and the student still has to
+          go and re-review it. */}
+      Your corrections here have taken the approval off{' '}
+      {one ? 'one answer' : `${items.length} answers`}. Your profile no longer supports something{' '}
+      {one ? 'it says' : 'they say'}, so {one ? 'it is' : 'they are'} back to unapproved and{' '}
+      {one ? 'has' : 'have'} to be reviewed again at G3 before anything can be filled in with{' '}
+      {one ? 'it' : 'them'}. Nothing was sent anywhere.
       <ul className="mt-3 space-y-3">
         {items.map((w) => (
           <li key={w.answerId}>

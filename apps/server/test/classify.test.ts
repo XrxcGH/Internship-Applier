@@ -547,3 +547,72 @@ describe('"source" alone is not a referral question', () => {
     }
   });
 });
+
+/**
+ * THE CONTAINER ANSWERS WHAT A BARE COLUMN HEADING CANNOT.
+ *
+ * `start_date` and `end_date` are answered from the profile's availability window, and the
+ * label rules could only refuse the phrasings that name their container out loud ("Previous
+ * employer start date"). A work-history table does not label its columns that way — it labels
+ * them "Start Date" — so a row of the applicant's employment history was filled with the date
+ * they become AVAILABLE, at 0.92 confidence, verified by read-back, and shown in the review as
+ * a field that went right. A false statement about their work history, in a document
+ * submitted in their name, with the review screen arguing it is correct.
+ *
+ * `FormField.section` had been declared for exactly this and populated by nothing. It is now
+ * read off the enclosing legend, caption or heading, and it may only ever DISQUALIFY: letting
+ * a heading satisfy a positive test would make every control under "Previous Employment" match
+ * employment rules whatever its own label said.
+ */
+describe('a date column inside a history table', () => {
+  const semanticOf = (label: string, section?: string): string =>
+    classifyField({ label, section, control: 'text', type: 'date' }).semantic;
+
+  it('is not answered from the availability window, whatever the table is called', () => {
+    for (const section of [
+      'Employment History',
+      'Work Experience',
+      'Previous Employment',
+      'Education',
+      'Academic History',
+      'Educational Qualifications',
+    ]) {
+      expect({ section, start: semanticOf('Start Date', section) }).toEqual({
+        section,
+        start: 'unknown',
+      });
+      expect({ section, end: semanticOf('End Date', section) }).toEqual({
+        section,
+        end: 'unknown',
+      });
+    }
+  });
+
+  /**
+   * The other direction, and the reason the container cannot simply outrank the label. Every
+   * one of these is the form asking when the applicant can begin, and refusing them hands back
+   * an empty box on the one date the profile can actually answer.
+   */
+  it('still answers the question when the label itself is unambiguous', () => {
+    expect(semanticOf('When can you start?', 'Employment History')).toBe('start_date');
+    expect(semanticOf('Desired start date', 'Employment History')).toBe('start_date');
+    expect(semanticOf('Earliest start date', 'Education')).toBe('start_date');
+    expect(semanticOf('Availability date', 'Work History')).toBe('start_date');
+  });
+
+  it('is unchanged when the scanner found no container', () => {
+    // `undefined` means "no container known", never "top level" — the scanner cannot always
+    // find one, and treating that as permission to refuse would empty the field on every form
+    // whose markup it cannot read.
+    expect(semanticOf('Start Date')).toBe('start_date');
+    expect(semanticOf('Start Date', '')).toBe('start_date');
+  });
+
+  it('lets a container take a semantic away but never hand one out', () => {
+    // A heading is one string shared by every control in the block. If it could satisfy a
+    // rule, a box labelled "Notes" under "Employment History" would start classifying as
+    // employment — so the positive test reads the field's own words only.
+    expect(semanticOf('Notes', 'Employment History')).not.toBe('start_date');
+    expect(classifyField({ label: 'Notes', section: 'Email Address' }).semantic).not.toBe('email');
+  });
+});

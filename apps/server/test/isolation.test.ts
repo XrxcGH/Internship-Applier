@@ -17,7 +17,7 @@
  */
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { config, REPO_ROOT } from '../src/config';
+import { config, Env, REPO_ROOT } from '../src/config';
 import { deleteMasterKey, getMasterKey } from '../src/infra/crypto/keychain';
 
 interface KeyringModule {
@@ -78,6 +78,46 @@ describe('the test suite writes nowhere near the real data directory', () => {
 
   it('is pinned to no model access, so no test can spend real usage', () => {
     expect(config.llm.provider).toBe('none');
+  });
+});
+
+/**
+ * The other containment this file is the right home for: not where the process writes, but
+ * who can reach it.
+ *
+ * `SERVER_HOST` was a bare string, so `SERVER_HOST=0.0.0.0` in .env bound the API to every
+ * interface while index.ts printed `server listening (loopback only)` on top of it and
+ * docs/10 stated the loopback bind as an invariant. Nothing had ever checked the value, so
+ * the banner and the doc were claims rather than facts.
+ *
+ * Asserted on `Env`, the schema config.ts parses `process.env` with, because a bad value
+ * there reaches `process.exit(1)` — which in a worker takes the whole run down — and a test
+ * that re-typed the rule into its own `z.object` would be testing zod.
+ *
+ * Both directions, because the cheap way to pass the first test is to refuse everything, and
+ * a startup that refuses `localhost` is a tool that will not run.
+ */
+describe('the API can only be told to bind loopback', () => {
+  it('refuses a host that would put the port on the network', () => {
+    for (const host of ['0.0.0.0', '::', '*', '192.168.1.7', '10.0.0.4', 'example.com', '']) {
+      // The empty string is in here on purpose: `SERVER_HOST=` in a .env file looks like an
+      // unset variable and is not one — Node reads '' as every interface, same as 0.0.0.0.
+      const parsed = Env.safeParse({ SERVER_HOST: host });
+      expect(parsed.success, `SERVER_HOST=${JSON.stringify(host)} was accepted`).toBe(false);
+    }
+  });
+
+  it('accepts every spelling of loopback a person reasonably uses', () => {
+    for (const host of ['127.0.0.1', '127.0.0.2', 'localhost', '::1', '::ffff:127.0.0.1']) {
+      const parsed = Env.safeParse({ SERVER_HOST: host });
+      expect(parsed.success, `SERVER_HOST=${host} was refused`).toBe(true);
+      if (parsed.success) expect(parsed.data.SERVER_HOST).toBe(host);
+    }
+  });
+
+  it('binds loopback when nothing is set, which is how it actually runs', () => {
+    expect(Env.parse({}).SERVER_HOST).toBe('127.0.0.1');
+    expect(config.server.host).toBe('127.0.0.1');
   });
 });
 

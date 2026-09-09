@@ -743,13 +743,29 @@ describe('reading HTML out of a feed', () => {
     expect(stripHtml('<unclosed')).toBe('<unclosed');
     // `<>` is not a tag: the old pattern needed at least one character between the brackets.
     expect(stripHtml('a<>b')).toBe('a<>b');
-    // An opener with no closer is left where it was found, markup and all.
-    expect(stripHtml('<style>.a{color:red}')).toBe('.a{color:red}');
+    /**
+     * AN OPENER WITH NO CLOSER TAKES ITS CONTENTS WITH IT.
+     *
+     * This used to assert the opposite — an unclosed opener "is left where it was found,
+     * markup and all" — and that was the bug, not the rule. A page whose script tag is never
+     * closed leaked its JavaScript source into description_text, and a string inside it
+     * ("Applicants must be U.S. citizens.") was then read by the deterministic requirement
+     * pass as a real citizenship rule and hard-failed every non-citizen: a false ineligible
+     * built out of somebody's tracking script. Unclosed markup is malformed either way, and
+     * dropping to the end of the document is the reading that cannot invent a requirement.
+     */
+    expect(stripHtml('<style>.a{color:red}')).toBe('');
     expect(stripHtml('<style>.a{color:red}</style>x')).toBe('x');
-    // Case is ignored, and `<scriptural>` opens a script span because the pattern this
-    // replaced had no word boundary either.
+    expect(stripHtml('<p>Real text</p><script>var a = "Applicants must be U.S. citizens."')).toBe(
+      'Real text',
+    );
+    // Case is ignored.
     expect(stripHtml('<SCRIPT>x</SCRIPT>y')).toBe('y');
-    expect(stripHtml('a<scriptural>b</script>c')).toBe('a c');
+    // `<scriptural>` is its own tag and no longer opens a script span: the pattern this
+    // replaced had no word boundary, so an ordinary word starting with "script" swallowed
+    // everything after it. Prose that merely says "script" is untouched.
+    expect(stripHtml('a<scriptural>b</script>c')).toBe('a b c');
+    expect(stripHtml('<p>Keep this</p><p>and this script word</p>')).toMatch(/script word/);
   });
 
   it('an escaped document decoded first has no markup left after stripping', () => {

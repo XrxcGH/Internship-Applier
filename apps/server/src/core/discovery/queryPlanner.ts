@@ -9,9 +9,9 @@
  * curated taxonomy, so a bad inference can't send forty queries for a role the user has
  * no evidence for.
  */
-import { workLocations } from '@ia/shared';
+import { upcomingCycleYear, workLocations } from '@ia/shared';
 import type { RoleFamily } from '@ia/shared';
-import type { ConfirmedProfile, SearchFilters, SourceKind } from '@ia/shared';
+import type { ConfirmedProfile, SearchFilters, Season, SourceKind } from '@ia/shared';
 import { AGGREGATOR_SOURCES } from './sources/aggregators';
 import { slugCandidates } from './resolveCompany';
 
@@ -328,17 +328,87 @@ export function inferRoleFamilies(profile: ConfirmedProfile): string[] {
   return scored.slice(0, 4).map((s) => s.family);
 }
 
-/** "summer 2027 internship", "2027 summer analyst", … — from the filters, not hardcoded. */
-export function termTokens(filters: SearchFilters): string[] {
-  const seasons = filters.term.seasons.length ? filters.term.seasons : ['summer'];
-  const years = filters.term.years.length ? filters.term.years : [new Date().getUTCFullYear() + 1];
+const SUMMER_START_MONTH = 5; // June
+
+/**
+ * The month each season's term begins, as the UTC month index a Date reports.
+ *
+ * Two things read it: which YEAR a search means when it names a season and no year, and
+ * whether the year it WAS given has already come and gone. Written as a total Record so
+ * that a season added to the enum is a compile error here rather than a season that
+ * silently inherits the summer calendar.
+ *
+ * `year_round` and `flexible` are null on purpose: they name no window, so there is no
+ * month at which one of them has "started" and nothing to roll over.
+ */
+const SEASON_START_MONTH: Record<Season, number | null> = {
+  summer: SUMMER_START_MONTH,
+  fall: 8, // September
+  winter: 11, // December
+  spring: 0, // January
+  year_round: null,
+  flexible: null,
+};
+
+/**
+ * The cycle a search means when it names a season but no year: the next occurrence whose
+ * applications are still plausibly open.
+ *
+ * This used to be `new Date().getUTCFullYear() + 1`, which is wrong for half of every year
+ * and in the direction that hides jobs: on 15 January 2027 it asked for "summer 2028
+ * internship", a cycle whose postings do not exist yet, while summer 2027 — still open,
+ * still being applied to that week — went unsearched. Summer hiring runs roughly the
+ * preceding autumn through spring, so the cycle only turns over once the term itself has
+ * begun: before 1 June 2027 the answer is 2027, from 1 June 2027 it is 2028.
+ *
+ * The rollover is the term's start rather than the month applications typically close
+ * (February for most large programs) because the two mistakes are not symmetric. Rolling
+ * over early searches a cycle nobody has posted for yet and finds nothing; rolling over at
+ * the start of the term keeps late and rolling postings — exactly the ones a student
+ * searching in April still has a shot at — inside the search.
+ *
+ * The clock is a parameter because a default that drifts with the calendar cannot be
+ * tested by a suite that pins dates, and an untestable date rule is how the year 2027 came
+ * to be written down as a constant in the first place.
+ */
+/**
+ * Re-exported from `@ia/shared`, where it now lives, so the tests and callers that import it
+ * from here keep working.
+ *
+ * It moved because `DEFAULT_FILTERS` needs it too: the term filter's year default was the
+ * literal `[2027]`, so a planner that derived the cycle from the clock still received 2027
+ * from the filters and used it — the fix was real and unreachable on the default path. A
+ * second copy in shared would have been the drift this file's own SEASON_START_MONTH comment
+ * warns about, so there is one.
+ */
+export { upcomingCycleYear };
+
+/** Whether that season of that year has already started, and so stopped taking applications. */
+function seasonHasBegun(season: Season, year: number, now: Date): boolean {
+  const startMonth = SEASON_START_MONTH[season];
+  if (startMonth === null) return false;
+  const thisYear = now.getUTCFullYear();
+  return thisYear > year || (thisYear === year && now.getUTCMonth() >= startMonth);
+}
+
+/**
+ * "summer 2027 internship", "2027 summer analyst", … — from the filters, and when the
+ * filters name no year, from the clock rather than from a year somebody typed once.
+ */
+export function termTokens(filters: SearchFilters, now: Date = new Date()): string[] {
+  const seasons: Season[] = filters.term.seasons.length ? filters.term.seasons : ['summer'];
   const types = filters.positionTypes.length ? filters.positionTypes : ['internship'];
 
   const out: string[] = [];
   for (const s of seasons) {
+    // Per season, because "fall" with no year does not mean the same year "winter" does:
+    // in September 2027 that autumn has already started, so the open fall cycle is fall
+    // 2028 — while winter 2027, which begins in December, is still open and still the
+    // winter a search made that month means.
+    const years = filters.term.years.length ? filters.term.years : [upcomingCycleYear(s, now)];
     for (const y of years) {
       for (const t of types.slice(0, 3)) {
-        out.push(`${s.replace('_', ' ')} ${y} ${t.replace('_', '-')}`);
+        out.push(`${s.replace('_', ' ')} ${String(y)} ${t.replace('_', '-')}`);
       }
     }
   }
@@ -394,9 +464,12 @@ export function planQueries(
   profile: ConfirmedProfile,
   filters: SearchFilters,
   knownBoards: PlannedTarget[] = [],
-  opts: { maxTargets?: number } = {},
+  opts: { maxTargets?: number; now?: Date } = {},
 ): QueryPlan {
   const notes: string[] = [];
+  // Injected, like refresh.ts and matching/run.ts: the term tokens are dated, and a plan
+  // whose dates come from the wall clock cannot be pinned by a test.
+  const now = opts.now ?? new Date();
 
   /**
    * What the user SAID, or failing that what the resume suggests. Said wins outright.
@@ -630,11 +703,48 @@ export function planQueries(
     );
   }
 
+  /**
+   * A plan aimed at a season that has already started, said out loud.
+   *
+   * The year in the term filter is a stated number, and `DEFAULT_FILTERS` states 2027 —
+   * so from June 2027 every default plan asks for "summer 2027 internship", a season whose
+   * postings closed months earlier, and the run comes back with nothing. The failure has no
+   * symptom: zero results from a closed cycle look exactly like zero results from a thin
+   * week. The planner will not silently rewrite a year the caller asked for — the plan is
+   * meant to be inspectable, and a filter that quietly means something else is the opposite
+   * of that — but it must not let the user read the silence as "there is nothing out there".
+   *
+   * It fires only when EVERY season/year pair in the filter has begun. A search for
+   * "summer 2027, winter 2027" made in August 2027 still has winter genuinely open, and
+   * telling that user their cycle has closed would be its own false alarm.
+   */
+  const seasons: Season[] = filters.term.seasons.length ? filters.term.seasons : ['summer'];
+  const askedYears = filters.term.years;
+  if (
+    askedYears.length > 0 &&
+    seasons.every((s) => askedYears.every((y) => seasonHasBegun(s, y, now)))
+  ) {
+    const asked = seasons.flatMap((s) =>
+      askedYears.map((y) => `${s.replace('_', ' ')} ${String(y)}`),
+    );
+    const open = [
+      ...new Set(seasons.map((s) => `${s.replace('_', ' ')} ${String(upcomingCycleYear(s, now))}`)),
+    ];
+    notes.push(
+      `Every term this plan searches has already begun: ${asked.join(', ')}. Applications ` +
+        'close before a season starts, so a run of this plan will find little or nothing — ' +
+        `the cycle now open is ${open.join(', ')}. If you did not ask for that year ` +
+        'yourself it came from the term.years default, which is a written-down number ' +
+        'rather than one read off the clock; send term.years with the plan request to ' +
+        'search the open cycle.',
+    );
+  }
+
   return {
     targets,
     keywords: [...new Set(keywords)],
     roleFamilies,
-    termTokens: termTokens(filters),
+    termTokens: termTokens(filters, now),
     locations: [...new Set(locations)],
     notes,
   };

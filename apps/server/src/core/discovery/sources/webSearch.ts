@@ -356,14 +356,28 @@ export const webSearch: JobSource = {
           "search result's own name because the page stated none — worth a look at G2.",
       );
     }
+    const gaps: string[] = [];
+
+    /**
+     * COVERAGE NOT OBTAINED IS A GAP, NOT A NOTE.
+     *
+     * A note sets neither `degraded` nor `skipped`, so a run that named forty pages, read
+     * twenty-four and left sixteen unfetched reported itself as complete: the summary said
+     * "web_search: N found" with a green tick, and the sentence about the other sixteen sat
+     * among the ordinary status lines nobody reads as a warning. The Workday and
+     * SmartRecruiters detail-page caps already report theirs as gaps for exactly this reason;
+     * this one was the odd source out.
+     *
+     * "Run it again for another sample" stays, because unlike a robots refusal this IS a gap
+     * the student can act on.
+     */
     if (sift.overCap > 0) {
-      notes.push(
+      gaps.push(
         `web_search: read the first ${cap} candidates and left ${sift.overCap} unfetched. ` +
           'Run it again for another sample.',
       );
     }
 
-    const gaps: string[] = [];
     if (unreadable.length > 0) {
       gaps.push(
         `web_search: ${unreadable.length} of ${sift.candidates.length} pages the search found ` +

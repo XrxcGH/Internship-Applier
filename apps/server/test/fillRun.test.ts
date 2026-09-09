@@ -40,6 +40,14 @@ const h = vi.hoisted(() => ({
   landsOn: 'https://careers.acme.com/apply',
   /** Held by `openSession` while set, so a launch can be caught mid-flight. */
   openGate: null as Promise<void> | null,
+  /**
+   * The address the stubbed browser turns out to have dialled, when a test wants a private one.
+   *
+   * browser.ts judges the address behind each document response because the guard before the
+   * request only ever saw a NAME, and the browser resolves that name again for itself. Null is
+   * every ordinary page.
+   */
+  dialsPrivatelyTo: null as string | null,
   /** Held by `detectIntervention` while set, which is the window defect 1 lived in. */
   readGate: null as Promise<void> | null,
   /** How many `executePlan` calls were in the page at the same moment. */
@@ -67,6 +75,21 @@ vi.mock('../src/core/filling/browser', () => ({
         url: () => h.landsOn,
       },
       closedByUser: false,
+      /**
+       * What browser.ts records when the address Chromium actually dialled turns out to be one
+       * this tool refuses, and the barrier the run has to await before reading it.
+       *
+       * The real verdict costs a lookup and lands after `goto` has already returned, so the
+       * stub publishes it only when `dialsJudged` is awaited. That is deliberate: a run that
+       * reads `privateDial` without the barrier passes this stub's check for the wrong reason,
+       * which is the same wrong reason it would pass against a real browser.
+       */
+      privateDial: null as { host: string; address: string } | null,
+      dialsJudged: async () => {
+        session.privateDial = h.dialsPrivatelyTo
+          ? { host: 'careers.acme.com', address: h.dialsPrivatelyTo }
+          : null;
+      },
       close: async () => {
         h.closed += 1;
         session.closedByUser = true;
@@ -105,7 +128,7 @@ vi.mock('../src/core/filling/fill', () => ({
   sameDocument: vi.fn(() => true),
 }));
 
-const { closeAllRuns, continueRun, discardRun, getRun, startRun } =
+const { closeAllRuns, continueRun, discardRun, getRun, SourceRefusedError, startRun } =
   await import('../src/core/filling/run');
 
 function gate(): { open: () => void; promise: Promise<void> } {
@@ -135,6 +158,7 @@ beforeEach(() => {
   h.peakExecuting = 0;
   h.executed = 0;
   h.landsOn = 'https://careers.acme.com/apply';
+  h.dialsPrivatelyTo = null;
 });
 
 afterEach(async () => {
@@ -297,6 +321,41 @@ describe('a browser window the user closed themselves', () => {
     // And it names which one, which the shared error code promises and the message did not.
     expect(refused).toMatch(/form\.test/);
   });
+
+  /**
+   * Continuing into a window that has gone.
+   *
+   * Nothing refused it, and the whole call went through: `detectIntervention` reads every frame
+   * of a dead page, each read throws, and a frame that cannot be read is treated as proving
+   * nothing, so it answers null; `buildFormMap` scans the same frames and `scanFrame` matches
+   * Playwright's "target closed" against FRAME_GONE, so it returns no fields rather than
+   * raising. The empty plan then landed on the branch that describes an empty PAGE — "Check the
+   * page in the browser window — the form may not have loaded yet." — about a browser window
+   * the user had closed. The one move that sentence asks for is the one that cannot help.
+   *
+   * The stubbed page reports itself closed the same way a real one does, so this test is about
+   * the check rather than about Playwright.
+   */
+  it('says the window is gone rather than blaming the page for loading slowly', async () => {
+    await startRun(input('app-1'));
+    await getRun('app-1')!.session!.close(); // the X on the Chromium window
+
+    const message = await continueRun(input('app-1')).then(
+      () => 'resolved',
+      (e: Error) => e.message,
+    );
+
+    expect(message).toMatch(/browser window was closed/i);
+    expect(message).not.toMatch(/may not have loaded/i);
+    // The prefix routes/filling.ts matches to answer 409 NO_RUN. A 502 here would say the
+    // employer's site broke, and invite a retry of a call that cannot ever work again.
+    expect(message).toMatch(/^No open fill run for this application/);
+    // And nothing was typed at a page that is not there.
+    expect(h.executed).toBe(0);
+    // Forgotten, so the panel offers the card that opens a fresh browser rather than a Fill
+    // button whose only outcome is this message a second time.
+    expect(getRun('app-1')).toBeUndefined();
+  });
 });
 
 describe('a fill the user stops while it is typing', () => {
@@ -356,6 +415,76 @@ describe('a page that redirects somewhere this tool will not go', () => {
     // careers page would break the feature entirely.
     h.landsOn = 'https://careers.acme.com/apply?step=2';
     await expect(startRun(input('app-1'))).resolves.toMatchObject({ applicationId: 'app-1' });
+  });
+});
+
+/**
+ * A page served from an address the browser picked after the guard had approved the name.
+ *
+ * The address check in front of a navigation resolves the NAME in this process, and then
+ * Chromium resolves the same name AGAIN for itself. Nothing pins the answer between the two, so
+ * a host whose DNS the attacker controls answers a public address to the guard and 127.0.0.1 to
+ * the browser a moment later — and the browser doing the dialling is the persistent profile
+ * carrying the student's real logins and LAN cookies. infra/http/publicHost.ts names that gap in
+ * its own header and closes it for fetches with `guardedLookup`; the browser takes no lookup
+ * hook, so browser.ts judges the address behind each document response instead and this is where
+ * the run acts on the verdict.
+ *
+ * The request has already gone out by then and nothing here can call it back. What these pin is
+ * everything after it: the page is not read, no key is pressed, and the window does not stay
+ * parked on that host.
+ */
+describe('a page served from an address the browser resolved for itself', () => {
+  it('refuses the run rather than reading the page', async () => {
+    h.dialsPrivatelyTo = '192.168.1.1';
+    const err = await startRun(input('app-1')).catch((e: unknown) => e);
+
+    // Ours, not the site's: routes/filling.ts turns this into a 400 that names the refusal,
+    // where a 502 would blame the employer and invite a retry.
+    expect(err).toBeInstanceOf(SourceRefusedError);
+    expect((err as Error).message).toMatch(/192\.168\.1\.1/);
+    // The name is worth saying too, because the student's link is not what was wrong with it.
+    expect((err as Error).message).toMatch(/careers\.acme\.com/);
+  });
+
+  it('closes the browser rather than leaving it parked on that address', async () => {
+    h.dialsPrivatelyTo = '127.0.0.1';
+    await startRun(input('app-1')).catch(() => undefined);
+    expect(h.closed).toBe(1);
+    expect(getRun('app-1')).toBeUndefined();
+  });
+
+  it('refuses a continue too, and types nothing', async () => {
+    // The start was clean; the rebinding happens on the wizard step the user clicked through
+    // while the run was parked. This is the check that stands between it and the keyboard.
+    await startRun(input('app-1'));
+    h.dialsPrivatelyTo = '169.254.169.254';
+
+    await expect(continueRun(input('app-1'))).rejects.toThrow(/169\.254\.169\.254/);
+    expect(h.executed).toBe(0);
+
+    /**
+     * AND THE WINDOW GOES WITH THE REFUSAL.
+     *
+     * This describe's own header says the browser "does not stay parked on that host", and
+     * only the START test pinned it — the continue refusal threw from outside `drive()`'s try,
+     * so the run stayed registered with its page open on the host that had just rebound. That
+     * page is the persistent profile carrying the student's real logins, and `context.route`
+     * judges DOCUMENTS only, so the attacker page's own XHR back to the now-private name is
+     * never seen by the address guard at all. Leaving the tab open is what lets the read the
+     * whole rule exists to prevent go on happening.
+     */
+    expect(h.closed).toBeGreaterThan(0);
+    expect(getRun('app-1')).toBeUndefined();
+  });
+
+  it('lets an ordinary public address through', async () => {
+    // The direction that costs a student a job if it goes wrong: an employer whose careers
+    // page is served from an ordinary address must fill exactly as before.
+    h.dialsPrivatelyTo = null;
+    await expect(startRun(input('app-1'))).resolves.toMatchObject({ state: 'reading' });
+    await expect(continueRun(input('app-1'))).resolves.toMatchObject({ state: 'done' });
+    expect(h.executed).toBe(1);
   });
 });
 

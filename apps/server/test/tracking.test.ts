@@ -216,6 +216,97 @@ describe('what needs the user, one thing at a time', () => {
     expect(recent.effectiveStatus).toBe('acknowledged');
   });
 
+  /**
+   * An interview that goes quiet was the third of the three statuses waiting on an employer,
+   * and the only one nothing covered. It never ghosted, never nudged, and went on being
+   * counted as an interview in progress, so a student screened in March still had that card
+   * under "Talking" in September with nothing written on it.
+   */
+  it('ghosts an interview that has gone quiet, counting from the interview', () => {
+    const d = derive(
+      app({
+        status: 'interview',
+        submittedAt: daysAgo(200),
+        respondedAt: daysAgo(150),
+        advancedAt: daysAgo(GHOST_AFTER_DAYS + 2),
+      }),
+      NOW,
+    );
+    expect(d.effectiveStatus).toBe('ghosted');
+    expect(d.attention).toBe('silent');
+    // From the interview, not from the submission two hundred days ago.
+    expect(d.daysQuiet).toBe(GHOST_AFTER_DAYS + 2);
+
+    // The boundary in both directions, because the cheap way to pass the test above is to
+    // ghost every interview.
+    const exactly = derive(
+      app({
+        status: 'interview',
+        submittedAt: daysAgo(200),
+        advancedAt: daysAgo(GHOST_AFTER_DAYS),
+      }),
+      NOW,
+    );
+    expect(exactly.effectiveStatus).toBe('ghosted');
+    const dayBefore = derive(
+      app({
+        status: 'interview',
+        submittedAt: daysAgo(200),
+        advancedAt: daysAgo(GHOST_AFTER_DAYS - 1),
+      }),
+      NOW,
+    );
+    expect(dayBefore.effectiveStatus).toBe('interview');
+  });
+
+  /**
+   * The other direction, and the one that matters more. Anchored on `submittedAt` the way
+   * `submitted` is, an application sent in January and interviewed last week reads as silent
+   * for eight months: a live interview dropped into "Closed" under "No word for 230 days.
+   * Worth following up, or letting go."
+   */
+  it('does not ghost an interview held last week on an application sent months ago', () => {
+    const d = derive(
+      app({
+        status: 'interview',
+        submittedAt: daysAgo(230),
+        respondedAt: daysAgo(220),
+        advancedAt: daysAgo(6),
+      }),
+      NOW,
+    );
+    expect(d.effectiveStatus).toBe('interview');
+    expect(d.attention).toBe('none');
+    expect(d.nudge).toBeNull();
+    expect(d.daysQuiet).toBe(6);
+  });
+
+  it('gives no verdict at all on an interview it cannot date', () => {
+    // A row carried over from before the status history was read has no advancedAt. Guessing
+    // at the submission date here is exactly the false ghost above, so nothing is guessed.
+    const d = derive(
+      app({ status: 'interview', submittedAt: daysAgo(200), advancedAt: null }),
+      NOW,
+    );
+    expect(d.effectiveStatus).toBe('interview');
+    expect(d.daysQuiet).toBeNull();
+  });
+
+  it('leaves an offer alone however long it sits', () => {
+    // Silence on an offer is the student's to break. Calling it ghosted would tell them an
+    // offer they still hold has evaporated.
+    const d = derive(
+      app({
+        status: 'offer',
+        submittedAt: daysAgo(200),
+        respondedAt: daysAgo(120),
+        advancedAt: daysAgo(100),
+      }),
+      NOW,
+    );
+    expect(d.effectiveStatus).toBe('offer');
+  });
+
   it('falls back to the submission date when no reply was ever recorded', () => {
     // Rows written before the status history was read carry no respondedAt.
     const d = derive(
@@ -357,6 +448,41 @@ describe('refusing to compute a rate from noise', () => {
     expect(s.interviewRate.numerator).toBe(1);
   });
 
+  /**
+   * "Currently talking to them" has to stop being true at some point. An interview that has
+   * been silent past the ghosting threshold was still counted here, so the tile said the
+   * student had two live interviews when one of them had been over since March.
+   */
+  it('stops counting a silent interview as an interview in progress', () => {
+    const s = computeStats(
+      [
+        app({
+          id: 'quiet',
+          status: 'interview',
+          submittedAt: daysAgo(200),
+          respondedAt: daysAgo(150),
+          advancedAt: daysAgo(GHOST_AFTER_DAYS + 20),
+        }),
+        app({
+          id: 'live',
+          status: 'interview',
+          submittedAt: daysAgo(20),
+          respondedAt: daysAgo(12),
+          advancedAt: daysAgo(5),
+        }),
+      ],
+      NOW,
+    );
+    expect(s.funnel.interviewing, 'only one of the two is still live').toBe(1);
+    expect(s.funnel.ghosted).toBe(1);
+
+    // And the cumulative figures must not fall because one of them went quiet: both got as
+    // far as an interview, and both heard back. Ghosting an interview reaches these through
+    // `effectiveStatus`, so this is the pin on that coupling.
+    expect(s.funnel.reachedInterview, 'both got that far').toBe(2);
+    expect(s.funnel.responded, 'both heard back').toBe(2);
+  });
+
   it('does not blame the user for silence', () => {
     const s = computeStats(
       [app({ status: 'submitted', submittedAt: daysAgo(GHOST_AFTER_DAYS + 5) })],
@@ -385,6 +511,79 @@ describe('reminders are drafts, never sends', () => {
       NOW,
     );
     expect(gone.filter((r) => r.kind === 'follow_up')).toHaveLength(0);
+  });
+
+  /**
+   * The follow-up nudge was offered for `submitted` alone, so the two states where a
+   * follow-up is most obviously worth sending — they acknowledged it and then went quiet,
+   * they interviewed you and then went quiet — were the two that produced nothing.
+   */
+  it('nudges an interview that has gone quiet, and an acknowledgement too', () => {
+    const quietDays = FOLLOW_UP_AFTER_DAYS + 6;
+
+    const interview = buildReminders(
+      [
+        app({
+          status: 'interview',
+          submittedAt: daysAgo(200),
+          respondedAt: daysAgo(150),
+          advancedAt: daysAgo(quietDays),
+        }),
+      ],
+      NOW,
+    );
+    expect(interview.filter((r) => r.kind === 'follow_up')).toHaveLength(1);
+    // Counted from the interview, and the sentence names what it counted from. Over
+    // `daysSinceSubmitted` this would have read "200 days since you applied".
+    expect(interview[0]!.headline).toBe(
+      `${String(quietDays)} days since you reached the interview stage with Northwind Systems`,
+    );
+
+    const acknowledged = buildReminders(
+      [app({ status: 'acknowledged', submittedAt: daysAgo(90), respondedAt: daysAgo(quietDays) })],
+      NOW,
+    );
+    expect(acknowledged[0]!.headline).toBe(
+      `${String(quietDays)} days since Northwind Systems acknowledged your application`,
+    );
+
+    // The submitted wording is the one that was already right, and it does not move.
+    const submitted = buildReminders(
+      [app({ status: 'submitted', submittedAt: daysAgo(quietDays) })],
+      NOW,
+    );
+    expect(submitted[0]!.headline).toBe(
+      `${String(quietDays)} days since you applied to Northwind Systems`,
+    );
+  });
+
+  it('does not nudge a fresh interview, or one already long gone', () => {
+    // Both directions. Nudging every interview is the cheap way to pass the test above, and
+    // an interview held four days ago is not waiting on anything.
+    const fresh = buildReminders(
+      [app({ status: 'interview', submittedAt: daysAgo(60), advancedAt: daysAgo(4) })],
+      NOW,
+    );
+    expect(fresh.filter((r) => r.kind === 'follow_up')).toHaveLength(0);
+
+    const gone = buildReminders(
+      [
+        app({
+          status: 'interview',
+          submittedAt: daysAgo(200),
+          advancedAt: daysAgo(GHOST_AFTER_DAYS + 5),
+        }),
+      ],
+      NOW,
+    );
+    expect(gone.filter((r) => r.kind === 'follow_up')).toHaveLength(0);
+
+    // And an interview with no date to count from is not nudged on a guess either.
+    const undated = buildReminders(
+      [app({ status: 'interview', submittedAt: daysAgo(200), advancedAt: null })],
+      NOW,
+    );
+    expect(undated).toHaveLength(0);
   });
 
   it('sorts the most urgent first', () => {
@@ -427,6 +626,34 @@ describe('reminders are drafts, never sends', () => {
 
   it('says something honest when there is no submission date at all', () => {
     expect(draftFollowUp(app({ status: 'submitted', submittedAt: null }), NOW)).toMatch(/recently/);
+  });
+
+  /**
+   * "I applied for the role two weeks ago and wanted to check whether the position is still
+   * open" is the wrong question to put to someone who has already interviewed you, and it
+   * reads as though the interview never happened.
+   */
+  it('asks a different question once an interview has happened', () => {
+    const text = draftFollowUp(
+      app({
+        status: 'interview',
+        submittedAt: daysAgo(200),
+        respondedAt: daysAgo(150),
+        advancedAt: daysAgo(20),
+      }),
+      NOW,
+    );
+    expect(text).toMatch(/interview process/i);
+    expect(text).not.toMatch(/still open/i);
+
+    // And no dated claim about the interview. The tracker knows when the user recorded
+    // reaching that stage, which is not when the interview was, so "I interviewed with you
+    // three weeks ago" would be a fabricated sentence in outgoing mail.
+    expect(text).not.toMatch(/yesterday|days ago|last week|two weeks ago|a few weeks ago/i);
+
+    // Same register as every other draft.
+    expect(text).not.toMatch(/reach out|circle back|touch base|synerg|leverage|delve/i);
+    expect(text).not.toContain('—');
   });
 });
 
@@ -610,6 +837,118 @@ describe('marking submitted takes the user at their word, and asks for it', () =
       .find((a) => a.id === id)!;
     expect(row.status).toBe('draft');
     expect(row.submittedAt).toBeNull();
+  });
+
+  /**
+   * The other half of G4's recording, walked end to end.
+   *
+   * `mark-submitted` is not the only writer of `submitted_at` — the board's own "I submitted
+   * it" goes through POST /api/applications/:id/status, and docs/03 § 3 names both. That
+   * second path had no test at all, and it is the one a person actually uses: a finished
+   * fill leaves the application in `awaiting_submit`, the user presses Submit on the
+   * employer's page, and then picks "I submitted it" off the card. If that walk does not
+   * work, everything after submission is unreachable and the tracker is decoration.
+   */
+  it('records the submission the user made themselves, from where a filled application sits', async () => {
+    const id = seed('awaiting_submit');
+
+    const res = await server.inject({
+      method: 'POST',
+      url: `/api/applications/${id}/status`,
+      payload: { status: 'submitted' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().status).toBe('submitted');
+
+    const row = db
+      .select()
+      .from(schema.application)
+      .all()
+      .find((a) => a.id === id)!;
+    expect(row.status).toBe('submitted');
+    // Without a timestamp there is no ghosting clock, no reply time and no follow-up.
+    expect(row.submittedAt).toBeTruthy();
+
+    // Who did it is the whole design, so the event has to say.
+    const event = db
+      .select()
+      .from(schema.applicationEvent)
+      .all()
+      .find((e) => e.applicationId === id && e.type === 'status_changed')!;
+    expect(event.payload as { from: string; to: string; by: string }).toMatchObject({
+      from: 'awaiting_submit',
+      to: 'submitted',
+      by: 'user',
+    });
+
+    // A second report of the same thing keeps the first timestamp. Overwriting it would put
+    // the silence clock back to zero, which is how an application nobody had answered in two
+    // months went back to looking freshly sent.
+    const first = row.submittedAt;
+    const again = await server.inject({
+      method: 'POST',
+      url: `/api/applications/${id}/status`,
+      payload: { status: 'submitted' },
+    });
+    expect(again.statusCode).toBe(200);
+    expect(
+      db
+        .select()
+        .from(schema.application)
+        .all()
+        .find((a) => a.id === id)!.submittedAt,
+    ).toBe(first);
+  });
+
+  /**
+   * The student who applied on the employer's own site, with no fill run behind them.
+   *
+   * This is not a rare path. A posting whose apply page redirects to an aggregator is
+   * refused outright (`SOURCE_REFUSED`), a login wall or a bot check ends a run with nothing
+   * typed, and a run that fills zero fields deliberately leaves the status where it was — so
+   * plenty of applications never reach `awaiting_submit`, and the student applies by hand.
+   * If the tracker could not record those, everything after submission would be unreachable
+   * for them and the board would be a lie by omission.
+   *
+   * It can: the transition table already lets a USER walk the same path the fill run walks,
+   * one legal hop at a time, and only then record the submission. What the model refuses is
+   * the jump — `draft → submitted` in one move, which is what a stray POST or a client firing
+   * on the wrong row looks like. This test exists so that stays true: a tightening of `NEXT`
+   * that closed the walk would trap every hand-made application in "Preparing" for ever, and
+   * nothing else would notice.
+   */
+  it('lets a student record an application they made by hand, one legal hop at a time', async () => {
+    const id = seed('draft');
+
+    // The jump is refused, and that refusal is the guard worth keeping.
+    const jump = await server.inject({
+      method: 'POST',
+      url: `/api/applications/${id}/status`,
+      payload: { status: 'submitted' },
+    });
+    expect(jump.statusCode).toBe(409);
+    expect(jump.json().error.code).toBe('ILLEGAL_TRANSITION');
+    // And it says where the application can actually go, which is what the board turns into
+    // a sentence for the user.
+    expect(jump.json().error.message).toMatch(/From here: answers_ready, withdrawn\./);
+
+    // The walk is not.
+    for (const status of ['answers_ready', 'filled', 'awaiting_submit', 'submitted']) {
+      const res = await server.inject({
+        method: 'POST',
+        url: `/api/applications/${id}/status`,
+        payload: { status },
+      });
+      expect(res.statusCode, status).toBe(200);
+    }
+
+    const row = db
+      .select()
+      .from(schema.application)
+      .all()
+      .find((a) => a.id === id)!;
+    expect(row.status).toBe('submitted');
+    expect(row.submittedAt).toBeTruthy();
   });
 
   it('still has no endpoint that does the submitting', async () => {

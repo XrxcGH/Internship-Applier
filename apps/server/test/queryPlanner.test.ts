@@ -4,7 +4,12 @@
  */
 import { describe, expect, it } from 'vitest';
 import type { ConfirmedProfile, SearchFilters } from '@ia/shared';
-import { inferRoleFamilies, planQueries } from '../src/core/discovery/queryPlanner';
+import {
+  inferRoleFamilies,
+  planQueries,
+  termTokens,
+  upcomingCycleYear,
+} from '../src/core/discovery/queryPlanner';
 import { AGGREGATOR_SOURCES } from '../src/core/discovery/sources/aggregators';
 
 /**
@@ -792,5 +797,167 @@ describe('choosing what you are looking for', () => {
     const p = coder();
     p.preferences = { ...p.preferences, roleFamilies: [] };
     expect(planQueries(p, filters()).roleFamilies).toContain('software engineering');
+  });
+});
+
+/**
+ * The search cycle, which used to be the year 2027 and never moved.
+ *
+ * `DEFAULT_FILTERS` states summer 2027 and the planner's own fallback was
+ * `new Date().getUTCFullYear() + 1`, so from June 2027 a default run searches a season whose
+ * postings closed months earlier and comes back empty, with nothing anywhere saying why —
+ * while docs/05 promises "the season and year are ordinary values — nothing in the system
+ * hardcodes summer or 2027". Every date below is injected: a test that reads the wall clock
+ * to check a date rule is the same bug one level up.
+ */
+describe('the search cycle follows the calendar', () => {
+  const at = (day: string) => new Date(`${day}T12:00:00Z`);
+
+  it('turns a summer over when that summer starts, not at New Year', () => {
+    // 2027-01-15 is the case the old fallback got wrong, in the direction that hides jobs:
+    // it asked for "summer 2028", a cycle nobody has posted for yet, while summer 2027 was
+    // still open and being applied to that week.
+    const expected: Array<[string, number]> = [
+      ['2026-09-09', 2027],
+      ['2026-12-31', 2027],
+      ['2027-01-15', 2027],
+      ['2027-05-31', 2027],
+      ['2027-06-01', 2028],
+      ['2027-11-02', 2028],
+      ['2028-03-04', 2028],
+      ['2029-06-30', 2030],
+      ['2031-02-01', 2031],
+    ];
+    for (const [day, year] of expected) {
+      expect({ day, cycle: upcomingCycleYear('summer', at(day)) }).toEqual({ day, cycle: year });
+    }
+  });
+
+  it('gives each season its own rollover rather than the summer one', () => {
+    // Mid-September 2027: fall has started, winter has not, and summer is a year away.
+    const sept = at('2027-09-15');
+    expect(upcomingCycleYear('fall', sept)).toBe(2028);
+    expect(upcomingCycleYear('winter', sept)).toBe(2027);
+    expect(upcomingCycleYear('spring', sept)).toBe(2028);
+    expect(upcomingCycleYear('summer', sept)).toBe(2028);
+    // A season with no window of its own — year_round, flexible — has no rollover of its
+    // own either, and follows the summer cycle the product is built around.
+    expect(upcomingCycleYear('year_round', sept)).toBe(2028);
+    expect(upcomingCycleYear('flexible', at('2027-01-15'))).toBe(2027);
+  });
+
+  it('dates a search that names no year from the clock it was given', () => {
+    const f = filters({ term: { seasons: ['summer'], years: [] } });
+    expect(termTokens(f, at('2027-01-15'))).toEqual(['summer 2027 internship']);
+    expect(termTokens(f, at('2027-07-04'))).toEqual(['summer 2028 internship']);
+  });
+
+  it('dates each season in the same plan separately', () => {
+    // In January the open fall cycle is this year's, and so is summer's.
+    const f = filters({ term: { seasons: ['summer', 'fall'], years: [] } });
+    expect(termTokens(f, at('2027-01-15'))).toEqual([
+      'summer 2027 internship',
+      'fall 2027 internship',
+    ]);
+    // By September fall has begun and rolls over on its own, while winter has not.
+    const g = filters({ term: { seasons: ['fall', 'winter'], years: [] } });
+    expect(termTokens(g, at('2027-09-15'))).toEqual([
+      'fall 2028 internship',
+      'winter 2027 internship',
+    ]);
+  });
+
+  it('never falls back to a year somebody typed once', () => {
+    const f = filters({ term: { seasons: ['summer', 'fall'], years: [] } });
+    for (const day of ['2029-03-01', '2031-08-20', '2034-06-01']) {
+      expect({ day, tokens: termTokens(f, at(day)).join(' ') }).toEqual({
+        day,
+        tokens: expect.not.stringContaining('2027') as unknown as string,
+      });
+    }
+  });
+
+  it('reads the real clock when no clock is injected', () => {
+    // Deliberately not pinned to a year: an assertion about today's date rots by itself,
+    // which is how a constant ends up in the code in the first place. Only the shape is pinned.
+    const tokens = termTokens(filters({ term: { seasons: ['summer'], years: [] } }));
+    const thisYear = new Date().getUTCFullYear();
+    expect(tokens).toHaveLength(1);
+    expect(tokens[0]).toMatch(
+      new RegExp(`^summer (?:${String(thisYear)}|${String(thisYear + 1)}) internship$`),
+    );
+  });
+
+  it('carries the derived cycle into the plan itself', () => {
+    const plan = planQueries(profile(), filters({ term: { seasons: ['summer'], years: [] } }), [], {
+      now: at('2030-02-02'),
+    });
+    expect(plan.termTokens).toEqual(['summer 2030 internship']);
+  });
+
+  it('leaves a year the caller did state alone', () => {
+    // The plan is meant to be inspectable, so a stated filter is never quietly rewritten —
+    // the note below is what a stale one gets instead.
+    const plan = planQueries(
+      profile(),
+      filters({ term: { seasons: ['summer'], years: [2029] } }),
+      [],
+      { now: at('2031-03-01') },
+    );
+    expect(plan.termTokens).toEqual(['summer 2029 internship']);
+  });
+});
+
+/**
+ * The other half: a plan can still be POINTED at a closed season, because `term.years` is a
+ * stated number and `DEFAULT_FILTERS` states 2027 for everyone who sends no filters — and no
+ * screen sends any. Zero results from a season that ended look exactly like zero results from
+ * a thin week, so the plan has to say which of the two it is.
+ */
+describe('a plan pointed at a season that has already begun', () => {
+  const at = (day: string) => new Date(`${day}T12:00:00Z`);
+
+  it('says so, instead of searching a closed cycle in silence', () => {
+    const notes = planQueries(profile(), filters(), [], { now: at('2027-08-01') }).notes.join(' ');
+    expect(notes).toMatch(/already begun: summer 2027/);
+    expect(notes).toMatch(/cycle now open is summer 2028/);
+  });
+
+  it('says nothing at all while that cycle is still open', () => {
+    // The cheap way to pass the test above is to warn on every plan, which would put a false
+    // "your search is closed" in front of every student applying on time.
+    for (const day of ['2026-09-09', '2027-01-15', '2027-05-31']) {
+      const notes = planQueries(profile(), filters(), [], { now: at(day) }).notes.join(' ');
+      expect({ day, warned: /already begun/.test(notes) }).toEqual({ day, warned: false });
+    }
+  });
+
+  it('does not call a cycle closed while one season it asks for is open', () => {
+    // Summer 2027 has gone by August; winter 2027 starts in December and is genuinely open.
+    const plan = planQueries(
+      profile(),
+      filters({ term: { seasons: ['summer', 'winter'], years: [2027] } }),
+      [],
+      { now: at('2027-08-01') },
+    );
+    expect(plan.notes.join(' ')).not.toMatch(/already begun/);
+  });
+
+  it('never calls a year_round search closed, having no season that could have begun', () => {
+    const plan = planQueries(
+      profile(),
+      filters({ term: { seasons: ['year_round'], years: [2027] } }),
+      [],
+      { now: at('2029-04-01') },
+    );
+    expect(plan.notes.join(' ')).not.toMatch(/already begun/);
+  });
+
+  it('never fires for a search with no year, which follows the clock already', () => {
+    const plan = planQueries(profile(), filters({ term: { seasons: ['summer'], years: [] } }), [], {
+      now: at('2031-08-01'),
+    });
+    expect(plan.notes.join(' ')).not.toMatch(/already begun/);
+    expect(plan.termTokens).toEqual(['summer 2032 internship']);
   });
 });

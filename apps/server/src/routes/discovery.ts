@@ -180,6 +180,44 @@ function rememberResolvedBoards(matches: Resolution[]): void {
   }
 }
 
+/**
+ * Says out loud which of the boards being returned are guesses.
+ *
+ * A board found only under the company's FIRST WORD is marked `fromFullName: false` and is
+ * otherwise indistinguishable from a confirmed resolution — same shape, same array, same
+ * "N open jobs" beside it. Nothing outside this file read that flag: `rememberResolvedBoards`
+ * uses it to refuse WRITING the guess down, which fixed what the app does by itself and
+ * nothing at all about what it tells the user. Discovery.tsx renders every element of
+ * `matches` identically, down to an Add button whose plan target reads "<name>, resolved to
+ * this board" — so ashby:vector, which is a real board with real openings belonging to
+ * somebody else, reached the student as Vector Health's board, and one press put it into a
+ * run under the word "resolved".
+ *
+ * The guesses stay in `matches`, because they are worth showing — the student can often tell
+ * at a glance, and a shape change would drop them from the one client that shows them. What
+ * goes in `notes` is the caveat, per board and named, since `notes` is the channel this route
+ * already uses for "what the probes could not prove" and Discovery.tsx prints every line of it
+ * directly under the board list.
+ */
+function guessNotes(name: string, matches: Resolution[]): string[] {
+  const guesses = matches.filter((m) => !m.fromFullName);
+  if (guesses.length === 0) return [];
+
+  const listed = guesses.map((m) => `${m.source}:${m.board}`).join(', ');
+  // Both numbers are ordinary here — one press of "Find the boards" resolves up to eight
+  // names — so the sentence has to agree either way rather than say "board(s)".
+  const one = guesses.length === 1;
+  const subject = one ? 'it' : 'they';
+  const object = one ? 'it' : 'them';
+  const noun = one ? 'That board is' : 'Those boards are';
+  return [
+    `Found only under the first word of "${name}": ${listed}. A company's first word is ` +
+      `frequently another company's whole name, so ${subject} may belong to a different ` +
+      `employer — open ${object} and check before adding ${object} to a run. ${noun} not ` +
+      'saved as a search target either way.',
+  ];
+}
+
 export async function discoveryRoutes(app: FastifyInstance): Promise<void> {
   /**
    * Gate G1: discovery is meaningless against an unconfirmed profile, since eligibility
@@ -227,7 +265,14 @@ export async function discoveryRoutes(app: FastifyInstance): Promise<void> {
     // `notes` carries the vendors that could not be checked at all. Without it an empty
     // `matches` reads as "this company has no board at any vendor we asked", which is a
     // stronger claim than the probes can make for SmartRecruiters.
-    return { name: parsed.data.name, matches, notes };
+    //
+    // The guess note goes first: it is about a row the reader is looking at and can act on,
+    // where the vendor notes are about something absent.
+    return {
+      name: parsed.data.name,
+      matches,
+      notes: [...guessNotes(parsed.data.name, matches), ...notes],
+    };
   });
 
   app.get('/api/discovery/stats', async () => postingStats());

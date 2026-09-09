@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { db, schema, sqlite } from '../src/infra/db/client';
 import { runMigrations } from '../src/infra/db/migrate';
 import { ALL_SOURCES, runDiscovery } from '../src/core/discovery/run';
@@ -275,6 +275,99 @@ describe('one job, two addresses', () => {
     expect(db.select().from(schema.jobPosting).all()).toHaveLength(1);
     expect(stored()?.isOpen).toBe(true);
     expect(summary.closed).toBe(0);
+  });
+});
+
+/**
+ * One programme, two offices, two apply URLs.
+ *
+ * Dedupe's stage 3 merges on company + title tokens + a different source, and it used to
+ * ignore the city entirely — so a company that runs the same internship in Austin and in
+ * Seattle had the two folded onto one row the moment a second source saw one of them. The
+ * survivor kept its own city and its own apply URL and the other posting was gone: not a
+ * duplicate hidden, a second real opening hidden, which is the worst failure this tool has.
+ * Persistence keeps them apart across runs by itself, because the stored fingerprint carries
+ * the city — the loss happened before it ever got there.
+ */
+describe('the same role in two cities', () => {
+  const REAL_ADZUNA = ALL_SOURCES['adzuna']!;
+
+  afterEach(() => {
+    ALL_SOURCES['adzuna'] = REAL_ADZUNA;
+  });
+
+  /** The aggregator's half of the run, under its own name so dedupe sees a second source. */
+  function alsoOnAdzuna(postings: NormalizedPosting[]): void {
+    ALL_SOURCES['adzuna'] = {
+      kind: 'adzuna',
+      requiresKey: false,
+      isConfigured: () => true,
+      fetch: async () => ({ postings, notes: [] }),
+    } as JobSource;
+  }
+
+  it('keeps both, with the apply URL each was posted under', async () => {
+    stub({
+      postings: [
+        posting({
+          canonicalUrl: 'https://boards.greenhouse.io/acme/jobs/1',
+          applyUrl: 'https://boards.greenhouse.io/acme/jobs/1',
+          locations: [{ city: 'Austin', region: 'TX', remote: false }],
+        }),
+      ],
+    });
+    alsoOnAdzuna([
+      posting({
+        externalId: 'x2',
+        canonicalUrl: 'https://adzuna.com/land/ad/2',
+        applyUrl: 'https://adzuna.com/land/ad/2',
+        // The other spelling of the same role, which is exactly what stage 3 matches on.
+        title: 'Software Engineer Intern',
+        locations: [{ city: 'Seattle', region: 'WA', remote: false }],
+      }),
+    ]);
+
+    await runDiscovery([
+      { source: 'greenhouse', board: 'acme' },
+      { source: 'adzuna', board: 'us' },
+    ]);
+
+    const rows = db.select().from(schema.jobPosting).all();
+    expect(rows.map((r) => r.applyUrl).sort()).toEqual([
+      'https://adzuna.com/land/ad/2',
+      'https://boards.greenhouse.io/acme/jobs/1',
+    ]);
+  });
+
+  it('still merges the one job the aggregator gave no location for', async () => {
+    // The other direction, and the reason stage 3 exists. A sighting that names no city
+    // contradicts nothing, so it merges — and the merged row keeps the city the board named.
+    stub({
+      postings: [
+        posting({
+          canonicalUrl: 'https://boards.greenhouse.io/acme/jobs/1',
+          locations: [{ city: 'Austin', region: 'TX', remote: false }],
+        }),
+      ],
+    });
+    alsoOnAdzuna([
+      posting({
+        externalId: 'x2',
+        canonicalUrl: 'https://adzuna.com/land/ad/2',
+        applyUrl: 'https://adzuna.com/land/ad/2',
+        title: 'Software Engineer Intern',
+        locations: [],
+      }),
+    ]);
+
+    await runDiscovery([
+      { source: 'greenhouse', board: 'acme' },
+      { source: 'adzuna', board: 'us' },
+    ]);
+
+    const rows = db.select().from(schema.jobPosting).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.locations).toEqual([{ city: 'Austin', region: 'TX', remote: false }]);
   });
 });
 

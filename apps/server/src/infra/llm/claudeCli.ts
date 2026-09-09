@@ -251,6 +251,19 @@ export function resetCliProbe(): void {
 interface CliEnvelope {
   type?: string;
   subtype?: string;
+  /**
+   * The MODEL's reason for stopping — "end_turn", "max_tokens", "tool_use", "refusal" — in
+   * the same vocabulary the API backend reports.
+   *
+   * Distinct from `subtype`, which is the CLI's own outcome for the whole run ("success",
+   * "error_max_turns"). `stopReason` was read off `subtype`, so on the default backend it
+   * carried "success" where callers expected the model's word, and both guards in
+   * `extractResume` — the refusal branch and the truncation branch — were unreachable. A
+   * resume long enough to exhaust the output budget came back as "the model returned
+   * something this app could not read as a resume", which blames the format, suggests
+   * nothing, and says the same thing on every retry.
+   */
+  stop_reason?: string;
   is_error?: boolean;
   result?: unknown;
   structured_output?: unknown;
@@ -644,13 +657,13 @@ export const claudeCliBackend: Backend = {
         usage: { input_tokens: 0, output_tokens: 0 },
         reportedUsd: typeof env.total_cost_usd === 'number' ? env.total_cost_usd : undefined,
         latencyMs,
-        stopReason: env.subtype ?? null,
+        stopReason: env.stop_reason ?? env.subtype ?? null,
       });
 
       return {
         text,
         structured: env.structured_output,
-        stopReason: env.subtype ?? null,
+        stopReason: env.stop_reason ?? env.subtype ?? null,
         provider: 'claude_cli',
         costUsd: env.total_cost_usd,
       };

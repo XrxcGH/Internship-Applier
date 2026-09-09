@@ -6,10 +6,60 @@ import { z } from 'zod';
 const here = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = path.resolve(here, '../../..');
 
-const Env = z.object({
+/**
+ * Loopback, and nothing else.
+ *
+ * `SERVER_HOST` was a bare `z.string()`. Putting `SERVER_HOST=0.0.0.0` in .env bound the API
+ * to every interface on the machine, and index.ts went on printing `server listening
+ * (loopback only)` over the top of it — a line that had never once checked what it asserted.
+ * docs/10 states the bind as an invariant ("The local API binds `127.0.0.1` only, never
+ * `0.0.0.0`"), so the choice was to check the value or to stop claiming it. Checked: the
+ * claim is the one worth keeping, and binding wider buys nothing anyway. The `onRequest`
+ * hook in app.ts already answers 403 to any connection that did not arrive from loopback, so
+ * a 0.0.0.0 bind produces a port the LAN can reach and cannot use. All that is left of it is
+ * the exposure.
+ *
+ * Accepted, because refusing any of these would be a lie in the other direction:
+ *   - the whole 127.0.0.0/8 block, not just 127.0.0.1 — 127.0.0.2 is as loopback as .1;
+ *   - `localhost`, which is what a person types;
+ *   - `::1` and `::ffff:127.0.0.1`, the IPv6 spellings of the same interface.
+ * Refused: `0.0.0.0`, `::`, `*`, a LAN or public address, a hostname, and the empty string —
+ * `SERVER_HOST=` in .env leaves Node listening on every interface, which is the accident this
+ * exists to stop and the one that looks the most like a typo.
+ *
+ * This fails closed. An odd-but-genuine spelling — `127.1`, or a bracketed `[::1]`, which
+ * Node would try to resolve as a name and fail on anyway — is refused at startup with a
+ * message naming the forms that work, rather than parsed loosely. A refusal here costs one
+ * clear error; a value waved through costs a LAN-visible port.
+ */
+function isLoopbackHost(value: string): boolean {
+  const host = value.trim().toLowerCase();
+  if (host === 'localhost' || host === '::1' || host === '::ffff:127.0.0.1') return true;
+
+  const octets = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (!octets) return false;
+  const parts = octets.slice(1).map(Number);
+  return parts.every((n) => n <= 255) && parts[0] === 127;
+}
+
+/**
+ * Exported so a test can assert the refusal on the schema the app actually parses with.
+ *
+ * A bad value here reaches `process.exit(1)` below, which in a test worker would take the
+ * runner down with it, and a test that re-typed the rule into its own `z.object` would prove
+ * only that zod works — the same trap logger.test.ts describes at length.
+ */
+export const Env = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
-  SERVER_HOST: z.string().default('127.0.0.1'),
+  SERVER_HOST: z
+    .string()
+    .default('127.0.0.1')
+    .refine(isLoopbackHost, {
+      message:
+        'SERVER_HOST must be a loopback address: 127.0.0.1 (the default), any 127.x.x.x, ' +
+        'localhost, or ::1. This server binds loopback only — see docs/10-security-privacy.md.',
+    }),
   SERVER_PORT: z.coerce.number().int().positive().default(8787),
   WEB_PORT: z.coerce.number().int().positive().default(5173),
   /**
@@ -81,7 +131,11 @@ export const config = {
   logLevel: env.LOG_LEVEL,
 
   server: {
-    /** Loopback only. Never bind 0.0.0.0 — see docs/10-security-privacy.md. */
+    /**
+     * Loopback only, and now checked rather than asserted — see `isLoopbackHost` above.
+     * Startup refuses anything else, which is what makes index.ts's "(loopback only)" line
+     * and the docs/10 invariant true statements about the running process.
+     */
     host: env.SERVER_HOST,
     port: env.SERVER_PORT,
   },

@@ -516,8 +516,8 @@ function persist(unique: ReturnType<typeof dedupe>['unique']): PersistResult {
      * The fingerprint (company + normalized title + primary city) is the same stage-2
      * key, so this is the existing rule applied across runs rather than a new one.
      */
-    const existing = db
-      .select({ id: schema.jobPosting.id })
+    const candidates = db
+      .select({ id: schema.jobPosting.id, canonicalUrl: schema.jobPosting.canonicalUrl })
       .from(schema.jobPosting)
       .where(
         or(
@@ -527,6 +527,23 @@ function persist(unique: ReturnType<typeof dedupe>['unique']): PersistResult {
       )
       .all();
 
+    /**
+     * THE EXACT KEY WINS OVER THE APPROXIMATE ONE.
+     *
+     * The two halves of that `or` can match DIFFERENT stored rows: this posting's own row by
+     * canonical URL, and somebody else's by fingerprint — company, normalised title and
+     * primary city, which two requisitions at one company in one city share readily. Taking
+     * `[0]` left the choice to whatever order SQLite's plan happened to return, so a sighting
+     * could update a different job's row and leave its own untouched: one posting overwritten
+     * with another's description and dates, and the real one never refreshed.
+     *
+     * A canonical URL is unique in this table and is the address the posting was actually
+     * found at. A fingerprint is a similarity heuristic. When both answer, the address decides.
+     */
+    const exact = candidates.find((c) => c.canonicalUrl === p.canonicalUrl);
+    const existing = exact ? [exact] : candidates;
+    const matchedByUrl = exact !== undefined;
+
     const now = new Date().toISOString();
 
     if (existing[0]) {
@@ -535,13 +552,54 @@ function persist(unique: ReturnType<typeof dedupe>['unique']): PersistResult {
         .from(schema.jobPosting)
         .where(eq(schema.jobPosting.id, existing[0].id))
         .all()[0];
+      const fresh = freshFields(p, stored);
+
+      /**
+       * A SIGHTING AT A DIFFERENT ADDRESS MAY NOT REWRITE WHERE THE STUDENT APPLIES.
+       *
+       * `freshFields` takes the apply URL from whatever sighting arrived last. On a
+       * fingerprint-only match that sighting is a DIFFERENT page — an aggregator's copy, a
+       * web-search hit — and the row then sends the student somewhere other than the address
+       * it claims to come from. G4 is the student clicking that link on a real application,
+       * so it has to point where the row says it does.
+       *
+       * A sighting at the same canonical URL is the same page and may correct it freely, and
+       * an empty stored value is not a correction but a gap being filled.
+       */
+      if (!matchedByUrl && typeof stored?.applyUrl === 'string' && stored.applyUrl !== '') {
+        delete fresh['applyUrl'];
+      }
+
+      /**
+       * REQUIREMENTS BELONG TO THE TEXT THEY WERE READ FROM.
+       *
+       * `runMatching` extracts once and then trusts the stamp: `requirementsExtractedAt ===
+       * null || opts.reextract`. Nothing ever cleared that stamp, so requirements read from
+       * one description outlived it. The shape that costs the student: a board answers a
+       * listing with an empty or one-line description, the posting is stored, matching finds
+       * no requirements in it and stamps the row — and when a later run brings the real
+       * description, the row keeps the stamp and the requirements are never read at all.
+       * Eligibility then reasons about a posting whose stated rules it has never seen, and the
+       * only way out was a full manual re-extract of every posting in the table.
+       *
+       * Cleared only when the text ACTUALLY changed. `freshFields` already refuses to
+       * overwrite something with nothing, so a run that re-sees the same posting normally
+       * proposes the identical text and this is a no-op — which matters, because clearing on
+       * every sighting would re-run the model pass over the whole table on every discovery
+       * run for users who have an API key.
+       */
+      const descriptionChanged =
+        typeof fresh['descriptionText'] === 'string' &&
+        fresh['descriptionText'] !== stored?.descriptionText;
+      if (descriptionChanged) fresh['requirementsExtractedAt'] = null;
+
       db.update(schema.jobPosting)
         // The fingerprint is rewritten, not just the timestamps. Its definition became more
         // cautious — it used to erase the tokens that tell "Intern I" from "Intern II" —
         // and rows stored under the old key would otherwise keep matching two distinct
         // requisitions onto one row forever. Recomputing on every sighting means the table
         // heals itself as postings are seen again, with no data migration to get wrong.
-        .set({ lastSeenAt: now, isOpen: true, fingerprint: fp, ...freshFields(p, stored) })
+        .set({ lastSeenAt: now, isOpen: true, fingerprint: fp, ...fresh })
         .where(eq(schema.jobPosting.id, existing[0].id))
         .run();
       linkSources(existing[0].id, entry.sources, p.externalId);

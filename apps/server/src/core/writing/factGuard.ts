@@ -1578,6 +1578,38 @@ export function checkClaimDeterministically(
     }
   }
 
+  /**
+   * ── A COUNT THE PROFILE CONTRADICTS, quoted underneath as if it agreed.
+   *
+   * "I led the build subteam of sixty students" came back GREEN against a profile bullet
+   * reading "Led the build subteam of six students", with that bullet printed beside it as
+   * the evidence. Nothing looked at the number: the lexical layer saw "build subteam" and
+   * "students" overlap and was satisfied, and a draft that had inflated a six-person team
+   * tenfold went to G3 wearing a tick and its own refutation.
+   *
+   * PAIRED WITH ITS NOUN, never compared loosely. A bare "sixty" against a bare "six"
+   * somewhere else in the profile would flag "I spent six weeks on a team of sixty" — two
+   * true numbers about two different things — so only numbers modifying the SAME noun are
+   * compared, and time words are excluded outright because a span is the duration check's
+   * business and it reads them far more carefully than this could.
+   *
+   * AMBER, NOT RED, for the same reason as the language ladder above: a bigger number is not
+   * always an inflated one. A student who ran two six-person cohorts may honestly write
+   * twelve, and blocking that at a gate with no override is the worse error. What must not
+   * happen is the green tick.
+   */
+  const inflated = inflatedCount(claim, evidence);
+  if (inflated) {
+    return {
+      verdict: 'inferred',
+      reason:
+        `The draft says ${inflated.claimed} ${inflated.noun}; your profile says ` +
+        `${inflated.held}. If the larger number is a total across entries, say so; otherwise ` +
+        'match the profile.',
+      quote: inflated.quote,
+    };
+  }
+
   // ── skills claimed but not held.
   const heldSkills = new Set(evidence.flatMap((e) => (e.facts.skills ?? []).map(normalize)));
   for (const raw of extractClaimedSkills(claim)) {
@@ -1744,6 +1776,110 @@ function levelOf(text: string): number {
   return rank;
 }
 
+/**
+ * A headcount pattern of this check's own, rather than COUNT_PATTERN.
+ *
+ * COUNT_PATTERN caps its digits at TWO on purpose — it feeds the duration extractor, where a
+ * three-digit number of years is not a tenure anybody claims. A headcount is not bounded that
+ * way: "31 members" is the number this check exists to compare and "300" is the inflation of
+ * it, so sharing the duration pattern silently limited every comparison here to 99 and let
+ * the largest claims — the ones most worth catching — through untouched.
+ */
+const HEADCOUNT = [
+  /**
+   * A whole number, and never a piece of a decimal.
+   *
+   * Without the guards, "I have a 3.968 GPA on a 4.0 scale" — a true sentence, and one this
+   * repo already has a suite about — read as the count 968 of a thing called "GPA" and the
+   * count 0 of a thing called "scale", and the honest GPA came back amber. The lookbehind
+   * refuses a digit that follows a digit or a dot; the lookahead refuses one that starts a
+   * decimal. `extractDurations` carries the same lookbehind for the same reason.
+   */
+  String.raw`(?<![\d.])\d{1,7}(?!\.\d)`,
+  String.raw`(?:${TENS.join('|')})[\s-](?:${ONES.join('|')})`,
+  ...Object.keys(NUMBER_WORDS).sort((a, b) => b.length - a.length),
+].join('|');
+
+/**
+ * Nouns a number in front of is somebody's SPAN, not their headcount.
+ *
+ * Durations are the duration check's business and it reads them with a care this cannot
+ * match — scoping, ceilings, rounding slack, the whole year-range apparatus. Comparing them
+ * here too would double-judge the same words and reach a different answer from the one the
+ * user is shown.
+ */
+const TIME_NOUN =
+  /^(?:year|yr|month|mo|week|day|hour|semester|term|quarter|summer|decade|minute|second)s?$/i;
+
+/** A number and the plural noun it modifies: "six students", "31 members", "twelve people". */
+const COUNTED_NOUN = new RegExp(
+  String.raw`\b(` + HEADCOUNT + String.raw`)\s+([a-z][a-z-]{2,})\b`,
+  'gi',
+);
+
+/**
+ * The magnitudes that turn the word in front of them into a bigger number rather than a noun.
+ *
+ * Without this, "I grew the club to three hundred members" parsed as the count 3 modifying a
+ * noun called "hundred", the profile's "thirty-one members" had nothing to compare against,
+ * and a tenfold inflation came back green — the same false green the check was written for,
+ * one spelling further on. Collapsed to a plain numeral before matching so the pattern below
+ * sees "300 members" and needs to know nothing about magnitudes at all.
+ */
+
+const MAGNITUDE = new RegExp(
+  String.raw`\b(` + HEADCOUNT + String.raw`)\s+(hundred|thousand|million)\b`,
+  'gi',
+);
+const MAGNITUDE_OF: Record<string, number> = { hundred: 100, thousand: 1000, million: 1_000_000 };
+
+/** Every (noun -> largest number said about it) pair in a piece of text. */
+function countsByNoun(raw: string): Map<string, number> {
+  const text = raw.replace(MAGNITUDE, (whole, count: string, unit: string) => {
+    const n = countOf(count);
+    const scale = MAGNITUDE_OF[unit.toLowerCase()];
+    return n > 0 && scale !== undefined ? ` ${String(n * scale)} ` : whole;
+  });
+
+  const out = new Map<string, number>();
+  for (const m of text.matchAll(COUNTED_NOUN)) {
+    const n = countOf(m[1]!);
+    const noun = m[2]!.toLowerCase();
+    if (n <= 0 || TIME_NOUN.test(noun)) continue;
+    out.set(noun, Math.max(out.get(noun) ?? 0, n));
+  }
+  return out;
+}
+
+/**
+ * A number in the draft that the profile's own words put lower, for the same noun.
+ *
+ * The evidence is read per ITEM rather than as one blob, so the quote handed back is the line
+ * that disagrees — a reason that names no source is one the student cannot act on. The
+ * largest figure the profile gives that noun is the one compared against, so a claim only
+ * counts as inflated when it exceeds everything the profile says.
+ */
+function inflatedCount(
+  claim: string,
+  evidence: Evidence[],
+): { noun: string; claimed: number; held: number; quote: string } | null {
+  const claimed = countsByNoun(claim);
+  if (claimed.size === 0) return null;
+
+  for (const [noun, n] of claimed) {
+    let best: { held: number; quote: string } | null = null;
+    for (const e of evidence) {
+      const here = countsByNoun(e.text).get(noun);
+      if (here === undefined) continue;
+      if (best === null || here > best.held) best = { held: here, quote: e.text };
+    }
+    if (best !== null && n > best.held) {
+      return { noun, claimed: n, held: best.held, quote: best.quote };
+    }
+  }
+  return null;
+}
+
 function overstatedLanguage(
   claim: string,
   evidence: Evidence[],
@@ -1751,19 +1887,51 @@ function overstatedLanguage(
   const held = evidence.flatMap((e) => e.facts.languages ?? []);
   if (held.length === 0) return null;
 
-  const claimRank = Math.max(levelOf(claim), LANGUAGE_USE.test(claim) ? 3 : 0);
-  if (claimRank === 0) return null;
-
   for (const lang of held) {
     const norm = normalize(lang.name);
     if (norm.length < 2 || !containsPhrase(normalize(claim), norm)) continue;
     // An unrecognised proficiency string says nothing either way, so it cannot be exceeded.
     const heldRank = levelOf(lang.proficiency);
-    if (heldRank > 0 && claimRank > heldRank) {
+    if (heldRank === 0) continue;
+
+    /**
+     * THE LEVEL IS READ FROM THE CLAUSE THAT NAMES THE LANGUAGE, NOT THE WHOLE SENTENCE.
+     *
+     * `levelOf(claim)` took the highest word anywhere in the draft and charged it to every
+     * language the profile holds, so a student who really is a native Igbo speaker and really
+     * is conversational in Spanish had "I am fluent in Igbo and conversational in Spanish" —
+     * true of both halves — flagged, because "fluent" was measured against Spanish. That is
+     * the ordinary way anyone writes two proficiencies, and the amber it earned sits on the
+     * G3 screen next to the profile line that agrees with it.
+     *
+     * The clause is bounded by the punctuation and conjunctions that separate list items, so
+     * "I am conversational in Spanish and Igbo" — one clause, two languages — still measures
+     * both against conversational, which is what it says.
+     */
+    const clause = clauseNaming(claim, lang.name);
+    const claimRank = Math.max(levelOf(clause), LANGUAGE_USE.test(clause) ? 3 : 0);
+    if (claimRank > heldRank) {
       return { name: lang.name, held: lang.proficiency.toLowerCase() };
     }
   }
   return null;
+}
+
+/**
+ * The stretch of a claim that a language name belongs to.
+ *
+ * Split on the boundaries a writer uses to list proficiencies — commas, semicolons and a
+ * bare "and" — and return the piece the name landed in. A name the split loses (a language
+ * whose own name contains a comma is not a thing, but a normalisation mismatch is) falls
+ * back to the whole claim, which is the reading this function replaced and so cannot be
+ * worse than it was.
+ */
+function clauseNaming(claim: string, language: string): string {
+  const norm = normalize(language);
+  for (const part of claim.split(/[,;]|\s+\band\b\s+/i)) {
+    if (containsPhrase(normalize(part), norm)) return part;
+  }
+  return claim;
 }
 
 /**

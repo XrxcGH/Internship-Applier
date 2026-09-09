@@ -274,11 +274,41 @@ export function retrieveEvidence(
   });
 
   profile.projects.forEach((p, i) => {
+    // The span belongs here for the same reason the role line above carries one, and a
+    // project was the one dated entry kind this file dropped it from. FactGuard's duration
+    // check pools evidence on `facts.startDate` and scopes a claim to the entry whose NAME
+    // it uses, so an undated project is in neither: "I worked on Trail Tracker for two
+    // years", about a project the profile records as running exactly two years, scoped to
+    // nothing and was measured against the longest entry the profile DID date — a
+    // three-month internship — and came back `overstated` at G3, where there is no
+    // override, quoting the internship as the reason.
+    //
+    // It failed just as quietly the other way. On the ordinary shape of a young
+    // applicant's resume, where the longest dated entry is a four-year club, the same
+    // sentence about a two-month project cleared that club's ceiling and went to an
+    // employer as a green tick. One missing pair of fields, both bug directions.
+    //
+    // The dates go in the TEXT as well as in `facts`, the way experience, education and
+    // certifications already put theirs there: the text is what a reviewer reads the
+    // sentence against at G3, and it is what gets quoted beside a claim the check blocks.
+    // Printed only when the profile holds one of them — "(date not stated to present)" on
+    // every undated project would be asserting an ongoing project the profile never
+    // claimed, in items whose whole job is to be true.
+    const span =
+      p.startDate || p.endDate
+        ? ` (${p.startDate ?? 'date not stated'} to ${p.endDate ?? 'present'})`
+        : '';
     items.push({
       ref: `projects.${i}`,
       kind: 'project',
-      text: `${p.name}: ${p.description}${p.bullets.length ? ` ${p.bullets.join(' ')}` : ''}`,
-      facts: { title: p.name, skills: p.skills ?? [] },
+      text:
+        `${p.name}: ${p.description}${p.bullets.length ? ` ${p.bullets.join(' ')}` : ''}` + span,
+      facts: {
+        title: p.name,
+        skills: p.skills ?? [],
+        startDate: p.startDate,
+        endDate: p.endDate,
+      },
       score:
         overlap(query, tokens(`${p.name} ${p.description} ${(p.skills ?? []).join(' ')}`)) + 0.1,
     });

@@ -156,6 +156,41 @@ const SCAN = (selector: string): unknown => {
   };
 
   /** The question a radio group answers, which lives on the fieldset, not the input. */
+  /**
+   * The heading of the block a control sits inside — a fieldset legend, a table caption, the
+   * heading that opens a section.
+   *
+   * A label on its own cannot tell two identical questions apart: the "Start Date" column of
+   * a work-history table and the "Start date" this internship asks about are the same six
+   * characters, and the classifier only ever saw the label. So a row of the applicant's
+   * employment history was filled with the date they become AVAILABLE, at 0.92 confidence,
+   * verified by read-back and shown in the review as a field that went right — a false
+   * statement about their work history in a document submitted in their name.
+   *
+   * Nearest container wins, and it is read from the shapes forms actually use rather than
+   * from a class name: a legend, a caption, an aria-label on the group, or the last heading
+   * before the block. An empty string means nothing was found, which the classifier treats as
+   * "no container known" rather than as "top level".
+   */
+  const sectionFor = (el: HTMLElement): string => {
+    const block = el.closest('fieldset, table, section, [role=group], [role=region]');
+    if (!block) return '';
+
+    const legend = block.querySelector('legend, caption');
+    if (legend) return text(legend);
+
+    const aria = (block.getAttribute('aria-label') ?? '').trim();
+    if (aria) return aria;
+
+    // The heading that introduces the block, whether it is inside it or immediately above.
+    const inside = block.querySelector('h1, h2, h3, h4, h5, h6');
+    if (inside) return text(inside);
+    for (let sib = block.previousElementSibling; sib; sib = sib.previousElementSibling) {
+      if (/^h[1-6]$/i.test(sib.tagName)) return text(sib);
+    }
+    return '';
+  };
+
   const groupLabelFor = (el: HTMLElement): string => {
     const group = el.closest('fieldset, [role=radiogroup]');
     if (!group) return '';
@@ -381,6 +416,7 @@ const SCAN = (selector: string): unknown => {
       label,
       optionLabel: control === 'radio' ? optionLabelFor(el) : undefined,
       groupLabel: control === 'radio' ? groupLabelFor(el) : undefined,
+      section: sectionFor(el) || undefined,
       optionValue: control === 'radio' ? (el.getAttribute('value') ?? '') : undefined,
       name: el.getAttribute('name') ?? undefined,
       id: el.id || undefined,
@@ -614,6 +650,10 @@ export async function buildFormMap(page: Page): Promise<FormMap> {
         // the first radio group pointed at the wrong element.
         locator: r.locator,
         label: r.label || '(no label found)',
+        // Carried onto the stored field, not only used for classification: the review screen
+        // shows the student a list of labels, and two rows both reading "Start Date" are the
+        // same six characters there too.
+        section: r.section,
         control: r.control,
         required: r.required,
         maxLength: r.maxLength,

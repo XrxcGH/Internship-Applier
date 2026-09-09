@@ -33,6 +33,42 @@ npm start          # builds the interface and serves everything from one URL
 Then open the address it prints. `npm run dev` runs the API and the Vite dev server
 separately while you are working on it.
 
+**The browser is a separate download, and `npm install` does not do it.** That command
+installs the `playwright` package; it does not fetch the Chromium that package drives. This
+version of the package declares no install script — `package-lock.json` records no
+`hasInstallScript` for either `playwright` or `playwright-core` — so nothing here and nothing
+in npm's own machinery downloads a browser. Everything else works, which is what makes it a
+bad first run: the gap surfaces on the first form fill, on a real application, as a 502
+`FILL_FAILED` carrying Playwright's own complaint that its executable does not exist at
+`ms-playwright\chromium-<revision>\chrome-win64\chrome.exe`. Do it once, before you need it:
+
+```bash
+npx playwright install chromium
+```
+
+Chromium is the only browser this tool ever launches, so the other two are not worth the
+download, and the command is a no-op once the pinned revision is on disk. It belongs in a
+`postinstall` script in the root `package.json` so that `npm install` is genuinely enough;
+until it is there, this paragraph is that step.
+
+**If port 8787 is taken, the advice the server prints is right for `npm start` and wrong for
+`npm run dev`.** The message tells you how to find and stop whatever is holding the port, and
+then offers "set SERVER_PORT in .env". Under `npm start` that works: one process serves the
+API and the built interface from one origin. Under `npm run dev` it breaks the app instead,
+because only the server reads that file — Vite's config takes `SERVER_PORT` from its own
+process environment. The API moves to 8788 and the dev server goes on proxying `/api` to
+8787, which is frequently the stale process you were escaping, still listening and still
+answering. So under `npm run dev`, either stop that process or put the variable where both
+halves can see it:
+
+```bash
+SERVER_PORT=8788 npm run dev            # bash
+$env:SERVER_PORT=8788; npm run dev      # PowerShell
+```
+
+Details, including the mirror-image trap in `WEB_PORT`, are in
+[`docs/02-architecture.md`](docs/02-architecture.md) § Processes and lifecycle.
+
 If you are going to commit anything from this checkout, run `npm run hooks:install` first.
 It points git at `.githooks`, whose pre-commit hook refuses commits containing your resume,
 the database, a `.env`, or an Anthropic key. Git does not use that directory until you say

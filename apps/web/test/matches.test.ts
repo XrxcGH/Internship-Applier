@@ -12,11 +12,15 @@ import {
   termLabel,
   type MatchDetail,
 } from '../src/lib/matches';
+import { queueKeyAction, type QueueKeyAction } from '../src/lib/queueKeys';
 import {
+  deadlineChip,
   DecisionRow,
   descriptionExcerpt,
   detailPaneState,
   FullDescription,
+  keyActionAllowed,
+  type PaneState,
 } from '../src/pages/Matches';
 
 /**
@@ -46,6 +50,58 @@ describe('daysUntil', () => {
   it('answers nothing for a posting with no deadline or an unreadable one', () => {
     expect(daysUntil(null)).toBeNull();
     expect(daysUntil('whenever')).toBeNull();
+  });
+});
+
+/**
+ * The chip the queue row draws from that number, on the one day it matters most.
+ *
+ * `daysUntil` parses `closesAt` as an instant, and a date with no time — USAJOBS's
+ * ApplicationCloseDate and JSON-LD's validThrough both send one — is the FIRST instant of
+ * that day. So a posting closing "2026-09-09" was drawn in urgency red reading `closed` from
+ * midnight UTC on the 9th, through the whole of the final day the student could still apply,
+ * and from the afternoon of the 8th anywhere west of Greenwich.
+ *
+ * The server never read it that way: `deadline` in eligibility.ts and the closing sweep in
+ * refresh.ts both stretch a bare date to the end of its day, so the requirement checklist in
+ * the pane said "Closes 2026-09-09 — met" beside a row calling the same posting closed. A
+ * false `closed` hides a job the student could still have got.
+ */
+describe('deadlineChip', () => {
+  const dateOnly = (offsetDays: number): string =>
+    new Date(Date.now() + offsetDays * 86_400_000).toISOString().slice(0, 10);
+  const at = (ms: number): string => new Date(Date.now() + ms).toISOString();
+
+  it('does not call a posting closed for the whole of its final day', () => {
+    expect(deadlineChip(dateOnly(0))).toEqual({ text: '1d left', urgent: true });
+  });
+
+  it('ignores the whitespace the field can arrive with, as the server does', () => {
+    expect(deadlineChip(` ${dateOnly(0)} `)).toEqual({ text: '1d left', urgent: true });
+  });
+
+  it('still closes a bare date once its day is over', () => {
+    // The other direction. The cheap way to pass the test above is to stop closing anything,
+    // and a queue that never says `closed` sends the student to apply through a dead form.
+    expect(deadlineChip(dateOnly(-1))).toEqual({ text: 'closed', urgent: true });
+  });
+
+  it('still closes a timestamp that has genuinely passed', () => {
+    expect(deadlineChip(at(-3 * 3600_000))).toEqual({ text: 'closed', urgent: true });
+    expect(deadlineChip(at(-40 * 86_400_000))).toEqual({ text: 'closed', urgent: true });
+  });
+
+  it('counts the days left, and reddens only the last week of them', () => {
+    expect(deadlineChip(at(3 * 86_400_000))).toEqual({ text: '3d left', urgent: true });
+    expect(deadlineChip(at(6 * 86_400_000))).toEqual({ text: '6d left', urgent: true });
+    expect(deadlineChip(at(7 * 86_400_000))).toEqual({ text: '7d left', urgent: false });
+    expect(deadlineChip(at(20 * 86_400_000))).toEqual({ text: '20d left', urgent: false });
+  });
+
+  it('draws no chip at all rather than guessing at a date it cannot read', () => {
+    expect(deadlineChip(null)).toBeNull();
+    expect(deadlineChip('whenever')).toBeNull();
+    expect(deadlineChip('')).toBeNull();
   });
 });
 
@@ -179,8 +235,11 @@ describe('the detail column itself', () => {
   const pane = page.slice(page.indexOf('{/* detail */}'), page.indexOf('<footer'));
 
   it('draws something for each of the three states', () => {
-    expect(pane).toMatch(/detailPaneState\(detail, detailError\) === 'loading'/);
-    expect(pane).toMatch(/detailPaneState\(detail, detailError\) === 'failed'/);
+    // Read once into `pane` now, because the same three states also decide whether a
+    // decision key may fire — see the keyboard block below.
+    expect(page).toMatch(/const pane = detailPaneState\(detail, detailError\);/);
+    expect(pane).toMatch(/pane === 'loading'/);
+    expect(pane).toMatch(/pane === 'failed'/);
     expect(pane).toMatch(/Reading the posting/);
     expect(pane).toMatch(/\{current && detail && \(/);
   });
@@ -195,6 +254,107 @@ describe('the detail column itself', () => {
   it('offers a retry that re-runs the fetch that failed', () => {
     expect(pane).toMatch(/setDetailAttempt\(\(n\) => n \+ 1\)/);
     expect(page).toMatch(/\}, \[selected, detailAttempt\]\)/);
+  });
+});
+
+/**
+ * The other half of that hole: the keys, which had no such door.
+ *
+ * Drawing the two blank states was only half the fix. A row is selected the instant the list
+ * lands — a whole round trip before its posting arrives, and for good after that posting
+ * fails to arrive — and `act` guards only `!selected || busyRef.current`. So `a` pressed over
+ * "Reading the posting…" created a real application, and `a` pressed over "This posting would
+ * not open." created one too: an approval at G2 for a posting whose title, requirements,
+ * score and rationale the user had never been shown. The four buttons are absent in both
+ * states because they render inside `current && detail`; on a screen this file calls
+ * keyboard-first, the buttons were never the way in.
+ */
+describe('keyActionAllowed', () => {
+  const PANES: PaneState[] = ['loading', 'failed', 'ready'];
+  const DECISIONS: QueueKeyAction[] = ['approve', 'skip', 'save', 'reject'];
+
+  it('will not decide a posting the user cannot see', () => {
+    for (const state of ['loading', 'failed'] as PaneState[]) {
+      for (const action of DECISIONS) {
+        expect(keyActionAllowed(action, state), `${action} over a ${state} pane`).toBe(false);
+      }
+    }
+  });
+
+  it('leaves every decision live once the posting is on screen', () => {
+    // The other direction, and the cheap way to pass the test above is a queue nobody can
+    // triage by keyboard at all.
+    for (const action of DECISIONS) {
+      expect(keyActionAllowed(action, 'ready'), action).toBe(true);
+    }
+  });
+
+  it('never holds the keys that only move, or close the sheet', () => {
+    // Moving off a posting that will not load is exactly what someone stuck at a dead pane
+    // needs to do, and a sheet that cannot be closed is worse than one that cannot open.
+    for (const state of PANES) {
+      expect(keyActionAllowed('next', state), state).toBe(true);
+      expect(keyActionAllowed('prev', state), state).toBe(true);
+      expect(keyActionAllowed('close-sheet', state), state).toBe(true);
+    }
+  });
+
+  it('classifies every action the key map can actually produce', () => {
+    // Enumerated from queueKeyAction rather than from a list written here, so a seventh
+    // binding cannot be added to the key map and left unclassified — the failure mode this
+    // repo's source-of-truth tests exist for.
+    const produced = [
+      ...['j', 'k', 'a', 's', 'x', 'l'].map((key) => queueKeyAction({ key }, { rejecting: false })),
+      queueKeyAction({ key: 'Escape' }, { rejecting: true }),
+    ];
+    expect(produced).not.toContain(null);
+
+    const held = produced
+      .filter((a): a is QueueKeyAction => a !== null && !keyActionAllowed(a, 'loading'))
+      .sort();
+    expect(held).toEqual(['approve', 'reject', 'save', 'skip']);
+  });
+});
+
+describe('the queue over a pane with nothing in it', () => {
+  const page = readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), '../src/pages/Matches.tsx'),
+    'utf8',
+  );
+
+  it('runs every keypress past the pane state before acting on it', () => {
+    expect(page).toMatch(/if \(!keyActionAllowed\(action, pane\)\) return;/);
+    // And re-reads the handler when the pane changes, or the listener registered while the
+    // posting was loading would go on refusing keys after it arrived.
+    expect(page).toMatch(/\}, \[move, act, rejecting, pane\]\)/);
+  });
+
+  it('says the keys are held, in both of the states where they are', () => {
+    // Held silently is the bug in a different costume: a press that vanishes without a word
+    // is how someone comes to believe they approved something.
+    const detail = page.slice(page.indexOf('{/* detail */}'), page.indexOf('<footer'));
+    const loading = detail.slice(
+      detail.indexOf("pane === 'loading'"),
+      detail.indexOf("pane === 'failed'"),
+    );
+    const failed = detail.slice(
+      detail.indexOf("pane === 'failed'"),
+      detail.indexOf('{current && detail'),
+    );
+    expect(loading).toMatch(/held/);
+    expect(failed).toMatch(/held/);
+  });
+
+  it('closes the reject sheet when the selection moves off the posting it was opened over', () => {
+    // Reachable with the mouse, which the key guard above does not cover: open the sheet on
+    // A, click row B, and `rejecting` stayed true through a pane that had unmounted — every
+    // key but Escape swallowed by a sheet nobody could see, and the sheet reappearing over B
+    // one press from filing A's reason against it.
+    const selectionEffect = page.slice(
+      page.indexOf('setDetail(null);'),
+      page.indexOf('const move ='),
+    );
+    expect(selectionEffect).toMatch(/setRejecting\(false\);/);
   });
 });
 

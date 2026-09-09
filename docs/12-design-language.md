@@ -23,9 +23,13 @@ drop shadows, Inter at three weights, an emoji in every heading.
 
 ## Typography
 
-Three faces, each with a job. All **self-hosted via `@fontsource`** — the app promises
-nothing leaves your machine, so pulling fonts from a CDN would leak a request on every
-launch and break offline use. The privacy stance and the type stack have to agree.
+Three faces, each with a job. All **self-hosted via `@fontsource`** — pulling them from a CDN
+would leak a request to Google on every launch and break offline use. Written as "the app
+promises nothing leaves your machine", which is not the promise the app can make: the resume,
+the posting text and every draft go to a model (docs/10 § What gets sent to the LLM). What it
+does promise is that nothing leaves for anyone the user did not ask for — no telemetry, no
+analytics, no third party — and a font request is precisely that kind of leak. The privacy
+stance and the type stack have to agree, on the true version of the stance.
 
 | Role | Face | Why |
 | --- | --- | --- |

@@ -130,6 +130,40 @@ describe('the fields that are encrypted at rest', () => {
 });
 
 /**
+ * The one filename a user picks, which is a name.
+ *
+ * Not an encrypted column — `resume_document.filename` is stored in the clear and shown back
+ * to its owner in the UI — but the string itself is almost always the applicant's full name,
+ * and docs/10 promises the censor covers a name. It reached the log through a key nobody had
+ * thought of as PII.
+ */
+describe('the name a resume arrived under', () => {
+  it('censors it, and still says which document failed', () => {
+    // The exact record routes/resumes.ts writes when a DOCX or TXT yields no text.
+    const { log, lines } = capture();
+    log.warn(
+      {
+        err: { message: 'no readable text', path: '/tmp/data/resumes/01HQZX9.txt' },
+        mime: 'text/plain',
+        filename: 'Eric Dean - Resume 2026.docx',
+        document: { filename: 'Eric Dean CV.pdf' },
+      },
+      'could not read any text out of this document; extraction will refuse it',
+    );
+
+    const out = JSON.stringify(lines());
+    expect(out, 'the applicant name went to the log verbatim').not.toContain('Eric Dean');
+    // The other direction: the censor must not reach past the name into what is left of the
+    // diagnostic. The stored copy is named by the document's id, so when the failure came
+    // from reading the file, `err.path` still says which document — and `mime` says what
+    // kind of file it was either way.
+    expect(out).toContain('01HQZX9');
+    expect(out).toContain('text/plain');
+    expect(out).toContain('no readable text');
+  });
+});
+
+/**
  * `note` is the only thing on a 'field not filled' line that says why, and part of it is the
  * user's own words. Both halves matter, so both are pinned.
  */

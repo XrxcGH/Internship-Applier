@@ -466,7 +466,21 @@ export async function fillingRoutes(app: FastifyInstance): Promise<void> {
          * loses four to a widget genuinely did fill the form, and the review screen is where
          * the four are dealt with. Zero is the case that means nothing happened.
          */
-        if (run.state === 'done' && run.result && run.result.filled > 0) {
+        /**
+         * THE LIST IS RECORDED WHENEVER A RUN FINISHED; ONLY THE STATUS WAITS FOR A FILL.
+         *
+         * Both used to sit behind `filled > 0`, and the two want different conditions. A form
+         * whose every field is redlined — an SSN, an EEO block, an attestation, nothing this
+         * tool may type — fills zero and produces the LONGEST list of fields the student has
+         * to do themselves. That list was computed, shown once in the review panel, and never
+         * written down: the panel reads the run in memory, which is gone when the browser
+         * closes, a second run starts or the server stops. The student came back to the
+         * application and the column `GET /api/applications/:id` reads was empty, so the app
+         * had nothing to say about what it had left them.
+         *
+         * The status guard stays exactly as it was, for the reason its own comment gives.
+         */
+        if (run.state === 'done' && run.result) {
           const skipped = run.result.results
             .filter((r) => r.status !== 'ok')
             .map((r) => ({
@@ -474,6 +488,7 @@ export async function fillingRoutes(app: FastifyInstance): Promise<void> {
               reason: skipReason(r),
               category: r.field.redlineCategory,
             }));
+          const filledSomething = run.result.filled > 0;
 
           /**
            * The status is read again here rather than reused from `load()`.
@@ -512,21 +527,26 @@ export async function fillingRoutes(app: FastifyInstance): Promise<void> {
           // by GET /api/applications/:id, that can still answer the question afterwards.
           db.update(schema.application)
             .set({
-              ...(next ? { status: next } : {}),
+              ...(next && filledSomething ? { status: next } : {}),
               skippedFields: skipped,
               updatedAt: new Date().toISOString(),
             })
             .where(eq(schema.application.id, req.params.id))
             .run();
 
-          db.insert(schema.applicationEvent)
-            .values({
-              id: ulid(),
-              applicationId: req.params.id,
-              type: 'filled',
-              payload: { filled: run.result.filled, skipped: skipped.length },
-            })
-            .run();
+          // The event says the form was filled, so it belongs to the same condition the
+          // status does: a `filled` event over a form nothing was typed into is the tracker
+          // telling the user it is ready to submit when it is not.
+          if (filledSomething) {
+            db.insert(schema.applicationEvent)
+              .values({
+                id: ulid(),
+                applicationId: req.params.id,
+                type: 'filled',
+                payload: { filled: run.result.filled, skipped: skipped.length },
+              })
+              .run();
+          }
         }
 
         return serializeRun(run);

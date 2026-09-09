@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { and, desc, eq, gte, inArray, sql } from 'drizzle-orm';
 import { ulid } from 'ulid';
 import type { ApplicationStatus } from '@ia/shared';
-import { db, schema } from '../infra/db/client';
+import { db, schema, sqlite } from '../infra/db/client';
 import { isProfileConfirmed } from '../core/profile/repository';
 import { runMatching } from '../core/matching/run';
 import { logger } from '../infra/logger';
@@ -39,6 +39,103 @@ const DecisionBody = z.object({
   reason: z.string().optional(),
   reasonTags: z.array(z.string()).default([]),
 });
+
+type Decision = z.infer<typeof DecisionBody>;
+
+/** The G2 answer itself: one decision per match, so the old row goes before the new one. */
+function replaceDecision(matchId: string, d: Decision): void {
+  db.delete(schema.decision).where(eq(schema.decision.matchId, matchId)).run();
+  db.insert(schema.decision)
+    .values({
+      id: ulid(),
+      matchId,
+      action: d.action,
+      reason: d.reason ?? null,
+      reasonTags: d.reasonTags,
+    })
+    .run();
+}
+
+/**
+ * A G2 decision and whatever it takes with it, or none of it.
+ *
+ * Used by every path that does not create an application: a reversal (which passes the
+ * application to delete with it) and a re-affirmed approval (which passes null, and still
+ * needs the wrapper — replacing a decision is a delete and an insert, and losing the race
+ * between them would leave the posting with no decision at all).
+ *
+ * Every write this route makes is several statements that only mean something together, and
+ * they were run loose. Two ways that half-applied, both of them producing the exact state the
+ * long comment on the reversal below says must never exist — the match decided and gone from
+ * the queue while a live application for it stays on the tracker:
+ *
+ *   * The decision row was replaced BEFORE the "have you already sent this?" check, so a
+ *     reversal that came back 409 APPLICATION_IN_PROGRESS had already recorded the user as
+ *     having rejected the posting. The response said the reversal was refused; the database
+ *     said it went through.
+ *   * The three deletes sat after `await discardRun(...)`. That await hands the event loop
+ *     over between the decision write and the deletes, so a browser session that throws on
+ *     close — or a process that stops there — left the decision replaced and the application
+ *     untouched.
+ *
+ * `discardRun` closes a real browser window and cannot join a transaction, so it moves OUT of
+ * this, ahead of the first write, where a failure means nothing has happened yet. What is left
+ * is synchronous, which is what makes better-sqlite3's transaction wrapper hold: an `async`
+ * body would commit at its first await. Same wrapper and same reasoning as `saveRequirements`
+ * in core/matching/run.ts.
+ */
+const recordDecision = sqlite.transaction(
+  (matchId: string, d: Decision, applicationId: string | null): void => {
+    replaceDecision(matchId, d);
+    if (applicationId === null) return;
+    // Explicitly, child rows first, rather than trusting ON DELETE CASCADE: SQLite
+    // enforces foreign keys only when the pragma is on, and an orphaned answer would be
+    // invisible work attached to an application nobody can open.
+    db.delete(schema.applicationAnswer)
+      .where(eq(schema.applicationAnswer.applicationId, applicationId))
+      .run();
+    db.delete(schema.applicationEvent)
+      .where(eq(schema.applicationEvent.applicationId, applicationId))
+      .run();
+    db.delete(schema.application).where(eq(schema.application.id, applicationId)).run();
+  },
+);
+
+/** The approval half of the same rule: the decision and the application it creates, together. */
+const approveIntoApplication = sqlite.transaction(
+  (
+    matchId: string,
+    d: Decision,
+    created: {
+      id: string;
+      applyUrl: string;
+      atsVendor: string;
+      deadlineAt: string | null;
+      company: string;
+      title: string;
+    },
+  ): void => {
+    replaceDecision(matchId, d);
+    db.insert(schema.application)
+      .values({
+        id: created.id,
+        matchId,
+        status: 'draft',
+        applyUrl: created.applyUrl,
+        atsVendor: created.atsVendor,
+        deadlineAt: created.deadlineAt,
+      })
+      .run();
+    db.insert(schema.applicationEvent)
+      .values({
+        id: ulid(),
+        applicationId: created.id,
+        type: 'created',
+        payload: { via: 'gate_g2', company: created.company, title: created.title },
+      })
+      .run();
+  },
+);
 
 export async function matchRoutes(app: FastifyInstance): Promise<void> {
   app.addHook('onRequest', async (req, reply) => {
@@ -169,6 +266,23 @@ export async function matchRoutes(app: FastifyInstance): Promise<void> {
       .offset(q.offset)
       .all();
 
+    /**
+     * The whole scored store, by band — deliberately NOT a description of `matches` above.
+     *
+     * It has been read as a bug twice now, so: this answers "what is in the store", while the
+     * list answers "what is left to triage". They are different questions and the screen asks
+     * both at once. Matches.tsx renders it as "12 eligible · 5 to check · 3 filtered" beside
+     * the band chips, and the third number is the giveaway — `ineligible` is shown while the
+     * `eligible` band is selected, so this can never have been the list's own tally. Nor could
+     * it be: narrowing it by `hideDecided` and `minScore` and the chosen band would leave a
+     * chip that changes with every filter and cannot say how much triage is left, and a triaged
+     * queue would read "0 eligible" on a store holding a hundred eligible postings.
+     *
+     * The one thing that HAS to be right is what the empty queue says, since an empty list
+     * under a non-zero count is the case that reads as a contradiction. Matches.tsx handles it
+     * there, with `decided`: it tells "nothing searched yet" and "you have triaged all of it"
+     * apart rather than sending someone back to Discover over postings they just decided.
+     */
     const counts = db
       .select({ eligibility: schema.match.eligibility, n: sql<number>`count(*)` })
       .from(schema.match)
@@ -238,16 +352,21 @@ export async function matchRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(404).send({ error: { code: 'NOT_FOUND', message: 'No such match.' } });
     }
 
-    db.delete(schema.decision).where(eq(schema.decision.matchId, req.params.id)).run();
-    db.insert(schema.decision)
-      .values({
-        id: ulid(),
-        matchId: req.params.id,
-        action: parsed.data.action,
-        reason: parsed.data.reason ?? null,
-        reasonTags: parsed.data.reasonTags,
+    /**
+     * The application this match's approval created, if there is one.
+     *
+     * Read before anything is written, because both branches below need it and the reversal
+     * has to be able to refuse without the decision row having already moved.
+     */
+    const created = db
+      .select({
+        id: schema.application.id,
+        status: schema.application.status,
+        submittedAt: schema.application.submittedAt,
       })
-      .run();
+      .from(schema.application)
+      .where(eq(schema.application.matchId, req.params.id))
+      .all()[0];
 
     /**
      * Reversing a G2 approval has to take the application with it.
@@ -269,79 +388,52 @@ export async function matchRoutes(app: FastifyInstance): Promise<void> {
      * statuses, which is one the user has not acted on in the world.
      */
     if (parsed.data.action !== 'approved') {
-      const created = db
-        .select({
-          id: schema.application.id,
-          status: schema.application.status,
-          submittedAt: schema.application.submittedAt,
-        })
-        .from(schema.application)
-        .where(eq(schema.application.matchId, req.params.id))
-        .all()[0];
+      if (created) {
+        const undoable =
+          created.submittedAt === null && TOOL_STATUSES.has(created.status as ApplicationStatus);
+        if (!undoable) {
+          // Nothing has been written yet, and nothing will be: a refusal that had already
+          // replaced the decision row would leave the posting decided — hidden from the
+          // queue by `hideDecided` — beside the live application it refused to remove.
+          return reply.code(409).send({
+            error: {
+              code: 'APPLICATION_IN_PROGRESS',
+              message:
+                `You have already taken application ${created.id} for this posting past the ` +
+                `point this tool can undo — it is ${created.status}. Withdraw it from the ` +
+                'tracker instead; changing the decision here would leave it running.',
+              details: { applicationId: created.id, status: created.status },
+            },
+          });
+        }
 
-      if (!created) return { action: parsed.data.action, applicationId: null };
-
-      const undoable =
-        created.submittedAt === null && TOOL_STATUSES.has(created.status as ApplicationStatus);
-      if (!undoable) {
-        return reply.code(409).send({
-          error: {
-            code: 'APPLICATION_IN_PROGRESS',
-            message:
-              `You have already taken application ${created.id} for this posting past the ` +
-              `point this tool can undo — it is ${created.status}. Withdraw it from the ` +
-              'tracker instead; changing the decision here would leave it running.',
-            details: { applicationId: created.id, status: created.status },
-          },
-        });
+        // A fill run holds a real browser window pointed at this employer's form. Closing it
+        // is the same courtesy the tracker pays when an application leaves the tool's hands.
+        // It happens here, before the first write, because it is the one part of a reversal
+        // that cannot be done inside the transaction — see `recordDecision`.
+        await discardRun(created.id);
       }
 
-      // A fill run holds a real browser window pointed at this employer's form. Closing it
-      // is the same courtesy the tracker pays when an application leaves the tool's hands.
-      await discardRun(created.id);
+      recordDecision(req.params.id, parsed.data, created?.id ?? null);
 
-      // Explicitly, child rows first, rather than trusting ON DELETE CASCADE: SQLite
-      // enforces foreign keys only when the pragma is on, and an orphaned answer would be
-      // invisible work attached to an application nobody can open.
-      db.delete(schema.applicationAnswer)
-        .where(eq(schema.applicationAnswer.applicationId, created.id))
-        .run();
-      db.delete(schema.applicationEvent)
-        .where(eq(schema.applicationEvent.applicationId, created.id))
-        .run();
-      db.delete(schema.application).where(eq(schema.application.id, created.id)).run();
-
+      if (!created) return { action: parsed.data.action, applicationId: null };
       return { action: parsed.data.action, applicationId: null, deletedApplicationId: created.id };
     }
 
-    const existing = db
-      .select({ id: schema.application.id })
-      .from(schema.application)
-      .where(eq(schema.application.matchId, req.params.id))
-      .all();
-
-    if (existing[0]) return { action: 'approved', applicationId: existing[0].id };
+    if (created) {
+      recordDecision(req.params.id, parsed.data, null);
+      return { action: 'approved', applicationId: created.id };
+    }
 
     const applicationId = ulid();
-    db.insert(schema.application)
-      .values({
-        id: applicationId,
-        matchId: req.params.id,
-        status: 'draft',
-        applyUrl: row.job_posting.applyUrl,
-        atsVendor: row.job_posting.atsVendor,
-        deadlineAt: row.job_posting.closesAt,
-      })
-      .run();
-
-    db.insert(schema.applicationEvent)
-      .values({
-        id: ulid(),
-        applicationId,
-        type: 'created',
-        payload: { via: 'gate_g2', company: row.job_posting.company, title: row.job_posting.title },
-      })
-      .run();
+    approveIntoApplication(req.params.id, parsed.data, {
+      id: applicationId,
+      applyUrl: row.job_posting.applyUrl,
+      atsVendor: row.job_posting.atsVendor,
+      deadlineAt: row.job_posting.closesAt,
+      company: row.job_posting.company,
+      title: row.job_posting.title,
+    });
 
     return { action: 'approved', applicationId };
   });

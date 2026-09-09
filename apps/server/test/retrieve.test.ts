@@ -854,3 +854,202 @@ describe('the drafting prompt on an activity-heavy profile', () => {
     expect(kinds.size).toBeGreaterThanOrEqual(4);
   });
 });
+
+// ─────────────────────────────────────────── the dates a project carries
+
+/**
+ * A project's dates never reached the evidence corpus, and a project is the one dated kind
+ * with no other way in: FactGuard pools duration evidence on `facts.startDate` and scopes a
+ * claim to the entry whose NAME it uses, so an undated project is in neither pool nor scope.
+ * "I worked on Trail Tracker for two years" — about a project the profile records as running
+ * exactly two years — was therefore measured against the longest entry the profile DID date,
+ * and on a young applicant's resume that is a two-month internship or a four-year club,
+ * never the project itself. Both directions failed:
+ *
+ *   a TRUE two-year claim, blocked at G3 by a two-month internship, with no override;
+ *   an INFLATED three-year claim about a two-month project, cleared by a four-year club.
+ *
+ * The dates reach the profile at gate G1 rather than from the resume: `ResumeExtraction`
+ * carries no date field on a project, while the shared `ProjectEntry` holds `startDate` and
+ * `endDate` and the G1 wizard validates them ("Project 1 started", "Project 1 finished" in
+ * Onboarding.tsx). So the fixtures confirm a profile and then put the dates on, which is the
+ * shape the database actually holds.
+ */
+function withProjectDates(
+  p: ConfirmedProfile,
+  dates: Array<{ startDate?: string; endDate?: string }>,
+): ConfirmedProfile {
+  return { ...p, projects: p.projects.map((proj, i) => ({ ...proj, ...(dates[i] ?? {}) })) };
+}
+
+describe('project dates are evidence', () => {
+  /** Two months of real work, and two dated projects — one long, one short. */
+  const SHORT_WORK = withProjectDates(
+    confirm({
+      ...BASE,
+      experience: [
+        {
+          organization: 'Sample Community Health Clinic',
+          title: 'Front Desk Intern',
+          type: 'internship',
+          startDate: '2025-06',
+          endDate: '2025-08',
+          location: 'Columbus, OH',
+          bullets: ['Greeted patients and logged intake forms at the reception desk'],
+        },
+      ],
+      projects: [
+        {
+          name: 'Trail Tracker',
+          description: 'A trail-condition map for the county park system',
+          url: null,
+          bullets: [],
+        },
+        {
+          name: 'Tide Chart',
+          description: 'A tide table for the sailing club',
+          url: null,
+          bullets: [],
+        },
+      ],
+    }),
+    // Two years on the first, two months on the second.
+    [
+      { startDate: '2023-06', endDate: '2025-06' },
+      { startDate: '2025-01', endDate: '2025-03' },
+    ],
+  );
+
+  it('puts the span in the item text and the dates in facts', () => {
+    const item = retrieve(SHORT_WORK, QUESTIONS[0]!).find((e) => e.ref === 'projects.0');
+    expect(item?.facts.startDate).toBe('2023-06');
+    expect(item?.facts.endDate).toBe('2025-06');
+    // In the text too: it is what a reviewer at G3 reads the sentence against, and what is
+    // quoted beside a claim the duration check blocks.
+    expect(item?.text).toBe(
+      'Trail Tracker: A trail-condition map for the county park system (2023-06 to 2025-06)',
+    );
+  });
+
+  /**
+   * An ongoing project has no end date and is measured to now, exactly as an ongoing job is
+   * — the convention the profile itself uses. An UNDATED project prints no span at all
+   * rather than "(date not stated to present)", which would assert an ongoing project the
+   * profile never claimed, in an item whose whole job is to be true.
+   */
+  it('prints an open span for an ongoing project and none at all for an undated one', () => {
+    const ongoing = withProjectDates(
+      confirm({
+        ...BASE,
+        experience: [REAL_JOB],
+        projects: [
+          { name: 'Tide Chart', description: 'A tide table', url: null, bullets: [] },
+          { name: 'Trail Tracker', description: 'A trail-condition map', url: null, bullets: [] },
+        ],
+      }),
+      [{ startDate: '2024-08' }],
+    );
+    const ev = retrieve(ongoing, QUESTIONS[0]!);
+    expect(ev.find((e) => e.ref === 'projects.0')?.text).toBe(
+      'Tide Chart: A tide table (2024-08 to present)',
+    );
+    expect(ev.find((e) => e.ref === 'projects.1')?.text).toBe(
+      'Trail Tracker: A trail-condition map',
+    );
+    // Two years to the pinned clock, so the true sentence clears and the inflated one does not.
+    expect(blockingFor(ongoing, QUESTIONS[0]!, 'I worked on Tide Chart for two years.')).toEqual(
+      [],
+    );
+    expect(
+      blockingFor(ongoing, QUESTIONS[0]!, 'I worked on Tide Chart for six years.'),
+    ).toHaveLength(1);
+  });
+
+  /**
+   * The false RED. Without the project's dates the only thing left to measure the sentence
+   * against was the two-month internship, and a true sentence came back `overstated` at the
+   * one gate that has no override.
+   */
+  it('clears a true tenure claim about a project the profile dates', () => {
+    for (const q of QUESTIONS) {
+      for (const claim of [
+        'I worked on Trail Tracker for two years.',
+        'I spent two years building Trail Tracker.',
+        'I have worked on Trail Tracker for about 24 months.',
+      ]) {
+        expect({ q, claim, blocking: blockingFor(SHORT_WORK, q, claim) }).toMatchObject({
+          blocking: [],
+        });
+      }
+    }
+  });
+
+  /**
+   * Opposite direction, in the same fixture: the short project is now the ceiling for a claim
+   * that names it. This blocked before as well — but against the INTERNSHIP, so the reviewer
+   * was shown the wrong entry as the reason. The ref is the assertion that matters.
+   */
+  it('measures an inflated claim against the project it names, and says so', () => {
+    const blocking = blockingFor(
+      SHORT_WORK,
+      QUESTIONS[0]!,
+      'I worked on Tide Chart for two years.',
+    );
+    expect(blocking).toHaveLength(1);
+    expect(blocking[0]!.verdict).toBe('overstated');
+    expect(blocking[0]!.profileRef).toBe('projects.1');
+    expect(blocking[0]!.quote).toContain('Tide Chart');
+  });
+
+  /**
+   * The false GREEN, which is the same missing pair of fields seen from the other side. This
+   * resume's longest dated entry is a four-year club, so an unscoped claim was measured
+   * against 43 months and three years about a two-month project went to an employer clean.
+   */
+  it('stops a four-year club vouching for a two-month project', () => {
+    const LONG_CLUB = withProjectDates(
+      confirm({
+        ...BASE,
+        experience: [
+          {
+            organization: 'Riverbend Robotics',
+            title: 'Build Team Member',
+            type: 'club',
+            startDate: '2022-09',
+            endDate: '2026-04',
+            location: 'Columbus, OH',
+            bullets: ['Machined bracket plates on the lathe for the drivetrain'],
+          },
+        ],
+        projects: [
+          {
+            name: 'Tide Chart',
+            description: 'A tide table for the sailing club',
+            url: null,
+            bullets: [],
+          },
+        ],
+      }),
+      [{ startDate: '2025-01', endDate: '2025-03' }],
+    );
+
+    const blocking = blockingFor(
+      LONG_CLUB,
+      QUESTIONS[0]!,
+      'I worked on Tide Chart for three years.',
+    );
+    expect(blocking).toHaveLength(1);
+    expect(blocking[0]!.verdict).toBe('overstated');
+    expect(blocking[0]!.profileRef).toBe('projects.0');
+
+    // And the club's own true tenure still clears: a project ceiling binds only a claim that
+    // names the project.
+    expect(
+      blockingFor(
+        LONG_CLUB,
+        QUESTIONS[0]!,
+        'I was on the Riverbend Robotics build team for three years.',
+      ),
+    ).toEqual([]);
+  });
+});

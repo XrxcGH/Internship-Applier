@@ -31,7 +31,10 @@ interface JsonLdJobPosting {
   datePosted?: string;
   validThrough?: string;
   employmentType?: string | string[];
-  hiringOrganization?: { name?: string; sameAs?: string };
+  // Meant to be an Organization node, and plenty of career pages write the name directly as a
+  // string instead — see `readOrganizationName`, which is why this is not typed as the object
+  // alone any more.
+  hiringOrganization?: string | { name?: string; sameAs?: string };
   jobLocation?: unknown;
   jobLocationType?: string;
   applicantLocationRequirements?: unknown;
@@ -94,6 +97,28 @@ function readCountry(value: unknown): string | undefined {
 }
 
 /**
+ * The employer's name out of schema.org `hiringOrganization`, or nothing.
+ *
+ * Two silences used to be read as names. `hiringOrganization` is meant to be an Organization
+ * node and plenty of career pages write the name directly as a string, which `?.name` read as
+ * absent — so a page that DID name its employer fell through to the address, which on a board
+ * names the vendor. And `??` only falls through on null and undefined, so a node with an empty
+ * or whitespace `name` was stored as the posting's company: an application addressed to nobody,
+ * with `namedByJsonLd.company` saying beside it that the page had named someone.
+ */
+function readOrganizationName(value: unknown): string | null {
+  const raw = typeof value === 'string' ? value : (value as { name?: unknown } | null)?.name;
+  return typeof raw === 'string' && raw.trim() !== '' ? raw.trim() : null;
+}
+
+/** The employer's own site, when `hiringOrganization` is a node rather than a bare name. */
+function readOrganizationSite(value: unknown): string | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const site = (value as { sameAs?: unknown }).sameAs;
+  return typeof site === 'string' && site.trim() !== '' ? site : null;
+}
+
+/**
  * The places a remote posting says you may live, from schema.org
  * `applicantLocationRequirements` — a Country or State node, or a list of them.
  *
@@ -151,10 +176,11 @@ export async function fetchManualPosting(url: string): Promise<ManualResult> {
   const ld = collectJsonLd(html)[0];
   const pageText = stripHtml(html);
 
-  const titleFromLd = typeof ld?.title === 'string' && ld.title.trim() !== '';
-  const companyFromLd =
-    typeof ld?.hiringOrganization?.name === 'string' && ld.hiringOrganization.name.trim() !== '';
-  const title = ld?.title ?? guessTitle(html) ?? 'Untitled posting';
+  const ldTitle = typeof ld?.title === 'string' ? ld.title.trim() : '';
+  const titleFromLd = ldTitle !== '';
+  const ldCompany = readOrganizationName(ld?.hiringOrganization);
+  const companyFromLd = ldCompany !== null;
+  const title = titleFromLd ? ldTitle : (guessTitle(html) ?? 'Untitled posting');
 
   /**
    * A page that does not name one job is not a posting, and storing it as one is a lie the
@@ -167,13 +193,20 @@ export async function fetchManualPosting(url: string): Promise<ManualResult> {
         'search or results page, open the posting itself and use that address.',
     );
   }
-  const company = ld?.hiringOrganization?.name ?? guessCompany(url);
+  const company = ldCompany ?? guessCompany(url);
   const description = ld?.description ? stripHtml(ld.description) : pageText;
 
   if (!ld) {
     notes.push(
       'No structured JobPosting data on the page, so the title, company, and dates were ' +
         'read from the page text and may need correcting.',
+    );
+  } else if (!companyFromLd) {
+    // The page states it is a posting and still does not say whose, so the company below came
+    // out of the address. Said out loud rather than shown as though the page had supplied it.
+    notes.push(
+      "The page's structured data does not name the employer, so the company was read from " +
+        'the address and may need correcting.',
     );
   }
   if (description.length < 200) {
@@ -211,7 +244,7 @@ export async function fetchManualPosting(url: string): Promise<ManualResult> {
     canonicalUrl: canonicalUrl(url),
     applyUrl: url,
     company,
-    companyDomain: safeHost(ld?.hiringOrganization?.sameAs ?? url),
+    companyDomain: safeHost(readOrganizationSite(ld?.hiringOrganization) ?? url),
     title,
     descriptionText: description,
     descriptionHtml: ld?.description ?? null,
@@ -265,12 +298,78 @@ function mapUnit(unit?: string): 'hour' | 'week' | 'month' | 'year' {
 
 function guessTitle(html: string): string | null {
   const og = html.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i);
-  if (og?.[1]) return decodeEntities(og[1]);
+  // Trimmed AFTER decoding and turned back into "nothing" if that is what it is: a page whose
+  // title is a lone `&nbsp;` named the job as surely as an empty one did, which is to say not
+  // at all, and an empty string is a worse posting name than "Untitled posting" is.
+  if (og?.[1]) return decodeEntities(og[1]).trim() || null;
   const t = html.match(/<title[^>]*>([^<]+)<\/title>/i);
-  return t?.[1] ? decodeEntities(t[1].trim()) : null;
+  return t?.[1] ? decodeEntities(t[1]).trim() || null : null;
 }
 
-function guessCompany(url: string): string {
+/**
+ * THE EMPLOYER, OUT OF THE ADDRESS, when the page did not name one itself.
+ *
+ * On a multi-tenant board the hostname belongs to the VENDOR: `job-boards.greenhouse.io` gave
+ * "job-boards", and `boards.greenhouse.io` gave "greenhouse", because the prefix strip below
+ * eats "boards." and leaves the vendor's own name standing where the employer's should be. A
+ * student pasting a Greenhouse or Lever link therefore got a posting whose company was the
+ * applicant-tracking system — and at G3 the most ordinary sentence a "why this company" answer
+ * contains, the employer's own name, is then a name the application has never heard of, and it
+ * is refused there with NO override. It also broke cross-source dedupe, since the same posting
+ * reached us from the Greenhouse adapter under the employer's slug.
+ */
+export function guessCompany(url: string): string {
+  return boardTenant(url) ?? hostFragment(url);
+}
+
+/**
+ * The boards that host many employers on one hostname, with the employer first in the path.
+ *
+ * Every multi-tenant vendor `detectVendor` knows by hostname is here, because each one had the
+ * reported bug and not just Greenhouse: `job-boards.greenhouse.io/acme-robotics/jobs/4512`,
+ * `jobs.lever.co/acme/<id>`, `jobs.ashbyhq.com/acme/<id>`, `jobs.smartrecruiters.com/Acme/<id>`,
+ * `apply.workable.com/acme/j/<id>`. The regional hosts (`job-boards.eu.greenhouse.io`,
+ * `jobs.eu.lever.co`) are the same shape, which is why this matches on the registrable domain
+ * rather than the whole host.
+ *
+ * Workday, Taleo and iCIMS are deliberately absent: their tenant is the SUBDOMAIN, which the
+ * hostname reading already gets right.
+ */
+const TENANT_IN_PATH =
+  /(?:^|\.)(?:greenhouse\.io|lever\.co|ashbyhq\.com|smartrecruiters\.com|workable\.com)$/;
+
+/**
+ * First path segments that are the board's own furniture rather than an employer.
+ *
+ * `apply.workable.com/j/AB12CD` is a short link with no employer in it at all, and storing "j"
+ * as the company would be a worse lie than the vendor's name. When nothing in the address names
+ * an employer this falls back to the hostname fragment ON PURPOSE: webSearch's `isHostFragment`
+ * repair keys on the stored company being part of the hostname, so answering "unknown" here
+ * would quietly switch that repair off for exactly the pages that need it most.
+ */
+const NOT_A_TENANT =
+  /^(?:jobs?|careers?|apply|application|embed|search|postings?|openings?|[a-z]|\d+|[0-9a-f]{8}-[0-9a-f-]+)$/i;
+
+function boardTenant(url: string): string | null {
+  if (!URL.canParse(url)) return null;
+  const parsed = new URL(url);
+  if (!TENANT_IN_PATH.test(parsed.hostname.toLowerCase())) return null;
+
+  const first = parsed.pathname.split('/').find((segment) => segment !== '');
+  // Greenhouse's embedded application form names the board in a query parameter instead of the
+  // path: `boards.greenhouse.io/embed/job_app?for=acme&token=4512`.
+  const slug =
+    first !== undefined && !NOT_A_TENANT.test(first)
+      ? first
+      : (parsed.searchParams.get('for') ?? '');
+  return slug.trim() === '' ? null : slug.trim();
+}
+
+/**
+ * The employer's own careers host, read as the employer — `careers.acme.com` is Acme's, and so
+ * is a Workday tenant at `acme.wd5.myworkdayjobs.com`.
+ */
+function hostFragment(url: string): string {
   const host = safeHost(url) ?? 'unknown';
   return host.replace(/^(www|jobs|careers|boards|apply)\./, '').split('.')[0] ?? 'unknown';
 }

@@ -66,20 +66,43 @@ export function buildReminders(apps: TrackedApplication[], now = new Date()): Re
       continue;
     }
 
-    // A follow-up becomes reasonable at two weeks and stops being useful once silence has
-    // run long enough to mean no.
+    /**
+     * A follow-up becomes reasonable at two weeks of silence and stops being useful once
+     * silence has run long enough to mean no.
+     *
+     * Counted from `daysQuiet`, not `daysSinceSubmitted`, and offered for all three statuses
+     * that are waiting on an employer rather than for `submitted` alone. Only `submitted`
+     * used to qualify, so the two states where a follow-up is most obviously worth sending
+     * — they acknowledged it and then went quiet, they interviewed you and then went quiet —
+     * were the two that never produced a nudge. An interview that went silent got nothing at
+     * all: no reminder, no ghosting, and a card still sitting under "Talking".
+     *
+     * For `submitted` the two counts are the same number, so nothing about that case moves.
+     */
     if (
-      app.status === 'submitted' &&
-      d.daysSinceSubmitted !== null &&
-      d.daysSinceSubmitted >= FOLLOW_UP_AFTER_DAYS &&
-      d.daysSinceSubmitted < GHOST_AFTER_DAYS
+      (app.status === 'submitted' || app.status === 'acknowledged' || app.status === 'interview') &&
+      d.daysQuiet !== null &&
+      d.daysQuiet >= FOLLOW_UP_AFTER_DAYS &&
+      d.daysQuiet < GHOST_AFTER_DAYS
     ) {
+      const days = String(d.daysQuiet);
       out.push({
         applicationId: app.id,
         kind: 'follow_up',
         urgency: 3,
-        headline: `${String(d.daysSinceSubmitted)} days since you applied to ${app.company}`,
-        detail: 'Long enough that a short follow-up is reasonable. A draft is below.',
+        // Each headline names the thing the clock is actually counting from. "days since you
+        // applied" over a count that starts at the interview would be a number attached to
+        // the wrong event, which is the kind of small lie this tracker keeps finding.
+        headline:
+          app.status === 'submitted'
+            ? `${days} days since you applied to ${app.company}`
+            : app.status === 'acknowledged'
+              ? `${days} days since ${app.company} acknowledged your application`
+              : `${days} days since you reached the interview stage with ${app.company}`,
+        detail:
+          app.status === 'interview'
+            ? 'Long enough to ask where the decision stands. A draft is below.'
+            : 'Long enough that a short follow-up is reasonable. A draft is below.',
       });
     }
   }
@@ -96,6 +119,34 @@ export function buildReminders(apps: TrackedApplication[], now = new Date()): Re
  */
 export function draftFollowUp(app: TrackedApplication, now = new Date()): string {
   const d = derive(app, now);
+
+  /**
+   * An application that has reached an interview gets a different note, and a dateless one.
+   *
+   * "I applied for the X role two weeks ago and wanted to check whether the position is
+   * still open" is the wrong question to put to someone who has already interviewed you, and
+   * it reads as though the interview never happened.
+   *
+   * There is no timing phrase in it because there is no date here worth standing behind.
+   * All the tracker knows is when the user recorded reaching the interview stage, which is
+   * not when the interview was and may not even be when the invitation arrived. "I
+   * interviewed with you three weeks ago" built out of that stamp is a fabricated sentence
+   * in outgoing mail, and this app does not let those through anywhere else either.
+   */
+  if (app.status === 'interview') {
+    return [
+      `Subject: Following up on my ${app.title} application`,
+      '',
+      'Hello,',
+      '',
+      `I am in the interview process for the ${app.title} role and wanted to ask whether there is any update on where things stand.`,
+      '',
+      'I am still very interested, and happy to send anything else that would be useful.',
+      '',
+      'Thank you for your time.',
+    ].join('\n');
+  }
+
   const days = d.daysSinceSubmitted;
 
   /**

@@ -45,6 +45,22 @@ export interface FieldDescriptor {
    * the user approved for exactly that question.
    */
   control?: string;
+  /**
+   * The heading of the block this control sits inside, when the scanner found one.
+   *
+   * A label on its own cannot tell two identical questions apart. The "Start Date" column of
+   * a work-history table and the "Start date" this internship asks about are the same six
+   * characters — so a row of the applicant's employment history received the date they become
+   * AVAILABLE, at 0.92 confidence, verified by read-back and shown in the review as a field
+   * that went right. That is a false statement about their work history, in a document
+   * submitted in their name, with the review screen arguing it is correct.
+   *
+   * The label rules can only disqualify the phrasings that name the container out loud
+   * ("Previous employer start date"); a bare column heading has to know what it is a column
+   * of. Optional, and `undefined` means "no container known" rather than "top level" — the
+   * scanner cannot always find one.
+   */
+  section?: string;
 }
 
 export interface Classification {
@@ -248,9 +264,19 @@ const NOT_WHICH_SCHOOL = anyOf(ASKS_WHEN_NOT_WHICH, THE_SCHOOLS_OWN_LINK);
  * history word disqualify the date.
  */
 const A_HISTORY_ROW_DATE = new RegExp(
-  String.raw`^(?!.*\b(availab(le|ility)|earliest|soonest|desired|preferred|anticipated)\b).*` +
+  // "when can you start" joined the availability half once the CONTAINER could disqualify a
+  // date. It is as unambiguous as "earliest start" and needs the same protection: asked inside
+  // a block captioned "Employment History" — which is where a form puts it often enough — the
+  // container was taking away the one date the profile can actually answer, and the student
+  // got an empty box on a question about themselves.
+  String.raw`^(?!.*\b(availab(le|ility)|earliest|soonest|desired|preferred|anticipated` +
+    String.raw`|when can you start)\b).*` +
     String.raw`(\bemploy(ment|er|ers|ed)\b|\bcompan(y|ies)\b|\bpositions?\b|\bjobs?\b|\broles?\b` +
+    // "education" is the caption every school-history table carries, and the word list had
+    // every synonym for one but not the heading itself — so "Start Date" under a legend
+    // reading "Education" was still answered with the applicant's availability.
     String.raw`|\bschools?\b|\buniversit(y|ies)\b|\bcolleges?\b|\binstitutions?\b|\bdegrees?\b` +
+    String.raw`|\beducation(al)?\b|\bacademics?\b|\bqualifications?\b` +
     String.raw`|\bprograms?\b|\battend(ed|ance)?\b|\benrolled\b|\bexperiences?\b` +
     String.raw`|\bhistor(y|ies)\b|\bprevious(ly)?\b|\bprior\b|\bformer\b|\bmost recent\b)`,
   'i',
@@ -573,8 +599,26 @@ export function classifyField(d: FieldDescriptor): Classification {
     return { semantic: 'essay', confidence: 0.85, via: 'rule' };
   }
 
+  /**
+   * THE SECTION MAY ONLY EVER DISQUALIFY, NEVER QUALIFY.
+   *
+   * A container heading answers the question a bare column label cannot — "Start Date" under
+   * a caption reading "Employment History" is a date in a row of past jobs, and filling it
+   * with the applicant's availability is a false statement about their work history made in
+   * their name. But letting a heading satisfy a rule's positive test would be far worse in
+   * the other direction: every control inside a block headed "Previous Employment" would
+   * start matching employment rules whatever its own label said, and a heading is one string
+   * shared by a dozen fields.
+   *
+   * So `test` still reads the field's own words and only `unless` sees the container. The
+   * section can take a semantic away; it can never hand one out.
+   */
+  const withSection = d.section
+    ? `${normalized} ${normalizeField({ label: d.section })}`
+    : normalized;
+
   for (const r of RULES) {
-    if (r.test.test(normalized) && !r.unless?.test(normalized))
+    if (r.test.test(normalized) && !r.unless?.test(withSection))
       return { semantic: r.semantic, confidence: r.confidence, via: 'rule' };
   }
 
