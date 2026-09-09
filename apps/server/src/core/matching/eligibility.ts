@@ -1278,9 +1278,38 @@ export function excludedCompany({ profile, posting }: RuleInput): RuleResult {
  */
 const POSTDOCTORAL = /\bpost[-\s]?doc(?:toral|torate)?\b/i;
 
+/**
+ * The title naming a student post in its own right.
+ *
+ * The docstring above says the bar is that the word "cannot mean anything else" — and it can.
+ * A university's postdoc office hires students to run it: "Research Intern, Postdoctoral
+ * Affairs Office", "Summer Intern - Postdoc Program Support", "Intern, Post-Doctoral
+ * Recruiting" all match POSTDOCTORAL, and all three are internships an undergraduate or a
+ * high-school student can hold. Every one of them came back a hard `ineligible` and left the
+ * queue — a FALSE ineligible, which this file's header calls the worst thing it can produce,
+ * arrived at by reading the word "postdoctoral" as the post rather than as the subject.
+ */
+const STUDENT_POST = /\b(?:intern|interns|internship|co[-\s]?op|apprentice|trainee)\b/i;
+
 export function postdoctoral({ profile, posting }: RuleInput): RuleResult {
   if (!POSTDOCTORAL.test(posting.title)) {
     return na('postdoctoral', 'The posting is not a postdoctoral position.');
+  }
+
+  /**
+   * Two readings, so no verdict. A title holding both words is either a postdoctoral post or
+   * a student one beside postdoctoral work, and nothing in the title settles which — so this
+   * says so rather than picking. `unknown` keeps the posting in front of the user with the
+   * doubt written on it, which is what the tri-state is for; `fail` would hide a job they
+   * could have had, and `pass` would waste their time silently.
+   */
+  if (STUDENT_POST.test(posting.title)) {
+    return unknown(
+      'postdoctoral',
+      'The title says both "postdoctoral" and an internship, so it may be a postdoctoral post ' +
+        'or a student one supporting that work. Check the posting.',
+      { evidence: posting.title, profileRef: 'education' },
+    );
   }
 
   const mine = ACADEMIC_TO_LEVEL[profile.derived.academicLevel] ?? 'none';

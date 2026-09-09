@@ -22,6 +22,7 @@ import {
   type RunSummary,
   type RunTarget,
 } from '../src/lib/discovery';
+import { retryLabel, scoredLine, scoringFailed } from '../src/pages/Discovery';
 
 /**
  * The pure helpers behind the Discover screen.
@@ -445,5 +446,112 @@ describe('a source that cannot contribute at all', () => {
     for (const t of keylessTargets([source('github_list'), source('arbeitnow')])) {
       expect(t.reason, t.source).not.toMatch(/searched without a company/);
     }
+  });
+});
+
+/**
+ * The two halves of one press, told apart.
+ *
+ * "Search and score" runs a search and then a scoring pass, and the scoring failure is
+ * caught rather than thrown on purpose — the search's postings are stored and losing that
+ * report to an error from the step after it would throw away the expensive half. The catch
+ * was the whole fix; drawing its sentence was not.
+ */
+describe('the report a scoring pass leaves behind', () => {
+  it('reads back what was scored, in the one sentence both callers now share', () => {
+    // `run` and `score` each built this from their own template literal, a word apart from
+    // drifting.
+    const r = scoredLine({ matched: 31, eligible: 12, unknown: 7, ineligible: 12 });
+    expect(r.ok).toBe(true);
+    expect(r.message).toBe('31 scored — 12 eligible, 7 to check, 12 filtered.');
+  });
+
+  it('does not report a scoring FAILURE as good news', () => {
+    // Both lines went into `<Notice tone="verified">`, so "scoring them did not run" arrived
+    // in the green tint, inside the block a user reads as the receipt for a run they have
+    // just waited two minutes for.
+    const r = scoringFailed(new Error('fetch failed'));
+    expect(r.ok).toBe(false);
+    expect(r.message).toContain('fetch failed');
+  });
+
+  it('says the search itself survived, so nobody re-runs the expensive half', () => {
+    const message = scoringFailed(new Error('boom')).message;
+    expect(message).toMatch(/postings are stored/);
+    expect(message).toMatch(/Score what is stored/);
+  });
+
+  it('reads a thrown non-Error rather than printing [object Object] at the user', () => {
+    expect(scoringFailed('gateway timed out').message).toContain('gateway timed out');
+  });
+});
+
+describe('where that line is drawn', () => {
+  const page = readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), '../src/pages/Discovery.tsx'),
+    'utf8',
+  );
+
+  it('takes its tone from the outcome, at BOTH places the state prints', () => {
+    // Section 04's run summary and section 05's pasted-posting card render the same `scored`
+    // state, each with the tone hard-coded. Fixing one leaves the Tier C user — the one who
+    // only ever pastes a posting, and so meets scoring nowhere else — with the green failure.
+    expect(page).not.toMatch(/tone="verified">\{scored\}/);
+    expect((page.match(/scored\.ok \? 'verified'/g) ?? []).length).toBe(2);
+  });
+});
+
+describe('retryLabel', () => {
+  it('names the action the button is about to run again', () => {
+    // A run costs a fan-out of real requests to third-party APIs, so the control that starts
+    // one over says so before it is pressed.
+    expect(retryLabel({ label: 'Searching' })).toBe('Try searching again');
+    expect(retryLabel({ label: 'Probing the boards' })).toBe('Try probing the boards again');
+    expect(retryLabel({ label: 'Scoring' })).toBe('Try scoring again');
+    expect(retryLabel({ label: 'Reading the page' })).toBe('Try reading the page again');
+    expect(retryLabel({ label: 'Storing what you pasted' })).toBe(
+      'Try storing what you pasted again',
+    );
+  });
+
+  it('keeps the plain wording when the failure was one of the four reads', () => {
+    // There the re-read IS the retry, and naming it would be a distinction without one.
+    expect(retryLabel(null)).toBe('Try again');
+  });
+});
+
+/**
+ * The banner's own button.
+ *
+ * It called `refresh(pinned)` whatever had failed — the four reads, and `setError(null)`
+ * first. So a search that died after ninety seconds, a probe that timed out and a pasted URL
+ * that came back 404 all answered "Try again" by wiping the red banner and re-counting the
+ * stored postings. Nothing was retried, and clearing the only evidence of the failure is how
+ * a thing that did not happen comes to look like a thing that did.
+ */
+describe('"Try again" on Discover', () => {
+  const page = readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), '../src/pages/Discovery.tsx'),
+    'utf8',
+  );
+
+  it('runs the action that failed rather than re-reading the page', () => {
+    const banner = page.slice(page.indexOf('{error && ('), page.indexOf('role="status"'));
+    expect(banner).toMatch(/guarded\(retry\.label, retry\.work\)/);
+    expect(banner).toMatch(/retryLabel\(retry\)/);
+  });
+
+  it('records the retry inside `guarded`, which is what covers all five spending actions', () => {
+    // At the call sites this would have been five separate fixes and the next action added
+    // would have been a sixth omission. `guarded` is the one door the probe, the run, the
+    // scoring, the URL read and the pasted posting all go through.
+    expect(page).toMatch(/catch \(err\) \{[\s\S]{0,400}setRetry\(\{ label, work \}\)/);
+    // Five labelled call sites, all of them spending something. If a sixth is added it goes
+    // through the same door and is retryable the day it lands.
+    expect((page.match(/guarded\('/g) ?? []).length).toBe(5);
+  });
+
+  it('still falls back to a re-read when it was a read that failed', () => {
+    expect(page).toMatch(/else refresh\(pinned\)/);
   });
 });

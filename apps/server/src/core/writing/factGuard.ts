@@ -98,11 +98,35 @@ export function splitClaims(text: string): Claim[] {
   const out: Claim[] = [];
   for (const { text: sentence, start } of sentences) {
     const parts = sentence.split(/[,;]\s+(?:and then|and also|and|but|then)\s+(?=\p{L})/giu);
+    const trimmedParts = parts.map((p) => p.trim()).filter((p) => /\p{L}/u.test(p));
+
+    /**
+     * THE FLOOR DECIDES WHETHER TO SPLIT, NEVER WHETHER TO CHECK.
+     *
+     * It used to `continue` past any part under twelve characters, and because the sentence
+     * was never re-checked as a whole, that text was then examined by NO layer of this file:
+     * it produced no claim, could not block, and drew no row in the G3 evidence panel. The
+     * user read an answer with a green tick on every line it did show.
+     *
+     * "I ran NASA." is eleven characters. So the invented-employer check — the one the
+     * `normalize` comment below calls the worst thing this file can get wrong — never saw the
+     * one sentence in the draft that named an employer the profile has never heard of, and
+     * draft.ts actively asks the model for short sentences ("Put a four-word sentence next to
+     * a twenty-five-word one"), so this is the shape the writer is being told to produce.
+     *
+     * Falling back to the whole sentence is the safe direction and costs almost nothing: the
+     * deterministic checks scan the entire claim text however it was cut, and the header above
+     * already records that under-splitting only dilutes the lexical score. Every letter of the
+     * input now ends up inside some claim.
+     */
+    const usable = trimmedParts.length > 1 && trimmedParts.every((p) => p.length >= 12);
+    const pieces = usable ? trimmedParts : [sentence.trim()];
+
     let local = 0;
-    for (const part of parts) {
-      const trimmed = part.trim();
-      if (trimmed.length < 12 || !/\p{L}/u.test(trimmed)) continue;
+    for (const trimmed of pieces) {
+      if (!/\p{L}/u.test(trimmed)) continue;
       const idx = sentence.indexOf(trimmed, local);
+      if (idx < 0) continue;
       local = idx + trimmed.length;
       out.push({ text: trimmed, span: { start: start + idx, end: start + idx + trimmed.length } });
     }
@@ -302,6 +326,78 @@ export function extractDurations(text: string): DurationClaim[] {
     const unit = m[2]!.toLowerCase();
     const months = unit.startsWith('y') ? n * 12 : unit.startsWith('w') ? n / 4.345 : n;
     out.push({ months, raw: m[0].trim() });
+  }
+
+  out.push(...magnitudeDurations(text), ...rangeDurations(text));
+  return out;
+}
+
+/**
+ * The units a student states a span in when they do not state it in months.
+ *
+ * The pattern above only fires on a number immediately followed by year/yr/month/mo/week, so
+ * a tenure written any other way produced NO DurationClaim at all — and no claim means the
+ * whole duration check is skipped, silently. On the project's own release-gate fixture (a
+ * two-month internship), "I spent three summers at Kestrel Analytics" and "I worked there for
+ * a decade" both came back GREEN with the two-month entry printed underneath as their
+ * evidence, while the same sentence written "for six years" was correctly blocked. A guard
+ * anyone can walk around by writing the number a different way is not guarding.
+ *
+ * Each magnitude is the SMALLEST span the word can honestly mean — a summer is the shortest
+ * school holiday, a semester one term — so the comparison stays generous to the writer and
+ * only a real overstatement can trip it.
+ */
+const MAGNITUDE_MONTHS: Array<[RegExp, number]> = [
+  [/\b(?:a|one)\s+decade\b/gi, 120],
+  [/\b(?:half\s+a\s+decade)\b/gi, 60],
+  [/\b(COUNT)[\s-]*decades?\b/gi, 120],
+  [/\b(COUNT)[\s-]*semesters?\b/gi, 4],
+  [/\b(COUNT)[\s-]*(?:school|academic)\s+years?\b/gi, 9],
+  [/\b(COUNT)[\s-]*summers?\b/gi, 2],
+];
+
+function magnitudeDurations(text: string): DurationClaim[] {
+  const out: DurationClaim[] = [];
+  for (const [pattern, unitMonths] of MAGNITUDE_MONTHS) {
+    const re = new RegExp(pattern.source.replace('COUNT', COUNT_PATTERN), pattern.flags);
+    for (const m of text.matchAll(re)) {
+      const n = m[1] === undefined ? 1 : countOf(m[1]);
+      if (n <= 0) continue;
+      out.push({ months: n * unitMonths, raw: m[0].trim() });
+    }
+  }
+  return out;
+}
+
+/**
+ * A tenure stated the way a resume states it: as the two years it ran between.
+ *
+ * "I ran the Sample High School Robotics Team from 2020 to 2026" claims six years against an
+ * entry the profile records as twenty months, and it came back supported with that entry
+ * quoted as its proof. This is the most natural way there is to write a span, and it was the
+ * one spelling the check could not see.
+ *
+ * THE SPAN IS READ AS THE SMALLEST ONE THE YEARS ALLOW, which is what keeps this from
+ * becoming a false RED. Bare years say nothing about months, so "from 2024 to 2026" could be
+ * anything from thirteen months (December to January) to thirty-five; a student who really
+ * was on the team from the autumn of 2024 to the spring of 2026 writes exactly that sentence
+ * about twenty real months, and reading it as the full twenty-four would block them at a gate
+ * with no override. Taking one whole year off the difference means no true sentence is ever
+ * measured as longer than it was, while "2020 to 2026" is still sixty months and still caught.
+ */
+const YEAR_RANGE =
+  /\b(?:from\s+)?(19|20)(\d{2})\s*(?:-|–|—|to|until|through|thru)\s*(?:(19|20)(\d{2})|present|now|today)\b/gi;
+
+function rangeDurations(text: string, now = new Date()): DurationClaim[] {
+  const out: DurationClaim[] = [];
+  for (const m of text.matchAll(YEAR_RANGE)) {
+    const start = Number(`${m[1]}${m[2]}`);
+    const end = m[3] ? Number(`${m[3]}${m[4]}`) : now.getUTCFullYear();
+    const years = end - start;
+    if (years <= 0) continue;
+    // One year of slack, never below a single month: the claim is real, its length is not
+    // knowable to better than a year, and the doubt goes to the writer.
+    out.push({ months: Math.max(1, (years - 1) * 12), raw: m[0].trim() });
   }
   return out;
 }
@@ -561,6 +657,36 @@ const CERT_CONTEXT =
  */
 const ADMIRATION_FRAME =
   /\b(follow(?:ed|ing|s)?|admir(?:e|ed|ing)|watch(?:ed|ing|es)?|heard (?:of|about)|known (?:of|about)|been a (?:fan|customer|user|reader|subscriber|follower))\b/i;
+
+/** The titles a name arrives under when the name belongs to a person. */
+const HONORIFIC =
+  /^(?:mr|mrs|ms|miss|mx|dr|prof|professor|coach|sir|dame|rev|father|sister|rabbi|imam|sgt|capt|lt|officer|coach)\b/i;
+
+/**
+ * The words that introduce somebody the writer knows, rather than somewhere they worked.
+ *
+ * "my physics teacher, Mrs. Delgado" and "my coach Alvarez" are the same sentence with and
+ * without the title, and a young applicant writes it both ways. The possessive is required:
+ * "the teacher" introduces nobody in particular, and "Sample High School's teacher" is not
+ * the shape anyone writes.
+ */
+const KNOWS_A_PERSON =
+  /\b(?:my|our)\s+(?:[\w-]+\s+){0,2}(?:teacher|coach|mentor|professor|instructor|tutor|advis[eo]r|counsell?or|principal|manager|supervisor|boss|parent|mother|father|mom|dad|grandmother|grandfather|aunt|uncle|cousin|sibling|brother|sister|friend|classmate|teammate|neighbou?r|doctor|nurse|pastor|rabbi|imam)s?\b[\s,'’-]*$/i;
+
+/**
+ * Whether this name is a person the writer named, rather than an organisation they claim.
+ *
+ * Two forms: the name carries its own title ("Mrs. Delgado"), or the words immediately in
+ * front of it say who they are to the writer ("my physics teacher, Delgado"). Only the text
+ * BEFORE the name is read for the second form, so a company that merely follows a relative
+ * in some other sentence cannot borrow the exemption.
+ */
+function namesAPerson(claim: string, rawName: string): boolean {
+  if (HONORIFIC.test(rawName.trim())) return true;
+  const at = claim.toLowerCase().indexOf(rawName.toLowerCase());
+  if (at < 0) return false;
+  return KNOWS_A_PERSON.test(claim.slice(0, at));
+}
 
 /**
  * Words that make a duration about schooling, so the degree span may bound it even when
@@ -936,6 +1062,30 @@ const WIN_GOVERNS_BEFORE = [
   /\b(?:took|placed|finished|came\s+in|earned|got|claimed)\s+(?:first|1st)(?:\s+place)?\s+(?:at|in|of|for)\s+(?:the\s+)?$/i,
   // "champion of the X", "winner of the X".
   /\b(?:champions?|winners?)\s+(?:of|at|in)\s+(?:the\s+)?$/i,
+  /**
+   * The ways of saying "first" without the word.
+   *
+   * Only the four shapes above fired, so a student the profile records at 2nd or 3rd could
+   * write "I swept the Oregon State Science Fair", "I topped the Oregon State Science Fair",
+   * "my team came out on top at the Oregon State Science Fair", "I was the top finisher at
+   * the Oregon State Science Fair" or "I beat everyone at the Oregon State Science Fair" and
+   * every one came back GREEN with the third-place honor quoted underneath as its proof — a
+   * fabricated win, on its way to an employer, wearing the profile's own evidence.
+   *
+   * These stay as tight as the four above: the phrase has to run straight into the name, so
+   * an intervening qualifier keeps a sentence that may well be true. "I was the top finisher
+   * from my school at the Oregon State Science Fair" does not match, and should not — a third
+   * placing can be the best in a school. "I topped my personal best at the Oregon State
+   * Science Fair" does not match either, because what is topped is the personal best.
+   */
+  /\b(?:swept|topped|dominated)\s+(?:(?:the|this|that|last|next|our|my)\s+)*$/i,
+  /\bcame\s+out\s+on\s+top\s+(?:at|in|of)\s+(?:the\s+)?$/i,
+  // "the top finisher at the X". The article and the placement noun are BOTH required: a bare
+  // "best at the X" also matches "I topped my personal best at the X", which claims no placing
+  // at all and was blocked at G3 while this pattern was loose enough to reach it.
+  /\bthe\s+(?:top|best|highest)[\s-]*(?:finisher|scorer|scoring|placing|ranked|team|entry|project)\s+(?:at|in|of)\s+(?:the\s+)?$/i,
+  /\b(?:was|were|am|is)\s+the\s+best\s+(?:at|in)\s+(?:the\s+)?$/i,
+  /\bbeat\s+(?:everyone|everybody|all\s+(?:the\s+)?(?:others|teams|schools)|the\s+(?:whole\s+)?field)\s+(?:at|in)\s+(?:the\s+)?$/i,
 ];
 
 /** "the X champion", "the X title" — the win word trailing the name instead of leading it. */
@@ -1338,6 +1488,51 @@ export function checkClaimDeterministically(
     // interface. "I interned at IBM" is still read as employment and still red; "I deployed
     // it to AWS" is not a claim about working at AWS and is left alone.
     if (isAcronymRun(raw) && !claimsEmployment) continue;
+
+    /**
+     * A PERSON IS NOT A CREDENTIAL, and nobody's teacher is on their resume.
+     *
+     * "My physics teacher, Mrs. Delgado, pushed me to try robotics" came back BLOCKING at
+     * G3 with `"Mrs Delgado" does not appear anywhere on your profile` — a true sentence
+     * about the student's own life, refused at the one gate with no override, and refused
+     * for a reason that can never be satisfied: a resume lists organisations, not the people
+     * in them, so no amount of profile editing would ever clear it. The only way out was
+     * deleting the sentence. "My coach, Mr. Alvarez, encouraged me to keep going" is the
+     * same sentence, and so is every mentor sentence a "why this field" answer is made of.
+     *
+     * A name is a person when it is introduced as one — by an honorific, or by the
+     * relationship word that names the writer's connection to them. Both forms, because the
+     * young applicants this tool serves write it either way.
+     *
+     * This gives up nothing in the other direction. The check exists to catch a fabricated
+     * ORGANISATION on the writer's history, and a person named as a person makes no claim
+     * about where the writer worked: "I interned at Delgado Engineering" carries no
+     * honorific and no relationship word, states an affiliation, and is still red.
+     */
+    if (namesAPerson(claim, raw)) continue;
+
+    /**
+     * A THIRD-PARTY COMPANY NAMED ADMIRINGLY IS STILL RED, AND THAT IS ON PURPOSE.
+     *
+     * "I have admired Boeing since I was a kid" blocks here, on a profile with no Boeing.
+     * ADMIRATION_FRAME and INTENT_FRAME veto exactly that shape twenty lines above — but only
+     * on the `matches(contextNorms)` branch, for the ONE employer this application is
+     * addressed to, where the question itself invites the name.
+     *
+     * Extending those vetoes to every other company was tried here and reverted. The release
+     * gate above ("does not let an opinion frame smuggle a fabrication through") caught what
+     * it costs: "I would love to bring the Rust experience I gained at Google to your team"
+     * carries an intent frame and a fabricated job at Google in the same sentence, and
+     * `affiliationFrame` does not read "gained at" as employment, so the veto passed it. The
+     * blanket refusal below is the only thing standing between that sentence and an employer.
+     *
+     * So the trade is deliberate and documented rather than fixed: naming an unrelated
+     * company you do not work for costs a G3 block, and the way out is to name the employer
+     * you are writing to, or to say the thing without the company's name. Closing it properly
+     * needs the employment reading to cover "the experience I gained at X" without turning
+     * "the confidence I gained at the food bank" red — a widening this file's own history
+     * says has produced a false RED every previous time.
+     */
 
     return {
       verdict: 'unsupported',

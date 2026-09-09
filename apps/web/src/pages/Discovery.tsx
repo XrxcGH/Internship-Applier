@@ -50,6 +50,73 @@ import { Badge, Button, Empty, Notice, TextArea, TextField } from '../components
 /** How many company names one press of "Find their boards" will probe. */
 const RESOLVE_LIMIT = 8;
 
+/**
+ * The one-line report a scoring pass leaves behind, and whether it is good news.
+ *
+ * `ok` exists because the failure sentence was drawn in the same green `verified` Notice as
+ * the success one. A run whose scoring half died came back as "The search finished and its
+ * postings are stored, but scoring them did not run: fetch failed" tinted like a completed
+ * job — the user reads the run summary as a receipt, and the only thing telling them half of
+ * it had not happened was the sentence itself, in the colour this app uses for "done".
+ */
+export interface ScoreReport {
+  ok: boolean;
+  message: string;
+}
+
+/**
+ * The success line, written once.
+ *
+ * `run` and `score` each built this same sentence from their own template literal, so the
+ * two could — and would — drift apart by a word.
+ */
+export function scoredLine(r: {
+  matched: number;
+  eligible: number;
+  unknown: number;
+  ineligible: number;
+}): ScoreReport {
+  return {
+    ok: true,
+    message: `${r.matched} scored — ${r.eligible} eligible, ${r.unknown} to check, ${r.ineligible} filtered.`,
+  };
+}
+
+/**
+ * Scoring failed, and the search in front of it did not.
+ *
+ * Says which half survived. Searching is the expensive half — a fan-out of real requests
+ * over minutes — and someone told only "scoring failed" reasonably assumes the postings went
+ * with it and runs the whole thing again.
+ */
+export function scoringFailed(err: unknown): ScoreReport {
+  return {
+    ok: false,
+    message:
+      'The search finished and its postings are stored, but scoring them did not run: ' +
+      (err instanceof Error ? err.message : String(err)) +
+      ' Press "Score what is stored" to try that half again.',
+  };
+}
+
+/** One failed action, kept so the error banner's button can run it again. */
+interface Retry {
+  label: string;
+  work: () => Promise<void>;
+}
+
+/**
+ * What "Try again" is offering, in the words of the thing that failed.
+ *
+ * A bare "Try again" under a dead search reads as "re-read this page", which is exactly what
+ * that button used to do. A run costs a fan-out of real requests to third-party APIs, so the
+ * control that starts one over has to say so before it is pressed rather than after.
+ */
+export function retryLabel(retry: { label: string } | null): string {
+  if (retry === null) return 'Try again';
+  return `Try ${retry.label.charAt(0).toLowerCase()}${retry.label.slice(1)} again`;
+}
+
 export function Discovery({
   onOpenQueue,
   onBusy,
@@ -70,7 +137,7 @@ export function Discovery({
 
   const [targets, setTargets] = useState<RunTarget[]>([]);
   const [summary, setSummary] = useState<RunSummary | null>(null);
-  const [scored, setScored] = useState<string | null>(null);
+  const [scored, setScored] = useState<ScoreReport | null>(null);
 
   const [manualUrl, setManualUrl] = useState('');
   // The paste-the-text fallback, for the three boards that refuse automated readers.
@@ -82,6 +149,24 @@ export function Discovery({
 
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  /**
+   * The action to run again when the banner's "Try again" is pressed, or null when the
+   * failure came from the four reads and re-reading really is the retry.
+   *
+   * That button called `refresh(pinned)` whatever had failed, and `refresh` re-reads the
+   * stats, the sources, the run list and the plan — nothing else — beginning with
+   * `setError(null)`. So a search that died after ninety seconds, a company probe that timed
+   * out, a pasted URL that came back 404: every one of them answered "Try again" by wiping
+   * the red banner and re-counting the postings. Nothing was retried, and clearing the only
+   * evidence of the failure is precisely how a thing that did not happen comes to look like a
+   * thing that did.
+   *
+   * Kept as `{label, work}` rather than a bound closure so the button can name what it is
+   * about to spend, and so the retry goes back in through `guarded` — a retried run needs the
+   * in-flight guard and the busy label just as much as the first press did.
+   */
+  const [retry, setRetry] = useState<Retry | null>(null);
 
   /**
    * The in-flight guard, as on the queue.
@@ -135,6 +220,9 @@ export function Discovery({
       };
 
       setError(null);
+      // Cleared, so a read that fails after an action failed leaves the button offering the
+      // reads it just tried rather than the run from five minutes ago.
+      setRetry(null);
       void postingStats().then(fresh(setStats)).catch(failFresh);
       void availableSources().then(fresh(setSources)).catch(failFresh);
       void listRuns().then(fresh(setRuns)).catch(failFresh);
@@ -154,10 +242,16 @@ export function Discovery({
       busyRef.current = true;
       setBusy(label);
       setError(null);
+      setRetry(null);
       try {
         await work();
       } catch (err) {
         fail(err);
+        // Recorded here rather than at the five call sites, so every action on this page that
+        // spends anything is retryable by the one button: the board probe, the run, the
+        // scoring, the URL read and the pasted posting all pass through `guarded`. Fixing
+        // this for the search alone would have left the other four clearing their own banner.
+        setRetry({ label, work });
       } finally {
         busyRef.current = false;
         setBusy(null);
@@ -226,16 +320,9 @@ export function Discovery({
        * throw away the expensive half of the press.
        */
       try {
-        const r = await recompute();
-        setScored(
-          `${r.matched} scored — ${r.eligible} eligible, ${r.unknown} to check, ${r.ineligible} filtered.`,
-        );
+        setScored(scoredLine(await recompute()));
       } catch (err) {
-        setScored(
-          'The search finished and its postings are stored, but scoring them did not run: ' +
-            (err instanceof Error ? err.message : String(err)) +
-            ' Press "Score what is stored" to try that half again.',
-        );
+        setScored(scoringFailed(err));
       }
       // The stats and the run list both moved; the plan may have too, since a board that
       // answered is a board the next plan knows about. Read through `refresh` rather than
@@ -247,10 +334,12 @@ export function Discovery({
 
   const score = (): Promise<void> =>
     guarded('Scoring', async () => {
-      const r = await recompute();
-      setScored(
-        `${r.matched} scored — ${r.eligible} eligible, ${r.unknown} to check, ${r.ineligible} filtered.`,
-      );
+      // Cleared before the request rather than replaced after it. A failure here is caught by
+      // `guarded` and drawn as the red banner, and the green line from the last SUCCESSFUL
+      // scoring stayed on screen underneath it — "31 scored — 12 eligible…" sitting directly
+      // below the sentence saying scoring had just failed.
+      setScored(null);
+      setScored(scoredLine(await recompute()));
     });
 
   const paste = (): Promise<void> =>
@@ -311,8 +400,15 @@ export function Discovery({
         <Notice tone="redline">
           {error}
           <div className="mt-3">
-            <Button size="sm" disabled={busy !== null} onClick={() => refresh(pinned)}>
-              Try again
+            <Button
+              size="sm"
+              disabled={busy !== null}
+              onClick={() => {
+                if (retry) void guarded(retry.label, retry.work);
+                else refresh(pinned);
+              }}
+            >
+              {retryLabel(retry)}
             </Button>
           </div>
         </Notice>
@@ -752,7 +848,11 @@ export function Discovery({
                 </Button>
               )}
             </div>
-            {scored && <Notice tone="verified">{scored}</Notice>}
+            {/* The tone follows the outcome. Both of this page's scoring lines were drawn
+                `verified` whatever they said, so the sentence reporting that scoring did NOT
+                run arrived tinted green, inside the block the user reads as the receipt for
+                the run. */}
+            {scored && <Notice tone={scored.ok ? 'verified' : 'caution'}>{scored.message}</Notice>}
             <p className="text-faint u-prose mt-3 text-sm">
               Finding a posting does not score it. Scoring reads each new posting for its
               requirements, which is the one step on this page that can spend money on a model call,
@@ -866,7 +966,10 @@ export function Discovery({
                 {busy === 'Scoring' ? 'Scoring…' : 'Score what is stored'}
               </Button>
             </div>
-            {scored && <Notice tone="verified">{scored}</Notice>}
+            {/* The same state, drawn the same way as in the run summary above — this second
+                copy had the tone hard-coded too, and the Tier C user who only ever pastes
+                postings meets scoring HERE and nowhere else. */}
+            {scored && <Notice tone={scored.ok ? 'verified' : 'caution'}>{scored.message}</Notice>}
           </div>
         )}
       </Section>

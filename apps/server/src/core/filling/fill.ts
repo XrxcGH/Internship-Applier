@@ -294,17 +294,75 @@ const KEPT_ENOUGH = 0.9;
  * Deliberately lenient about formatting and strict about content. "+1 (555) 010-0000"
  * matching "15550100000" is the form being helpful; an empty box is not, and neither is a
  * box holding a tenth of the answer.
+ *
+ * `everyWord` withdraws the last of that leniency for a value the user approved word for word
+ * at G3. `KEPT_ENOUGH` lets a form drop a tenth of a value, which is the right allowance for a
+ * phone number a page reformats and the wrong one for an essay: an ATS that caps a textarea
+ * from its own `input` handler — a character counter that slices, which the maxlength
+ * attribute the scanner reads does not appear in — kept 570 of 600 approved characters, and
+ * the run reported the field filled, in green, with the last two sentences of the answer gone.
+ * The approved text is the whole of what the user stood behind; nothing here may hand the
+ * employer a shorter version of it and call that success.
  */
-function accepted(intended: string, actual: string): boolean {
+function accepted(intended: string, actual: string, everyWord = false): boolean {
   if (actual === intended) return true;
   const a = comparable(actual);
   const b = comparable(intended);
   if (!a) return false;
+  // Reformatting is still forgiven either way: `comparable` drops the spacing and punctuation
+  // a textarea or a rich-text box normalizes, so this equality is "the same words".
   if (a === b) return true;
+  if (everyWord) return false;
   // A prefix, and nearly all of one. The other direction — the page holding MORE than was
   // typed — used to count as well, which is how a second fill run that appended an approved
   // answer to itself came back "ok" with the answer in the box twice.
   return b.startsWith(a) && a.length >= b.length * KEPT_ENOUGH;
+}
+
+/**
+ * Refuses to type an approved answer the box is not big enough to hold.
+ *
+ * G3 is where the user reads the exact words and stands behind them. `plan.ts` then slices
+ * those words to the form's own maxlength before typing — `text.slice(0, field.maxLength)` —
+ * and everything downstream sees only the slice: the page keeps it, read-back matches it, and
+ * the run says the field was filled. A 2000-character answer went to an employer as 600
+ * characters ending mid-word, under a green tick, and nothing anywhere told the student a
+ * sentence had been taken out of what they approved. Its own test pinned the slice happening
+ * and called that "rather than letting the form truncate silently"; the form was not doing the
+ * truncating, this tool was.
+ *
+ * Not filled, with the reason, is the only honest outcome available here. The alternative —
+ * shortening the answer BEFORE approval, where the user can see what goes — belongs at G3, and
+ * this file is downstream of it.
+ *
+ * `>=` rather than `==`, so it holds whether the cut has already happened or is still ahead:
+ * a value that exactly fills the box leaves nothing for a form that counts a newline as two
+ * characters, and a caller that stops pre-slicing lands here rather than at the browser's own
+ * silent chop.
+ *
+ * Answers only. The identical `value.slice(0, field.maxLength)` runs on profile values one
+ * branch below in `plan.ts`, and the same test there would fire on almost every form that
+ * uses it: a state field is `maxlength="2"` and holds "NJ", a postal field `maxlength="5"` and
+ * holds "08901", a phone `maxlength="10"`. Those caps are the length of the data, so a value
+ * ending at the cap says nothing at all — refusing them would leave a page of correct fields
+ * marked "needs you" and teach the student to click past the one that matters. On an approved
+ * answer the cap is a budget the answer was never written to, so ending exactly on it is
+ * evidence.
+ */
+function refuseIfCutToFit(action: FillAction): FieldResult | null {
+  const { field, value, source } = action;
+  if (source !== 'answer') return null;
+  const cap = field.maxLength;
+  if (cap === undefined || value.length < cap) return null;
+  return {
+    field,
+    status: 'skipped',
+    note:
+      `This box holds ${cap} characters and the answer you approved needs every one of them, ` +
+      'so the end of it would be cut off without you seeing what went. Nothing was typed. ' +
+      'Shorten the answer in the workspace and approve the shorter one, or type it in here ' +
+      'yourself.',
+  };
 }
 
 /**
@@ -422,7 +480,13 @@ async function readValue(loc: Locator, field: FormField): Promise<string> {
 }
 
 async function fillOne(page: Page, action: FillAction, documentUrl?: string): Promise<FieldResult> {
-  const { field, value } = action;
+  const { field, value, source } = action;
+
+  // Asked before the page is touched at all, because the answer to it does not depend on the
+  // page: the value in hand is already shorter than what the user approved, or is about to be.
+  const cutToFit = refuseIfCutToFit(action);
+  if (cutToFit) return cutToFit;
+
   const frame = frameFor(page, field, documentUrl);
   if (!frame) {
     const moved = !field.frame;
@@ -751,10 +815,29 @@ async function fillOne(page: Page, action: FillAction, documentUrl?: string): Pr
     }
 
     const readBack = await readValue(loc, field);
-    if (accepted(expected, readBack)) {
+    if (accepted(expected, readBack, source === 'answer')) {
       // The report shows what a person would see on the page, not the option code we
       // compared against.
       return { field, status: 'ok', readBack: reported ?? readBack, note: adjusted };
+    }
+
+    // The page kept the start of an approved answer and dropped the rest — a JS character
+    // cap, or a maxlength the scan never saw. The two numbers are the part the student cannot
+    // see by looking at the box; the general note below would print six hundred characters of
+    // their own essay back at them and bury the one fact that matters.
+    const keptTheStart =
+      source === 'answer' &&
+      readBack !== '' &&
+      comparable(expected).startsWith(comparable(readBack));
+    if (keptTheStart) {
+      return {
+        field,
+        status: 'mismatch',
+        readBack,
+        note:
+          `This box kept ${readBack.length} characters of the ${expected.length} you approved, ` +
+          'so the end of your answer is not on the page. Finish it yourself before you submit.',
+      };
     }
 
     return {

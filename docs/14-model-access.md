@@ -9,7 +9,7 @@ and location and nothing personal), and — **only when an `ANTHROPIC_API_KEY` i
 model pass in requirement extraction, which sends the text of a job description
 (`extractRequirements.ts`, gated on `hasApiKey()`; docs/05 § Stage 0 describes it, and the
 cost table below prices it). The CLI backend never runs that pass. Everything else is local:
-the board adapters, requirement extraction's regex pass, the twelve eligibility rules,
+the board adapters, requirement extraction's regex pass, the thirteen eligibility rules,
 scoring, FactGuard's deterministic layer, StyleCritic, and the tell-scrub are all pure
 functions running on this machine. An install with no model access is a reduced tool, not a
 broken one, and `GET /api/model-access` says exactly which parts are affected.

@@ -1,3 +1,5 @@
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 import {
   flagLabel,
@@ -6,6 +8,13 @@ import {
   isDismissible,
   OPTIONAL_WIZARD_FIELDS,
 } from '../src/lib/review';
+import type { AnswerEvidence, AnswerFlag } from '../src/lib/api';
+import {
+  AnswerReview,
+  evidenceNote,
+  wasChecked,
+  type ReviewedAnswer,
+} from '../src/components/AnswerReview';
 
 /**
  * G1 clears a review flag only when the field it names actually holds something. These
@@ -138,5 +147,180 @@ describe('flagLabel', () => {
     expect(flagLabel('workAuthorization.status')).toBe('workAuthorization.status');
     expect(flagLabel('locationPrefs.base.city')).toBe('locationPrefs.base.city');
     expect(flagLabel('somethingUnexpected')).toBe('somethingUnexpected');
+  });
+});
+
+/**
+ * Gate G3's evidence column, and the one sentence that stood for four different facts.
+ *
+ * "Nothing to check yet. Claims appear here as soon as there is text." was printed whenever
+ * `evidence` came back empty. That is true of an answer nobody has written, reassuring and
+ * FALSE about an answer saved without a confirmed profile and so never read against one, and
+ * self-contradicting about a checked answer that needed no backing — there is text, and the
+ * sentence says there is not. Opposite meanings behind one line, on the screen whose job is
+ * telling someone what has been checked before they stand behind it.
+ */
+function answer(over: Partial<ReviewedAnswer> = {}): ReviewedAnswer {
+  return {
+    id: 'ans1',
+    applicationId: 'app1',
+    questionText: 'Why do you want to work here?',
+    fieldKey: 'q_why',
+    answerType: 'long_text',
+    draftText: 'I wrote a parser for our robotics team.',
+    finalText: 'I wrote a parser for our robotics team.',
+    text: 'I wrote a parser for our robotics team.',
+    editDistance: 0,
+    editSummary: 'Unedited so far.',
+    evidence: [],
+    flags: [],
+    approvedAt: null,
+    archetype: 'motivation',
+    ...over,
+  };
+}
+
+const claim: AnswerEvidence = {
+  claim: 'I wrote a parser',
+  verdict: 'supported',
+  profileRef: 'projects.0',
+  quote: 'Wrote the telemetry parser.',
+};
+
+const tell: AnswerFlag = {
+  type: 'ai_tell',
+  span: { start: 0, end: 4 },
+  note: 'Reads as machine-written.',
+};
+
+describe('wasChecked', () => {
+  it('declines to answer when nothing in the payload says either way', () => {
+    // The important case. An unchecked answer and a checked one with nothing to flag both
+    // arrive holding `evidence: []`, so a guess here is a false GREEN half the time.
+    expect(wasChecked(answer())).toBeNull();
+  });
+
+  it('believes the server when the save response says so, in both directions', () => {
+    // PATCH /api/answers/:id answers with `verified: false` when the edit was stored without
+    // a confirmed profile, which stores `evidence: []` and `flags: []` — exactly the shape
+    // that used to render as "nothing to check".
+    expect(wasChecked(answer({ verified: false }))).toBe(false);
+    expect(wasChecked(answer({ verified: true }))).toBe(true);
+  });
+
+  it('takes a listed claim or any flag as proof the guard ran', () => {
+    expect(wasChecked(answer({ evidence: [claim] }))).toBe(true);
+    expect(wasChecked(answer({ flags: [tell] }))).toBe(true);
+  });
+
+  it('takes `unresolved` as proof by its presence, not by its value', () => {
+    // The draft response always sends it, and `false` there means "checked, nothing left
+    // unresolved" — reading it as falsy would throw away proof on every clean draft.
+    expect(wasChecked(answer({ unresolved: false }))).toBe(true);
+    expect(wasChecked(answer({ unresolved: true }))).toBe(true);
+  });
+
+  it('takes a style note as proof, and a missing one as nothing either way', () => {
+    expect(wasChecked(answer({ styleNote: 'Longer sentences than you usually write.' }))).toBe(
+      true,
+    );
+    expect(wasChecked(answer({ styleNote: null }))).toBeNull();
+  });
+
+  it('lets the server overrule the inferences, since it is talking about this text', () => {
+    expect(wasChecked(answer({ verified: false, evidence: [claim] }))).toBe(false);
+  });
+});
+
+describe('evidenceNote', () => {
+  it('keeps the original sentence for the case it was always true of', () => {
+    const note = evidenceNote(answer({ text: '   ', evidence: [] }));
+    expect(note.state).toBe('no-text');
+    expect(note.text).toMatch(/as soon as there is text/);
+  });
+
+  it('says a checked answer was checked, instead of that there is nothing to check', () => {
+    const note = evidenceNote(answer({ verified: true }));
+    expect(note.state).toBe('checked');
+    expect(note.text).toMatch(/Read against your profile/);
+    expect(note.text).not.toMatch(/Nothing to check yet/);
+  });
+
+  it('says an unchecked answer was NOT checked — the false green this existed to hide', () => {
+    const note = evidenceNote(answer({ verified: false }));
+    expect(note.state).toBe('unchecked');
+    expect(note.text).toMatch(/Not read against your profile/);
+    expect(note.text).not.toMatch(/Nothing to check yet/);
+  });
+
+  it('claims neither when the payload cannot say, and offers the move that settles it', () => {
+    // Reloading the application re-reads a payload with no `verified` in it at all, so this
+    // is a state the screen really reaches. Asserting either way here would be the same bug
+    // with a different sentence.
+    const note = evidenceNote(answer());
+    expect(note.state).toBe('unknown');
+    expect(note.text).toMatch(/nothing here says which/);
+    expect(note.text).toMatch(/Saving it again/);
+  });
+
+  it('never says "nothing to check" over an answer that has text', () => {
+    for (const a of [
+      answer(),
+      answer({ verified: true }),
+      answer({ verified: false }),
+      answer({ unresolved: false }),
+    ]) {
+      expect(evidenceNote(a).text, evidenceNote(a).state).not.toMatch(/Nothing to check yet/);
+    }
+  });
+});
+
+describe('the evidence column as it renders', () => {
+  const render = (a: ReviewedAnswer): string =>
+    renderToStaticMarkup(
+      createElement(AnswerReview, {
+        answer: a,
+        canDraft: true,
+        busy: null,
+        onDraft: () => undefined,
+        onSave: () => undefined,
+        onApprove: () => undefined,
+        onUnapprove: () => undefined,
+        onDelete: () => undefined,
+      }),
+    );
+
+  it('prints the note the state earns, not the one sentence for all of them', () => {
+    expect(render(answer({ verified: true }))).toContain('Read against your profile');
+    expect(render(answer({ verified: false }))).toContain('Not read against your profile');
+    expect(render(answer())).toContain('No claims are listed against this text');
+  });
+
+  /**
+   * The fourth state never reaches the evidence column, and that is the right answer rather
+   * than a gap: an answer with no text at all renders the "No answer yet" placeholder and
+   * the two buttons that make one, so a note about claims would be talking about something
+   * that does not exist. `evidenceNote` still returns it — the function is also read by
+   * callers that are not this component — and the state is asserted on the function above.
+   */
+  it('offers to write the answer rather than reporting on the claims of an empty one', () => {
+    const empty = render(answer({ text: '', draftText: '', finalText: '' }));
+    expect(empty).toContain('No answer yet');
+    expect(empty).not.toContain('Nothing to check yet');
+  });
+
+  it('colours the definite negative and leaves plain absence plain', () => {
+    // An answer that has not been read against the profile is a warning. An answer whose
+    // payload cannot say is an absence of information, and dressing that as bad news at a
+    // gate with no override teaches people to ignore the colour.
+    expect(render(answer({ verified: false }))).toContain('text-caution');
+    expect(render(answer())).not.toContain('text-caution');
+  });
+
+  it('lists the claims when there are claims, and drops the note entirely', () => {
+    const html = render(answer({ evidence: [claim] }));
+    expect(html).toContain('Wrote the telemetry parser.');
+    expect(html).not.toContain('Nothing to check yet');
+    expect(html).not.toContain('nothing here says which');
   });
 });

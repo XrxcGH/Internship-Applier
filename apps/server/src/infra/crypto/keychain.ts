@@ -5,15 +5,22 @@
  * Manager / macOS Keychain / libsecret). It is never written to disk in plaintext and
  * never appears in a config file.
  *
- * If the OS store is unavailable — headless Linux without libsecret, CI, a locked
- * session — we fall back to a keyfile with owner-only permissions and log a loud warning.
- * Failing shut instead would make the app unusable in exactly the environments where
- * people run tests; failing silently would be worse. So: fall back, but be noisy.
+ * If the OS store is not THERE — headless Linux without libsecret, CI — we fall back to a
+ * keyfile with owner-only permissions and log a loud warning. Failing shut instead would
+ * make the app unusable in exactly the environments where people run tests; failing
+ * silently would be worse. So: fall back, but be noisy.
+ *
+ * A store that is there and will not answer is the opposite case and this file used to
+ * treat it as the same one. A locked keychain, a denied prompt, an entry whose ACL no
+ * longer matches: those mean a key we cannot see, not a key that does not exist, and the
+ * fallback path ends in `randomBytes`. See `UnreadableKeychainError` and `mintKey` — no
+ * branch here mints a key over a database that already holds ciphertext.
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { randomBytes } from 'node:crypto';
+import Database from 'better-sqlite3';
 import { config } from '../../config';
 import { logger } from '../logger';
 
@@ -132,6 +139,83 @@ function keyfilePath(): string {
 }
 
 /**
+ * The tables whose every row carries at least one column only the master key can open.
+ *
+ * Named as tables rather than columns so the list cannot drift as columns are added:
+ * `profile.full_name` and `profile.email` are NOT NULL and ENCRYPTED, as are
+ * `resume_document.path` and `writing_sample.content`, so one row in any of them IS
+ * ciphertext. See infra/db/schema.ts, where each column is marked.
+ */
+const TABLES_HOLDING_CIPHERTEXT = ['profile', 'resume_document', 'writing_sample'];
+
+/**
+ * Is there already something on this machine that a brand new key would orphan?
+ *
+ * Asked immediately before minting, because minting is the one irreversible act in this
+ * file. Every other mistake here — the wrong storage location, a noisy warning, a refusal
+ * to start — is recoverable by the user; a fresh random key written over a database sealed
+ * under the old one takes their profile, their resume text and their writing samples with
+ * it, and the first sign is an authentication failure with nothing attached that names a
+ * cause.
+ *
+ * Opened read-write although nothing here writes: SQLite cannot open a WAL database
+ * read-only unless the `-shm` sidecar already exists or can be created, and a spurious
+ * "cannot tell" on a perfectly healthy database would be a refusal to start. This process
+ * opens the same file read-write moments later anyway.
+ */
+function databaseHoldsCiphertext(): boolean {
+  const file = config.paths.database;
+  if (!fs.existsSync(file)) return false;
+
+  let sqlite: InstanceType<typeof Database> | null = null;
+  try {
+    sqlite = new Database(file, { fileMustExist: true });
+    sqlite.pragma('busy_timeout = 5000');
+    const named = sqlite.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all() as {
+      name: string;
+    }[];
+    const present = new Set(named.map((r) => r.name));
+    for (const table of TABLES_HOLDING_CIPHERTEXT) {
+      // Absent before the first migration, which is a genuinely empty install.
+      if (!present.has(table)) continue;
+      const row = sqlite.prepare(`SELECT count(*) AS n FROM "${table}"`).get() as { n: number };
+      if (row.n > 0) return true;
+    }
+    return false;
+  } catch (err) {
+    // A database file that is there and will not answer is not a database that is empty,
+    // and this is the same distinction the rest of the file turns on. Guessing "empty"
+    // here would put the mint back one level down from where it was taken out.
+    logger.error(
+      { err, file },
+      'could not check whether the database already holds encrypted data; assuming it does ' +
+        'rather than risk replacing the key that opens it',
+    );
+    return true;
+  } finally {
+    try {
+      sqlite?.close();
+    } catch {
+      /* Nothing left to do about it, and the caller's answer is already decided. */
+    }
+  }
+}
+
+/**
+ * A brand new master key, which is only ever safe when there is nothing already sealed.
+ *
+ * Every path that mints goes through here, and that is the point: the reported failure came
+ * in through the credential store, but `readFallbackKey` mints too, and it is reached by a
+ * binding that will not load, by an `Entry` constructor that throws, and by a `setPassword`
+ * that is refused. Guarding the branch someone happened to be looking at would have left
+ * three other ways to the same fresh random key over the same sealed database.
+ */
+function mintKey(why: string): Buffer {
+  if (databaseHoldsCiphertext()) throw new WouldOrphanStoredDataError(why);
+  return randomBytes(KEY_BYTES);
+}
+
+/**
  * The keyfile, when the credential store is empty and we are about to adopt it.
  *
  * A keyfile of the wrong length throws for the same reason `readFallbackKey` does: it is a
@@ -180,7 +264,9 @@ function readFallbackKey(): Buffer {
   const existing = existingFallbackKey();
   if (existing) return existing;
 
-  const key = randomBytes(KEY_BYTES);
+  const key = mintKey(
+    `There is no usable master key in the OS credential store and none at ${file}`,
+  );
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, key.toString('base64'), { encoding: 'utf8', mode: 0o600 });
   try {
@@ -248,6 +334,56 @@ export class UnreadableKeyfileError extends Error {
 }
 
 /**
+ * The credential store answered the door and would not say anything.
+ *
+ * The distinction this class exists to draw: `getPassword()` returning null means there is
+ * no key yet, and `getPassword()` THROWING means we do not know whether there is one. A
+ * locked macOS login Keychain throws. So does a prompt the user dismissed, and so does an
+ * entry whose ACL no longer matches the binary asking. All three used to land in the same
+ * catch as "this platform has no credential store", and the reported consequence is the
+ * worst thing in this file: a week-old install, key in the Keychain, no data/.master.key on
+ * disk, one denied prompt — and the fallback path minted a fresh random key and started
+ * writing under it, while the profile, the resume text and every writing sample stayed
+ * sealed under the key still sitting in the Keychain, unreadable and unmentioned.
+ *
+ * Refusing costs an unlock and a restart. Guessing cost all of it.
+ */
+export class UnreadableKeychainError extends Error {
+  constructor(cause: unknown) {
+    super(
+      'The master key could not be read from the OS credential store: ' +
+        `${cause instanceof Error ? cause.message : String(cause)}. This tool will not ` +
+        'generate a replacement, because anything already stored is encrypted under the key ' +
+        'that store is holding. Unlock your keychain, or allow the access prompt, and start ' +
+        'again.',
+      { cause },
+    );
+    this.name = 'UnreadableKeychainError';
+  }
+}
+
+/**
+ * There is no key to be found, and there is already data that only a key opens.
+ *
+ * The other half of the same rule. Even a credential store that answers cleanly can answer
+ * "empty" — an entry deleted by a keychain repair, a login item migrated to a new machine,
+ * a profile moved between accounts — and a data directory full of ciphertext is then the
+ * only remaining evidence that a key ever existed. Minting there is not a first run; it is
+ * the same destruction arrived at politely.
+ */
+export class WouldOrphanStoredDataError extends Error {
+  constructor(why: string) {
+    super(
+      `${why}, and this database already holds encrypted data. This tool will not generate a ` +
+        'new key, because everything already stored was sealed under the old one and would ' +
+        'become permanently unreadable. Restore the credential-store entry or the key file ' +
+        'from a backup, or delete your data and start again.',
+    );
+    this.name = 'WouldOrphanStoredDataError';
+  }
+}
+
+/**
  * Every error in this file that means "there is a key here and we must not overwrite it".
  *
  * Listed once, because the catch in `getMasterKey` re-throws these rather than treating them
@@ -259,6 +395,8 @@ const KEY_MUST_NOT_BE_REPLACED = [
   CorruptMasterKeyError,
   CorruptKeyfileError,
   UnreadableKeyfileError,
+  UnreadableKeychainError,
+  WouldOrphanStoredDataError,
 ];
 
 function mustNotBeReplaced(err: unknown): boolean {
@@ -285,6 +423,24 @@ function warnKeyfileInUse(why: string): void {
   );
 }
 
+/**
+ * Reads the entry, keeping "there is no key" apart from "we could not look".
+ *
+ * A read that fails on a machine with no credential store to read is the supported fallback
+ * case and stays on the old path: a headless Linux box answers `getPassword` with a d-bus or
+ * secret-service failure, and failing shut there would make the app unusable in exactly the
+ * environment the keyfile exists for. Anything else is a store that is present and would not
+ * answer, and the one thing that must not follow is a new key.
+ */
+function readStoredKey(entry: Entry): string | null {
+  try {
+    return entry.getPassword();
+  } catch (err) {
+    if (isStoreAbsent(err)) throw err;
+    throw new UnreadableKeychainError(err);
+  }
+}
+
 export function getMasterKey(): Buffer {
   if (cached) return cached;
 
@@ -292,7 +448,7 @@ export function getMasterKey(): Buffer {
   if (store.entry) {
     const entry = store.entry;
     try {
-      const existing = entry.getPassword();
+      const existing = readStoredKey(entry);
       if (existing) {
         const key = Buffer.from(existing, 'base64');
         if (key.length !== KEY_BYTES) {
@@ -334,8 +490,8 @@ export function getMasterKey(): Buffer {
       /**
        * An empty credential store is not necessarily a first run.
        *
-       * The fallback keyfile is a supported path — headless, CI, a locked session — so a
-       * profile can already be encrypted under it by the time the store becomes usable.
+       * The fallback keyfile is a supported path — headless, CI — so a profile can already
+       * be encrypted under it by the time the store becomes usable.
        * Minting a fresh key here regardless meant name, email, phone, date of birth,
        * address and resume text all stopped decrypting the moment the keychain started
        * working, with nothing but an authentication failure to explain it. The keyfile is
@@ -344,7 +500,11 @@ export function getMasterKey(): Buffer {
        * still removes both.
        */
       const adopted = existingFallbackKey();
-      const key = adopted ?? randomBytes(KEY_BYTES);
+      const key =
+        adopted ??
+        mintKey(
+          `The OS credential store holds no master key and there is none at ${keyfilePath()}`,
+        );
       entry.setPassword(key.toString('base64'));
       logger.info(
         adopted

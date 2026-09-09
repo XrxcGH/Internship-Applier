@@ -127,7 +127,7 @@ type EligibilityRule = (input: RuleInput) => RuleResult;
 
 ### The rules
 
-Twelve of them, in `RULES` in `eligibility.ts`. There are two distinct ways a rule declines
+Thirteen of them, in `RULES` in `eligibility.ts`. There are two distinct ways a rule declines
 to decide and the difference is load-bearing: **`not_applicable`** means the posting never
 raised the question, **`unknown`** means it did and the tool could not settle it. Only
 `unknown` badges a posting in the queue and pushes it below the eligible ones — a rule that
@@ -140,6 +140,7 @@ badged nearly every row and meant nothing.
 | `deadline` | `closes_at` in the future. A date with no time means the whole of that day, not its first instant — bare dates parse to midnight UTC, which closed postings a day early on people who still had hours to apply. | `not_applicable` with no closing date; `unknown` if the date can't be read. |
 | `age_minimum` | `derived.age >= req.value`. Common values: 16, 18. | `not_applicable` if no minimum is stated; `unknown` if one is and DOB is absent — the single highest-value missing field, so the user is prompted for it. |
 | `education_level` | `derived.academicLevel` ∈ required set. Handles "currently enrolled in a Bachelor's" vs "must have completed". | `not_applicable` if no level is stated; `unknown` if the clause is unparseable or there is no education history to check against. |
+| `postdoctoral` | The only rule that reads the TITLE rather than a requirement: postings for these rarely state the degree, because the word carries it. Drawn as narrowly as the word allows — "fellow" and "fellowship" are deliberately not enough, or it would hide the programmes an undergraduate most wants to see. | `not_applicable` unless the title says "postdoctoral"/"postdoc"; `unknown` when the title ALSO names a student post ("Research Intern, Postdoctoral Affairs Office"), because the office that runs a postdoc programme hires students to run it and the title alone cannot say which this is. |
 | `graduation_window` | `expectedGraduation` within the stated window. Very common ("graduating Dec 2027 – Jun 2028") and a frequent silent disqualifier. | `not_applicable` if no window is stated; `unknown` if the window or your expected graduation can't be read. |
 | `enrollment` | Many internships require active enrolment during the term or return-to-school after. Checks the graduation date against the requirement. | `not_applicable` if enrolment isn't required; `unknown` if the clause is unparseable or your graduation date is unknown. |
 | `work_authorization` | `fail` when the posting requires authorization without sponsorship and `workAuthorization.needsSponsorship` is set. | `not_applicable` if unmentioned; `unknown` if the clause is unparseable or your status is not on file. |
@@ -155,8 +156,7 @@ badged nearly every row and meant nothing.
 > **Deferred with Guardian mode:** an `age_work_permit` rule, which would attach an advisory
 > (never a fail) when the user is a minor and the posting's jurisdiction requires a work
 > permit or restricts hours. The locked decision of 2026-08-03 puts Guardian mode out of v1
-> — see docs/10 § Guardian mode and docs/11 § Decisions — so it is not in `RULES` and there
-> is no thirteenth rule.
+> — see docs/10 § Guardian mode and docs/11 § Decisions — so it is not in `RULES`.
 
 ### How the three states are presented
 
@@ -249,8 +249,8 @@ user opportunities. It gets:
   is the step *before* these rules — whether requirement extraction turned the posting's
   actual words into the right requirement object in the first place.
 - Property tests: no rule may return `fail` without either a `requirementId` or posting
-  `evidence` — six of the thirteen fail paths (location twice, term overlap, deadline,
-  posting open, excluded company) cite evidence rather than a requirement, because they
+  `evidence` — seven of the fourteen fail paths (location twice, term overlap,
+  deadline, posting open, excluded company, postdoctoral) cite evidence rather than a requirement, because they
   fail on something the posting says rather than on a requirement it states; `unknown`
   inputs can never produce `fail`; adding a profile fact can never turn `eligible` into
   `ineligible` for an unchanged posting.

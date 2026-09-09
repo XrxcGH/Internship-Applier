@@ -1183,3 +1183,48 @@ describe('skipped fields survive the run that found them', () => {
     expect(res.json().skippedFields).toEqual([]);
   });
 });
+
+/**
+ * What the detail endpoint says about the application itself.
+ *
+ * GET /api/applications/:id answered with the posting and the answers and nothing about the
+ * application's own state, and apps/web/src/pages/Applications.tsx carried a comment saying
+ * so: it looked `submittedAt` up in the summary list rendered beside the detail. That is
+ * right only while the list happens to be loaded and happens to contain this row — open the
+ * detail before the list settles and the lookup returns undefined, so an application the user
+ * had already told the tool they submitted rendered as unsubmitted and the fill panel offered
+ * to open and fill the form again.
+ *
+ * G4 is not breached by that: the fill engine has no submit path and a human still presses
+ * the button. What is wrong is the screen asserting something untrue about the user's own
+ * application at the moment they are deciding what to do with it.
+ */
+describe('the application detail carries the application’s own state', () => {
+  afterEach(() => {
+    db.update(schema.application)
+      .set({ status: 'draft', submittedAt: null })
+      .where(eq(schema.application.id, applicationId))
+      .run();
+  });
+
+  it('sends the status and submittedAt, so the screen need not look them up elsewhere', async () => {
+    const when = '2026-09-01T10:00:00.000Z';
+    db.update(schema.application)
+      .set({ status: 'submitted', submittedAt: when })
+      .where(eq(schema.application.id, applicationId))
+      .run();
+
+    const res = await app.inject({ method: 'GET', url: `/api/applications/${applicationId}` });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { status?: string; submittedAt?: string | null };
+    expect(body.status).toBe('submitted');
+    expect(body.submittedAt).toBe(when);
+  });
+
+  it('says draft and null for one that has not been sent', async () => {
+    const res = await app.inject({ method: 'GET', url: `/api/applications/${applicationId}` });
+    const body = res.json() as { status?: string; submittedAt?: string | null };
+    expect(body.status).toBe('draft');
+    expect(body.submittedAt).toBeNull();
+  });
+});

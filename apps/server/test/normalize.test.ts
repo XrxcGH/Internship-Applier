@@ -327,6 +327,100 @@ describe('term dates and duration', () => {
     });
   });
 
+  /**
+   * The first "<month> <year> to <month> <year>" in the text used to become the term whatever
+   * introduced it — and a posting dates far more than the job.
+   *
+   * "Summer 2027 Software Engineering Internship. Applications open March 2027 to June 2027 and
+   * are reviewed on a rolling basis." was stored as a term of 2027-03..2027-06. Those months
+   * overlap the Summer 2027 season window, so `deriveTermWindow` counted them as corroborated —
+   * an EXACT window, the only kind term_overlap is allowed to reject on — and a student free
+   * 2027-06-01 to 2027-08-20, who could have taken that internship outright, was hard-failed
+   * with "Overlaps your availability by only about 4.2 weeks; 6 are needed." docs/05 says an
+   * inferred window may raise a question and never hard-fail anyone.
+   *
+   * The application window is only the reported shape. The hiring calendar is written a dozen
+   * ways and every one of them reads to the old parser as the term.
+   */
+  it('does not read the hiring calendar as the term the job runs', () => {
+    for (const text of [
+      'Summer 2027 Software Engineering Internship. Applications open March 2027 to June 2027.',
+      'Applications are accepted from September 2026 through November 2026 for our Summer 2027 program.',
+      'Application window: September 2026 - November 2026. Summer 2027 internship.',
+      'Applications for this role are open March 2027 to June 2027.',
+      'Apply between September 2026 and November 2026 for the Summer 2027 cohort.',
+      'We accept applications on a rolling basis from October 2026 until January 2027.',
+      'The review period runs January 2027 to March 2027.',
+      'Interviews take place October 2026 to December 2026 for the Summer 2027 cohort.',
+      'Decisions will be sent March 2027 through May 2027.',
+      'Offers are extended November 2026 through January 2027.',
+      'Shortlisted candidates are contacted October 2026 to November 2026.',
+      'You will be notified February 2027 through April 2027.',
+      // The windows a posting dates that are not the hiring calendar either. These are the
+      // same words parseDurationWeeks already refuses to read as the length of the job, and
+      // the two lists are built from one source so they cannot drift apart again.
+      'Onboarding runs May 2027 to June 2027.',
+      'There is a probation period from June 2027 to August 2027.',
+    ]) {
+      expect(parseTermDates(text), text).toBeNull();
+    }
+  });
+
+  /** The guard has to leave a real term alone, however the posting introduces it. */
+  it('still reads a term the posting states as its own dates for the job', () => {
+    const cases: Array<[string, { start: string; end: string }]> = [
+      ['The internship runs June 2027 through August 2027.', { start: '2027-06', end: '2027-08' }],
+      ['Program dates: June 2027 – August 2027.', { start: '2027-06', end: '2027-08' }],
+      ['This co-op runs from January 2027 until June 2027.', { start: '2027-01', end: '2027-06' }],
+      ['Summer 2027 (June 2027 - August 2027)', { start: '2027-06', end: '2027-08' }],
+      ['You will work June 2027 to August 2027, full-time.', { start: '2027-06', end: '2027-08' }],
+      [
+        'Our fellowship is scheduled for Sept. 2026 - Dec. 2026.',
+        { start: '2026-09', end: '2026-12' },
+      ],
+      [
+        'June 2027 - August 2027 internship, 40 hours per week.',
+        { start: '2027-06', end: '2027-08' },
+      ],
+    ];
+    for (const [text, want] of cases) {
+      expect(parseTermDates(text), text).toEqual(want);
+    }
+  });
+
+  /**
+   * Both halves of the guard, on one posting: the application window loses and the term two
+   * sentences later still wins. The old parser stopped at the first range it found, so a
+   * posting that states its hiring calendar before its dates — the ordinary ordering — never
+   * got as far as the sentence that answers the question.
+   */
+  it('keeps looking past a range that is not the term', () => {
+    expect(
+      parseTermDates(
+        'Applications are reviewed on a rolling basis from October 2026 until January 2027. ' +
+          'The internship runs June 2027 to August 2027.',
+      ),
+    ).toEqual({ start: '2027-06', end: '2027-08' });
+    // Same loop, second bug: a first match whose words are not months used to abandon the
+    // search outright. "Fall 2026 to Spring 2027" matches the range pattern and resolves to no
+    // months at all, so a co-op that then spells its dates out was stored with no term.
+    expect(
+      parseTermDates(
+        'This co-op runs Fall 2026 to Spring 2027 — September 2026 through April 2027.',
+      ),
+    ).toEqual({ start: '2026-09', end: '2027-04' });
+  });
+
+  /**
+   * An unlabelled range is exactly the one that cannot be told from an application window, and
+   * the consumer of this field can hard-fail on it. Saying nothing costs the posting its exact
+   * dates and leaves the season-and-year window, which can raise a question and never rejects.
+   */
+  it('says nothing rather than guess when a range has no context at all', () => {
+    expect(parseTermDates('June 2027 - August 2027')).toBeNull();
+    expect(parseTermDates('Acme Corp. September 2026 – December 2026. New York, NY.')).toBeNull();
+  });
+
   it('parses weeks and months', () => {
     expect(parseDurationWeeks('a 12 week internship')).toBe(12);
     expect(parseDurationWeeks('10-12 weeks')).toBe(11);

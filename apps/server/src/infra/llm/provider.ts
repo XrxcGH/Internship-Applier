@@ -71,10 +71,12 @@ export interface GenerateResult {
  *
  *   `unavailable`     no CLI on PATH and no key — the genuine no-access case
  *   `not_signed_in`   the CLI is installed and has no credentials
- *   `no_key`          the API backend was selected with no ANTHROPIC_API_KEY
+ *   `no_key`          the API backend was selected with no ANTHROPIC_API_KEY, or with one
+ *                     the API answered 401 for — both are "the key needs sorting out"
  *   `usage_limit`     the subscription's cap was reached; it comes back on its own
  *   `timed_out`       the call was still running when the per-call ceiling expired
- *   `cli_error`       the CLI exited non-zero or reported an error of its own
+ *   `cli_error`       the CLI exited non-zero, reported an error of its own, or stopped
+ *                     without producing a single byte to say why
  *   `unreadable`      it answered in a shape this app could not parse
  *
  * The first three are the ones where "set up model access" is the right thing to say. The

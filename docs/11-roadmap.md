@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | M0 Skeleton | **done** | 19-table schema, CI, G4 guards, pre-commit hook |
 | M1 Resume → profile | **done** | Claude-native PDF ingestion, field encryption, G1 enforced in the repository |
-| M2 Discovery | **done** | Greenhouse/Lever/Ashby adapters, polite fetcher, 3-stage dedupe, run reporting. Verified live: 424 postings from two real boards, with a failing board correctly reported as degraded rather than dropped. |
+| M2 Discovery | **done** | Six ATS board adapters — Greenhouse, Lever, Ashby, Workday, SmartRecruiters, Workable — plus the aggregators and web search, a polite fetcher, 3-stage dedupe, run reporting. Verified live: 424 postings from two real boards, with a failing board correctly reported as degraded rather than dropped. Named in full because "Greenhouse/Lever/Ashby" was written when that was the whole registry, and it was still being read as the whole registry after three more shipped. |
 | M3 Matching | **done** | Deterministic + LLM requirement extraction with quote verification, 12 pure eligibility rules, scoring, rationale. Verified live: 816 postings → 420 eligible / 244 unknown / 152 ineligible, 203 requirements, 0 dropped, 0 errors. |
 | M4 Review queue | **done** | Keyboard-first triage, requirement checklist with verbatim quotes, score breakdown, reject reasons, G2 approval creating an application. Verified live against 123 real matches. |
 | M5 Writing engine | **done** | Bounded evidence retrieval, drafting with the measured voice, two-layer FactGuard, StyleCritic, answer library, G3 workspace. The adversarial suite passes: every planted fabrication caught, and the false-positive half passes too. G3 enforced server-side with no override. |
@@ -90,7 +90,10 @@ full stop attached, which had made "TypeScript." look exactly like a fabrication
 
 Gate G3 is enforced in `routes/answers.ts`, which re-verifies at approval time and returns
 409 while any claim is unsupported. There is no override parameter and no bulk-approve
-endpoint; `answers.test.ts` asserts both.
+endpoint. `answers.test.ts` asserts the second — three plausible approve-everything paths
+all answer 404. It does not assert the first, which this line used to claim it did: the
+handler reads no body, so there is nowhere for an override to arrive, but that is a fact
+about the code as written and no test would go red if a parameter were added tomorrow.
 
 **Not done:** drafting itself has never run against a live model. The reason is no longer
 that there is no key: the Claude Code CLI backend exists and resume extraction and discovery
@@ -127,16 +130,27 @@ Three findings worth keeping:
   false positives it had just introduced — "GitHub username", "Professional
   certifications", "Declaration of major". All three now have tests keeping them fillable.
 
-**Not done:** the per-vendor ATS adapters (Greenhouse, Lever, Ashby, Workday). The generic
-mapper handles all four in principle, since it works from labels and roles rather than
-vendor markup, but that is untested against a real posting from any of them. Research on
-their DOM structure was gathered and is in the run journal.
+**Not done:** the per-vendor ATS *form-filling* adapters (Greenhouse, Lever, Ashby, Workday).
+The word "filling" is load-bearing and was missing: adapters under those same four names ship
+in M2 and fetch postings perfectly well, so "no Workday adapter" read as a hole in discovery
+and got repeated that way into the README. `core/filling` holds `formMap.ts` and no vendor
+file; `core/discovery/sources/ats.ts` holds six vendors. The generic mapper handles all four
+in principle, since it works from labels and roles rather than vendor markup, but that is
+untested against a real posting from any of them. Research on their DOM structure was
+gathered and is in the run journal.
 
 ### M7 — Tracker (2 days)
 
 Status model + kanban + table + CSV export. Deadline and follow-up reminders as drafts.
-Optional read-only Gmail/IMAP ingestion for status updates. Outcome stats by source and by
-answer variant.
+Outcome stats by source.
+
+**Not built, and the M7 row above marks the milestone done without them:** the read-only
+Gmail/IMAP ingestion for status updates — there is no mail client anywhere in `apps/` or
+`packages/`, so no status ever updates itself and every transition is the user's — and the
+by-answer-variant half of the outcome stats. `computeStats` groups by source and by nothing
+else; `answer_template.variants` stores a company variant that no statistic reads. Both were
+listed here as though shipped, and docs/02 § Data flow was still telling the reader a mailbox
+would move their cards.
 
 ### M8 — Hardening & packaging (3 days)
 

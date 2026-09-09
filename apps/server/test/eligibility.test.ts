@@ -1857,6 +1857,33 @@ describe('a postdoctoral position', () => {
     // coverage everywhere else.
     expect(evaluateEligibility(input()).eligibility).not.toBe('ineligible');
   });
+
+  /**
+   * The false ineligible this rule produced, pinned so it cannot come back.
+   *
+   * A university's postdoc office hires students to run it, and the title says so: these are
+   * internships an undergraduate or a high-school student can hold, and every one of them
+   * was hard-failed and dropped out of the queue because the title also contains the word the
+   * rule reads. Hiding a job the user could have got is the worst outcome this file has.
+   *
+   * `unknown`, not `pass`: the title genuinely has two readings and nothing here can settle
+   * which, so the doubt goes to the user with the posting still in front of them.
+   */
+  it('does not hide a student post that merely mentions postdocs', () => {
+    for (const title of [
+      'Research Intern, Postdoctoral Affairs Office',
+      'Summer Intern - Postdoc Program Support',
+      'Intern, Post-Doctoral Recruiting',
+      'Postdoctoral Program Co-op',
+    ]) {
+      expect(verdict(title, 'undergrad'), title).toBe('unknown');
+      expect(verdict(title, 'high_school'), title).toBe('unknown');
+    }
+  });
+
+  it('still fails the real thing, which never calls itself an internship', () => {
+    expect(verdict('Postdoctoral Research Associate', 'undergrad')).toBe('fail');
+  });
 });
 
 describe('properties that must always hold', () => {

@@ -32,6 +32,99 @@ interface Segment {
 }
 
 /**
+ * The answer as this card receives it, plus the one field only some responses carry.
+ *
+ * `PATCH /api/answers/:id` answers with `verified`, which is false when the edit was saved
+ * without a confirmed profile and so was never read against one. Nothing between there and
+ * here keeps it: `saveAnswer` types the response as `Answer`, which does not name the field,
+ * and Applications stores `{ styleNote }` out of that response and drops the rest. Declared
+ * optional so this card can use it the moment it arrives and does not lie in the meantime.
+ */
+export type ReviewedAnswer = Answer & { verified?: boolean };
+
+/**
+ * Did the fact-check run against the text that is on screen right now?
+ *
+ * `null` is a real answer and the important one. An unchecked answer and a checked one with
+ * nothing to flag both arrive here holding `evidence: []`, and the panel printed the same
+ * sentence over both — at the gate whose entire job is telling someone what has and has not
+ * been checked before they put their name to it. So this returns `true` only on proof, and
+ * declines to answer rather than guessing.
+ *
+ * What counts as proof, and why each one:
+ *   `verified`   — the server's own statement about this text. Believed either way.
+ *   `evidence`   — a listed claim only exists because the guard produced it.
+ *   `flags`      — likewise; an ai_tell or a style_drift comes out of the same pass.
+ *   `styleNote`  — written by the same pass, and survives a save in Applications' notes.
+ *   `unresolved` — a boolean the draft response always sends, so its PRESENCE is the proof,
+ *                  not its value. `false` here means "checked, nothing left unresolved".
+ *
+ * The reuse path is why none of this can be inferred from text alone: adding a question
+ * pre-fills a previously approved answer, and when no profile is confirmed it stores that
+ * text with `evidence: []` and `flags: []` and no verification at all.
+ */
+export function wasChecked(answer: {
+  evidence: AnswerEvidence[];
+  flags: Answer['flags'];
+  styleNote?: string | null;
+  unresolved?: boolean;
+  verified?: boolean;
+}): boolean | null {
+  if (answer.verified !== undefined) return answer.verified;
+  if (answer.evidence.length > 0 || answer.flags.length > 0) return true;
+  if (answer.unresolved !== undefined) return true;
+  if (answer.styleNote) return true;
+  return null;
+}
+
+export interface EvidenceNote {
+  state: 'no-text' | 'checked' | 'unchecked' | 'unknown';
+  text: string;
+}
+
+/**
+ * What the evidence column says when it has no claims to list.
+ *
+ * One sentence used to cover four situations: no answer written yet, an answer checked and
+ * found to need no backing, an answer saved without a confirmed profile and so never read
+ * against one, and an answer whose payload simply does not say. "Nothing to check yet.
+ * Claims appear here as soon as there is text." is true of the first, reassuring and false
+ * about the third, and flatly self-contradicting on the other two, where there IS text.
+ */
+export function evidenceNote(answer: {
+  text: string;
+  evidence: AnswerEvidence[];
+  flags: Answer['flags'];
+  styleNote?: string | null;
+  unresolved?: boolean;
+  verified?: boolean;
+}): EvidenceNote {
+  if (answer.text.trim().length === 0) {
+    return {
+      state: 'no-text',
+      text: 'Nothing to check yet. Claims appear here as soon as there is text.',
+    };
+  }
+  const checked = wasChecked(answer);
+  if (checked === true) {
+    return {
+      state: 'checked',
+      text: 'Read against your profile, and no claim in it needed backing.',
+    };
+  }
+  if (checked === false) {
+    return {
+      state: 'unchecked',
+      text: 'Not read against your profile — that needs a confirmed one (G1). Nothing here backs a word of this yet.',
+    };
+  }
+  return {
+    state: 'unknown',
+    text: 'No claims are listed against this text. That may mean the check found nothing needing backing, or that it has not run on this version — nothing here says which. Saving it again runs it.',
+  };
+}
+
+/**
  * Splits the answer into highlighted claims and the plain text between them.
  *
  * Spans are found here rather than trusted from the server: the user edits this text
@@ -65,7 +158,7 @@ function sameWords(a: string, b: string): boolean {
   return (a.match(/\S+/g) ?? []).join(' ') === (b.match(/\S+/g) ?? []).join(' ');
 }
 
-function EditMeter({ answer }: { answer: Answer }) {
+function EditMeter({ answer }: { answer: ReviewedAnswer }) {
   const draftWords = (answer.draftText.match(/\S+/g) ?? []).length;
   if (draftWords === 0) return null;
   const pct = Math.min(100, Math.round((answer.editDistance / draftWords) * 100));
@@ -109,7 +202,7 @@ export function AnswerReview({
   onUnapprove,
   onDelete,
 }: {
-  answer: Answer;
+  answer: ReviewedAnswer;
   canDraft: boolean;
   /**
    * The one action in flight anywhere on the page, as `verb:answerId`, or null.
@@ -425,8 +518,19 @@ export function AnswerReview({
           <aside className="bg-sunk/40 px-5 py-5">
             <p className="u-eyebrow mb-3">Evidence</p>
             {answer.evidence.length === 0 ? (
-              <p className="text-faint text-sm">
-                Nothing to check yet. Claims appear here as soon as there is text.
+              /* Four states behind what used to be one sentence — see `evidenceNote`. Only
+                 the definite negative is coloured: an answer that has not been read against
+                 the profile is a warning, and an answer whose payload cannot say either way
+                 is an absence of information rather than bad news, so it is not dressed as
+                 one. Neither blocks the gate — approving re-verifies on the server — but the
+                 user is deciding whether to stand behind the sentence, and what has actually
+                 been checked is the thing they are entitled to know. */
+              <p
+                className={`text-sm ${
+                  evidenceNote(answer).state === 'unchecked' ? 'text-caution' : 'text-faint'
+                }`}
+              >
+                {evidenceNote(answer).text}
               </p>
             ) : (
               <ol className="space-y-3">

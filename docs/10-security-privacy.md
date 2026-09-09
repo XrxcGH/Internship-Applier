@@ -34,6 +34,7 @@ data/                          # gitignored in full
 ├─ resumes/                    # original uploads
 ├─ artifacts/                  # reserved; nothing writes here yet (see below)
 ├─ browser-profile/            # Playwright persistent context + storage state
+├─ scratch/                    # PLAINTEXT prompts for the CLI backend (see below)
 └─ .master.key                 # ONLY when the OS credential store was unavailable
 ```
 
@@ -41,6 +42,17 @@ data/                          # gitignored in full
 is ever captured either (docs/07 § The submit gate). The directory is empty on every
 install, and the deletion routine still clears it so that stays true if something starts
 writing there.
+
+**`scratch/` is the one directory here that holds decrypted PII in a plain file, and this
+inventory used to leave it out.** The Claude Code CLI takes its system prompt from a file
+rather than from stdin, so `claudeCli.ts` writes one into `data/scratch/ia-claude-*/` per
+call. For drafting that prompt carries the user's name, their city, the evidence facts, and
+up to three DECRYPTED writing samples. Each run removes its own directory in a `finally`, so
+what survives is what a process killed mid-generation left behind — which is exactly the
+case an inventory is read for. It lives under `DATA_DIR` for that reason and not in
+`%TEMP%`: `config.ts` insists every path derive from one root, and a plaintext copy of the
+user's own writing stranded outside it would sit somewhere "delete everything" does not
+look, while that endpoint went on promising no copy is kept anywhere.
 
 **Field-level encryption.** Columns marked 🔒 in doc 03 are encrypted with AES-256-GCM
 before insert and decrypted on read. Each value gets a fresh 96-bit nonce; the row id is
@@ -267,8 +279,11 @@ applications or missed ones.
 - **Export everything** — `GET /api/privacy/export` returns a single JSON file containing all
   stored data, decrypted, for the user to keep.
 - **Delete everything** — `POST /api/privacy/delete-all` with a typed confirmation string
-  wipes every table in `app.db`, `resumes/`, `artifacts/`, `browser-profile/`, and the keychain
-  entries. Files are removed, not just unlinked from the DB.
+  wipes every table in `app.db`, `resumes/`, `artifacts/`, `browser-profile/`, `scratch/`,
+  and the keychain entries. Files are removed, not just unlinked from the DB. `scratch/` is
+  named here for the same reason it is named in the tree above: it is the directory that can
+  be holding a decrypted writing sample when the wipe runs, so a list of what gets destroyed
+  that leaves it out is exactly the list a user would be wrong to trust.
 - **Per-item deletion** for resumes (`DELETE /api/resumes/:id`), writing samples
   (`DELETE /api/writing-samples/:id`), individual drafted answers
   (`DELETE /api/answers/:id`), and saved answer templates

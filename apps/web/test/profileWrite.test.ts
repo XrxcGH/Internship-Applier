@@ -1,6 +1,6 @@
 import { CandidateProfile } from '@ia/shared';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { clearReviewFlag, saveProfile } from '../src/lib/api';
+import { blankProfile, clearReviewFlag, extractResume, saveProfile } from '../src/lib/api';
 import { clearToken } from '../src/lib/session';
 
 /**
@@ -128,5 +128,65 @@ describe('clearReviewFlag', () => {
     const cleared = await clearReviewFlag('education.0.gpa');
     expect(cleared.profile.id).toBe('p1');
     expect(cleared.withdrawnApprovals).toEqual(withdrawnApprovals);
+  });
+});
+
+/**
+ * THE OTHER RESPONSE SHAPE, AND THE FIRST THING THIS APPLICATION ASKS ANYONE TO DO.
+ *
+ * The two routes above answer with the profile at the top level. The two DRAFT routes —
+ * `POST /api/resumes/:id/extract` and `POST /api/profile/blank` — nest it, because they also
+ * carry the flag list: docs/09 line 41 documents `{ profile, needsReview }`.
+ *
+ * `extractResume` ran `readProfileWrite` on that envelope, which parses the BODY as a
+ * profile. Handed `{ profile: {...}, needsReview: [...] }` the parse throws on every required
+ * field at once, so uploading a resume to a clean install ended at a wall of raw Zod JSON on
+ * the G1 screen — with the server sitting there having read the resume correctly. Everything
+ * downstream is gated on G1, so the first action in the product broke the whole product.
+ *
+ * Nothing caught it. No web test called this function, and every server test asserted the
+ * route's JSON rather than what the client made of it: the bug lived exactly in the seam
+ * between the two suites, which is why the test lives here and asserts the real shape.
+ */
+describe('the draft-profile endpoints, which nest what the write endpoints spread', () => {
+  const envelope = {
+    profile,
+    needsReview: ['education.0.gpa', 'dateOfBirth'],
+    withdrawnApprovals: [],
+  };
+
+  it('reads a resume extraction out of its envelope', async () => {
+    stubFetch(envelope);
+    const read = await extractResume('doc1');
+    expect(read.profile.id).toBe('p1');
+    expect(read.profile.fullName).toBe('Ada Ruiz');
+    expect(read.needsReview).toEqual(['education.0.gpa', 'dateOfBirth']);
+  });
+
+  it('reads a blank profile out of the same envelope', async () => {
+    stubFetch({ ...envelope, needsReview: ['fullName', 'email'] });
+    const started = await blankProfile();
+    expect(started.profile.id).toBe('p1');
+    expect(started.needsReview).toEqual(['fullName', 'email']);
+  });
+
+  it('keeps the approvals a re-extraction withdrew', async () => {
+    // Re-reading a resume replaces every fact at once, so it withdraws more approvals than
+    // any other write. This half of the answer went missing here once already.
+    stubFetch({ ...envelope, withdrawnApprovals });
+    expect((await extractResume('doc1')).withdrawnApprovals).toEqual(withdrawnApprovals);
+  });
+
+  it('still refuses a draft whose profile is malformed', async () => {
+    stubFetch({ ...envelope, profile: { ...profile, email: 12 } });
+    await expect(extractResume('doc1')).rejects.toThrow();
+  });
+
+  /**
+   * The failure itself, pinned as the thing that must not come back: reading the envelope
+   * with the top-level reader is what shipped, and this is what it did.
+   */
+  it('is why there are two readers: the write reader cannot read this shape', () => {
+    expect(() => CandidateProfile.parse(envelope)).toThrow();
   });
 });

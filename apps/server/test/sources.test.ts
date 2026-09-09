@@ -132,6 +132,47 @@ describe('parseLocation', () => {
     expect(parseLocation('New York, NY', true).remote).toBe(true);
     expect(parseLocation('Remote', false).remote).toBe(false);
   });
+
+  /**
+   * The preposition the remote wording leaves holding a country.
+   *
+   * A live run over 2,941 postings stored forty of them as based in a town called "in USA",
+   * "in Canada" or "in UK": stripRemoteToken took "Remote" out of "Remote in USA" and handed
+   * back "in USA", which is not a country name, so the country the string actually stated was
+   * discarded and the leftover was filed as the CITY. The same shape as the "Remote job" bug
+   * one word further on, which is exactly why it survived that fix.
+   */
+  it('reads the country out of a remote string, rather than a town called "in USA"', () => {
+    for (const [raw, country] of [
+      ['Remote in USA', 'USA'],
+      ['Remote in Canada', 'Canada'],
+      ['Remote in UK', 'UK'],
+      ['Remote within USA', 'USA'],
+      ['Remote anywhere in Canada', 'Canada'],
+      ['Remote based in Germany', 'Germany'],
+    ] as const) {
+      expect(parseLocation(raw), raw).toEqual({ country, remote: true });
+    }
+  });
+
+  it('keeps the city when a preposition introduces a real one', () => {
+    expect(parseLocation('Remote in Portland, OR')).toMatchObject({
+      city: 'Portland',
+      region: 'OR',
+      remote: true,
+    });
+  });
+
+  /**
+   * The guard against the rule reaching too far. Independence, Indianapolis and Inglewood are
+   * real towns that begin with the letters of a preposition, and the space is the only thing
+   * standing between them and being trimmed down to "dependence", "dianapolis" and "glewood".
+   */
+  it('leaves a town alone whose name merely starts with a preposition', () => {
+    expect(parseLocation('Remote or Independence, MO')).toMatchObject({ city: 'Independence' });
+    expect(parseLocation('Indianapolis, IN')).toMatchObject({ city: 'Indianapolis', region: 'IN' });
+    expect(parseLocation('Inglewood, CA')).toMatchObject({ city: 'Inglewood', region: 'CA' });
+  });
 });
 
 /**

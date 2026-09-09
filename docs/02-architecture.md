@@ -170,7 +170,8 @@ internship-applier/
 │  │     │  │  ├─ sources/           # ats.ts, aggregators.ts, types.ts (doc 04)
 │  │     │  │  ├─ queryPlanner.ts    # profile → search targets
 │  │     │  │  ├─ resolveCompany.ts  # company name → board slug, by probing
-│  │     │  │  ├─ manualPosting.ts   # the paste-a-URL path
+│  │     │  │  ├─ manualPosting.ts   # paste-a-URL (fetched) and paste-the-text (never is)
+│  │     │  │  ├─ sourcingPolicy.ts  # the hosts nothing in this app opens (doc 10)
 │  │     │  │  ├─ normalize.ts       # source payload → JobPosting
 │  │     │  │  ├─ dedupe.ts          # URL → fingerprint → title-token match
 │  │     │  │  ├─ refresh.ts         # re-check open/closed, deadlines
@@ -190,7 +191,7 @@ internship-applier/
 │  │     │  │  ├─ draft.ts           # generate answer from question + profile
 │  │     │  │  ├─ factGuard.ts       # claim → profile evidence, or flag
 │  │     │  │  ├─ tellScrub.ts       # machine-sounding phrasing
-│  │     │  │  └─ styleCritic.ts     # measure draft vs StyleProfile, revise
+│  │     │  │  └─ styleCritic.ts     # measure draft vs StyleProfile → flags only
 │  │     │  ├─ filling/
 │  │     │  │  ├─ browser.ts         # Playwright lifecycle, persistent context
 │  │     │  │  ├─ formMap.ts         # DOM → FormField[] semantic map
@@ -216,7 +217,8 @@ internship-applier/
 │  ├─ shared/                        # Zod schemas + TS types used by both apps
 │  └─ fixtures/                      # local mock application site for tests
 ├─ docs/
-└─ data/                             # gitignored: app.db, resumes/, browser-profile/
+└─ data/                             # gitignored: app.db, resumes/, artifacts/,
+                                     #   browser-profile/, scratch/ — doc 10 § Data at rest
 ```
 
 ## Data flow: one application, end to end
@@ -226,18 +228,28 @@ internship-applier/
 2. **G1 · Confirm.** UI shows the extracted profile in an editable form. User corrects it,
    adds DOB, work authorization, availability window, location preferences. Saved as
    confirmed.
-3. **Discover.** `queryPlanner` turns the profile into source queries. Worker fans out
-   across source adapters, normalizes results into `job_posting`, dedupes.
+3. **Discover.** `queryPlanner` turns the profile into source queries. `runDiscovery` fans
+   out over four concurrent targets, normalizes results into `job_posting`, dedupes. The
+   fan-out lives inside the request that asked for it — this said "worker", which is the one
+   word § Notable stack decisions spends a paragraph saying was never built.
 4. **Match.** For each new posting: `requirements` extracts structured requirements from the
    JD; `eligibility` runs hard rules (pure functions); survivors get a `score` with a
    per-dimension breakdown and a `rationale`.
 5. **G2 · Approve.** Matches land in the review queue. User approves, skips, or rejects with
-   a reason (rejection reasons feed preference learning).
+   a reason. The reason and its tags are stored on the `decision` row and **nothing reads
+   them**: `score.ts` never sees a decision, and no query in the server joins that table.
+   This step used to say they "feed preference learning", which is a promise that ranking
+   improves as you triage — so a user giving honest reject reasons was paying a real cost
+   into a mechanism that does not exist.
 6. **Draft.** Approving creates an application and nothing else — it opens no browser, drafts
    nothing and submits nothing (docs/08 § Queue). Questions are added by the user or read off
    the `FormMap` a fill run builds, and each answer is drafted on request, one call per
    answer: retrieve relevant profile facts → generate in the user's `StyleProfile` →
-   `factGuard` verifies → `styleCritic` revises.
+   `factGuard` verifies → `tellScrub` flags machine register, and between them those two get
+   one revision pass. `styleCritic` is **not** in that chain and revises nothing: it runs
+   later, in `routes/answers.ts`, and every drift it measures becomes a flag the user reads
+   at G3 (docs/06 § ⑤). Written the old way round, the pipeline read as though something
+   rewrote the draft toward the voice target before anyone saw it.
 7. **G3 · Review.** Answer workspace shows each question, the draft, the supporting profile
    evidence, and any unsupported-claim flags. User edits and approves each one.
 8. **Fill.** The visible browser fills the form field by field. Redlined fields
@@ -247,8 +259,13 @@ internship-applier/
    browser themselves. The tool records the submission afterwards, when the user says so.
    (No screenshot is captured; `application.screenshot_path` exists in the schema and is
    never written. See docs/07 § G4.)
-10. **Track.** Application moves through the tracker; optional read-only email ingestion
-    updates status; deadline and follow-up reminders surface as drafts only.
+10. **Track.** Application moves through the tracker, every transition entered by the user
+    and checked against the status model. Deadline and follow-up reminders surface as drafts
+    only — `GET /api/applications/:id/draft-message` returns text and nothing sends it.
+    **Not built:** the read-only email ingestion this step listed as optional. No IMAP or
+    Gmail client exists in `apps/` or `packages/`, so no status ever updates itself, and a
+    reader who took this literally would have been waiting for a mailbox to move a card that
+    only they can move.
 
 ## Concurrency and rate limiting
 

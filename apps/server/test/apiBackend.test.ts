@@ -26,6 +26,11 @@ const h = vi.hoisted(() => ({
     usage: { input_tokens: 10, output_tokens: 5 },
   } as Record<string, unknown>,
   hasKey: true,
+  /** What the live key check runs into, and how many times it has been run. */
+  probeFails: null as { status?: number; message: string } | null,
+  probes: 0,
+  /** What a real generate runs into. The API answers 401 for a key it will not take. */
+  createFails: null as { status?: number; message: string } | null,
 }));
 
 vi.mock('../src/infra/llm/client', async (importOriginal) => {
@@ -37,15 +42,41 @@ vi.mock('../src/infra/llm/client', async (importOriginal) => {
       messages: {
         create: (body: Record<string, unknown>) => {
           h.sent.push(body);
+          if (h.createFails) return Promise.reject(Object.assign(new Error('x'), h.createFails));
           return Promise.resolve(h.reply);
+        },
+      },
+      // GET /v1/models: authenticated, not billed, and the smallest thing that can tell a
+      // live key from a dead one.
+      models: {
+        list: () => {
+          h.probes += 1;
+          if (h.probeFails) return Promise.reject(Object.assign(new Error('x'), h.probeFails));
+          return Promise.resolve({ data: [] });
         },
       },
     }),
   };
 });
 
-const { apiBackend } = await import('../src/infra/llm/apiBackend');
+/**
+ * The suite pins LLM_PROVIDER=none (vitest.setup.ts), which is right everywhere else and
+ * would make every question in this file answer itself: the resolver short-circuits before
+ * it ever looks at a key. This file is about what the API path does when it IS the path, so
+ * only that one field is overridden — `paths` and the rest stay real, and the override is
+ * local to this test file.
+ */
+vi.mock('../src/config', async (importOriginal) => {
+  const real = await importOriginal<{ config: { llm: Record<string, unknown> } }>();
+  return {
+    ...real,
+    config: { ...real.config, llm: { ...real.config.llm, provider: 'api' } },
+  };
+});
+
+const { apiBackend, apiKeyRejected } = await import('../src/infra/llm/apiBackend');
 const { NoModelAccessError } = await import('../src/infra/llm/provider');
+const { describeAccess, modelAccessLikely, resetBackend } = await import('../src/infra/llm');
 const { runMigrations } = await import('../src/infra/db/migrate');
 
 let dir: string;
@@ -58,6 +89,12 @@ beforeAll(() => {
 beforeEach(() => {
   h.sent = [];
   h.hasKey = true;
+  h.probeFails = null;
+  h.createFails = null;
+  h.probes = 0;
+  // Drops both the cached backend choice and the cached verdict on the key, which are
+  // process-wide and would otherwise leak the previous test's 401 into this one.
+  resetBackend();
   dir = mkdtempSync(path.join(tmpdir(), 'ia-apibackend-'));
 });
 
@@ -178,5 +215,128 @@ describe('when there is no key', () => {
       .then(() => {
         expect(h.sent).toHaveLength(0);
       });
+  });
+});
+
+/**
+ * Whether the key WORKS, which was never the question this backend asked.
+ *
+ * `available()` was `hasApiKey()` — the presence of a string in the environment. A revoked
+ * key satisfies that, and so does one pasted a few characters short: GET /api/model-access
+ * answered that model access was available, the Draft button was offered, and the first real
+ * call was where the user found out. Under `auto` a dead key is picked up as the fallback and
+ * then reported as working access.
+ *
+ * The mirror direction is pinned just as hard, because it is the one an over-strict fix
+ * breaks: a laptop with no network, a 429, a 500 at the other end. None of those are the
+ * key's fault, and calling them one sends someone to reissue a key that was fine.
+ */
+describe('proving the key rather than trusting that one is set', () => {
+  const draft = { purpose: 'answer_draft' as const, system: 's', user: 'u' };
+
+  it('does not report a revoked key as working model access', async () => {
+    h.probeFails = { status: 401, message: 'invalid x-api-key' };
+    expect(await apiBackend.available()).toBe(false);
+    expect(apiKeyRejected()).toBe(true);
+  });
+
+  it('names that state, instead of reporting it as no key at all', async () => {
+    // "No model access configured." in front of someone looking straight at the
+    // ANTHROPIC_API_KEY line they filled in reads as the app failing to notice it.
+    h.probeFails = { status: 401, message: 'invalid x-api-key' };
+    const access = await describeAccess();
+    expect(access.available).toBe(false);
+    expect(access.description).toMatch(/ANTHROPIC_API_KEY/);
+    expect(access.description).toMatch(/rejected/i);
+  });
+
+  it('reports a key that works as working, which is the direction that must not break', async () => {
+    expect(await apiBackend.available()).toBe(true);
+    const access = await describeAccess();
+    expect(access.available).toBe(true);
+    expect(access.provider).toBe('api');
+  });
+
+  for (const [what, failure] of [
+    ['a machine with no network', { message: 'getaddrinfo ENOTFOUND api.anthropic.com' }],
+    ['a rate-limited key, which is a working key', { status: 429, message: 'slow down' }],
+    ['an outage at the other end', { status: 500, message: 'internal server error' }],
+  ] as Array<[string, { status?: number; message: string }]>) {
+    it(`does not call the key bad because of ${what}`, async () => {
+      h.probeFails = failure;
+      expect(await apiBackend.available()).toBe(true);
+      expect(apiKeyRejected()).toBe(false);
+    });
+  }
+
+  it('checks once and remembers, and forgets again when asked to', async () => {
+    // This runs behind a settings screen and behind every draft; it cannot be a round trip
+    // each time. It also cannot be permanent, or a corrected key needs a restart — the
+    // Test button calls resetBackend() for exactly that.
+    await apiBackend.available();
+    await apiBackend.available();
+    expect(h.probes).toBe(1);
+
+    resetBackend();
+    await apiBackend.available();
+    expect(h.probes).toBe(2);
+  });
+
+  it('does not go looking when there is no key to check', async () => {
+    h.hasKey = false;
+    expect(await apiBackend.available()).toBe(false);
+    expect(h.probes).toBe(0);
+  });
+
+  it('stops calling drafting likely once the key is known bad', async () => {
+    // `modelAccessLikely` is sync and deliberately optimistic — it only gates whether a
+    // button is offered. Optimism has one limit: a key the API has already answered 401 for
+    // is not a maybe.
+    expect(modelAccessLikely()).toBe(true);
+    h.probeFails = { status: 401, message: 'invalid x-api-key' };
+    await apiBackend.available();
+    expect(modelAccessLikely()).toBe(false);
+  });
+
+  /**
+   * The other half: a key can be revoked between the check and the draft, and a cached
+   * backend skips the check entirely. Left alone the user got the SDK's own
+   * `AuthenticationError: 401 {"type":"error",...}` rendered into the answer pane.
+   */
+  it('turns a 401 on a real call into a sentence, and marks it a setup problem', async () => {
+    h.createFails = { status: 401, message: '401 {"type":"error","error":{}}' };
+    const err = await apiBackend
+      .generate(draft)
+      .then(() => null)
+      .catch((e: unknown) => e as InstanceType<typeof NoModelAccessError>);
+
+    expect(err).toBeInstanceOf(NoModelAccessError);
+    expect(err!.reason).toBe('no_key');
+    expect(err!.isSetupProblem).toBe(true);
+    expect(err!.message).toMatch(/rejected/i);
+    expect(err!.message).toMatch(/console\.anthropic\.com/);
+  });
+
+  it('latches unavailable after that, so the seam stops choosing it', async () => {
+    // The same latch the CLI backend keeps for a signed-out install, and for the same
+    // reason: until `available()` says false, `auto` goes on shadowing whatever else works.
+    expect(await apiBackend.available()).toBe(true);
+    h.createFails = { status: 401, message: 'nope' };
+    await apiBackend.generate(draft).catch(() => undefined);
+    expect(await apiBackend.available()).toBe(false);
+  });
+
+  it('leaves an overload alone — it is not the key, and it comes back on its own', async () => {
+    h.createFails = { status: 529, message: 'overloaded_error' };
+    const err = await apiBackend
+      .generate(draft)
+      .then(() => null)
+      .catch((e: unknown) => e);
+
+    // Passed through as itself: turning it into "your key was rejected" would be a wrong
+    // diagnosis with a confident remedy.
+    expect(err).not.toBeInstanceOf(NoModelAccessError);
+    expect(apiKeyRejected()).toBe(false);
+    expect(await apiBackend.available()).toBe(true);
   });
 });

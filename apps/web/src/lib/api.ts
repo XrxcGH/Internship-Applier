@@ -88,13 +88,17 @@ export async function uploadResume(file: File): Promise<{ documentId: string }> 
  * place a fact goes missing.
  */
 export const extractResume = (id: string) =>
-  request<unknown>(`/api/resumes/${id}/extract`, { method: 'POST' }).then((body) => {
-    const r = body as { needsReview?: string[] } | null;
-    return {
-      ...readProfileWrite(body),
-      needsReview: r?.needsReview ?? [],
-    };
-  });
+  request<unknown>(`/api/resumes/${id}/extract`, { method: 'POST' }).then(readDraftProfile);
+
+/**
+ * The same draft an extraction produces, with nothing in it.
+ *
+ * For the machine with no model, where the dropzone cannot work. Shaped exactly like
+ * `extractResume` so the screen that consumes it does not have to know which of the two it
+ * called — the difference between them is how full the profile arrives, not what it is.
+ */
+export const blankProfile = () =>
+  request<unknown>('/api/profile/blank', { method: 'POST' }).then(readDraftProfile);
 
 export const getProfile = () =>
   request<unknown>('/api/profile')
@@ -137,6 +141,39 @@ function readProfileWrite(body: unknown): ProfileWrite {
   return {
     profile: CandidateProfile.parse(body),
     withdrawnApprovals: Array.isArray(withdrawn) ? (withdrawn as WithdrawnApproval[]) : [],
+  };
+}
+
+/** A draft profile, plus the flags the reader raised on it. */
+export interface DraftProfileRead extends ProfileWrite {
+  needsReview: string[];
+}
+
+/**
+ * THE TWO PROFILE RESPONSE SHAPES ARE NOT THE SAME, AND THIS IS THE OTHER ONE.
+ *
+ * `PUT /api/profile` and `POST /api/profile/reviewed/:path` answer with the profile at the
+ * top level. The two draft endpoints — resume extraction and the blank profile — answer with
+ * it NESTED, as `{ profile, needsReview }`, because they also have to carry the flag list;
+ * docs/09 line 41 documents that shape.
+ *
+ * `extractResume` called `readProfileWrite`, which runs `CandidateProfile.parse` on the body
+ * itself. Handed the envelope, that parse throws — so uploading a resume, the first thing
+ * this application asks anyone to do, ended at a wall of raw Zod JSON on the G1 screen while
+ * the server sat there having read the resume perfectly. It reproduced on the first upload
+ * to a clean install, every time, and nothing caught it: no web test exercised this function,
+ * and every server-side test asserted the route's JSON rather than what the client made of
+ * it, which is exactly the seam the bug lived in.
+ *
+ * Two readers, named for the two shapes, so the next endpoint has to pick one on purpose.
+ */
+function readDraftProfile(body: unknown): DraftProfileRead {
+  const r = body as { profile?: unknown; needsReview?: unknown } | null;
+  const withdrawn = (body as { withdrawnApprovals?: unknown } | null)?.withdrawnApprovals;
+  return {
+    profile: CandidateProfile.parse(r?.profile),
+    withdrawnApprovals: Array.isArray(withdrawn) ? (withdrawn as WithdrawnApproval[]) : [],
+    needsReview: Array.isArray(r?.needsReview) ? (r.needsReview as string[]) : [],
   };
 }
 
@@ -279,6 +316,15 @@ export interface ApplicationDetail {
   skippedFields: SkippedField[];
   canDraft: boolean;
   modelAccess: ModelAccess;
+  /**
+   * Where this application has got to, from the endpoint that loaded it.
+   *
+   * The detail screen used to read these off the summary list beside it, which is only
+   * right while that list is loaded and contains this row — otherwise an application the
+   * user has already submitted rendered as unsubmitted.
+   */
+  status: string;
+  submittedAt: string | null;
 }
 
 export const getModelAccess = () => request<ModelAccess>('/api/model-access');

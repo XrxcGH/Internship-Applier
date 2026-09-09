@@ -118,6 +118,33 @@ async function readCapped(
 }
 
 /**
+ * Could this body be text at all, or is it bytes?
+ *
+ * Nothing looked at Content-Type, so whatever came back with a 200 was decoded as UTF-8 and
+ * stored as the posting's description. A careers link that turns out to be
+ * `application/pdf` put `%PDF-1.4` and the replacement character through `stripHtml` and into
+ * the description a student reads at G3 — and requirement extraction ran over the same
+ * mojibake, which is the reason this is not merely cosmetic: a phrase invented by a decoder
+ * is not something the posting says, and eligibility is decided on it.
+ *
+ * The list is an allowlist because the failure it guards is "these bytes are not language",
+ * and the interesting half is why it is not `text/*` plus `application/json`: USAJOBS answers
+ * `application/hal+json` and Atom and RSS feeds answer `+xml`, so an equality check on
+ * `application/json` would have refused every federal posting — a false failure of exactly the
+ * kind this repo cares more about than the one it is fixing. `+json` and `+xml` are the
+ * structured-suffix registrations from RFC 6838 § 4.2.8, so the rule is the standard's, not a
+ * list of vendors to keep adding to.
+ *
+ * A response that names no type at all is allowed through by the caller below, and only a
+ * response that names one this does not recognise is refused. A server that said nothing has
+ * not said "binary", and small employer sites omit the header.
+ */
+function isTextualType(mediaType: string): boolean {
+  if (mediaType.startsWith('text/')) return true;
+  return /^application\/(?:json|xml|[\w.+-]+\+(?:json|xml))$/.test(mediaType);
+}
+
+/**
  * A byte count a person can read, in the unit that suits it.
  *
  * `Math.round(limit / 1024 / 1024)` was the whole of this, and the robots.txt cap is 512KB —
@@ -668,11 +695,35 @@ export async function politeFetch(url: string, opts: FetchOptions = {}): Promise
     await takeToken(host, opts.rps ?? DEFAULT_RPS);
 
     try {
+      /**
+       * A caller's header REPLACES the default of the same name, whatever case it spells it in.
+       *
+       * `...opts.headers` reads as if it did that, and does only when the spelling happens to
+       * match. The USAJOBS adapter sends `'User-Agent'`, capitalised the way the vendor's own
+       * docs write it, so the object carried `user-agent` AND `User-Agent` as two distinct
+       * keys — and undici's `Headers` lowercases them into one and APPENDS. Measured, the
+       * request went out with
+       *
+       *     user-agent: internship-applier/0.1 (+local personal job-search tool), <registered agent>
+       *
+       * USAJOBS requires the User-Agent to be the address registered against the API key, and
+       * that joined string is not it, so the one source of federal internships and Pathways
+       * identifies itself as something neither side ever configured.
+       *
+       * Normalising rather than special-casing user-agent, because every default here has the
+       * same shape and the same adapter proves it: its `Accept: application/json` arrived with
+       * this function's whole default accept list joined in front of it. A caller spelling
+       * `Content-Type`, `If-None-Match` or `If-Modified-Since` would have joined ours the same
+       * way — and for a conditional header, a joined value is one no server can match, so a
+       * revalidation would silently stop revalidating.
+       */
       const headers: Record<string, string> = {
         'user-agent': USER_AGENT,
         accept: 'application/json, text/html;q=0.9, */*;q=0.5',
-        ...opts.headers,
       };
+      for (const [name, value] of Object.entries(opts.headers ?? {})) {
+        headers[name.toLowerCase()] = value;
+      }
       if (hit?.etag) headers['if-none-match'] = hit.etag;
       if (hit?.lastModified) headers['if-modified-since'] = hit.lastModified;
 
@@ -823,6 +874,34 @@ export async function politeFetch(url: string, opts: FetchOptions = {}): Promise
       }
 
       if (!res.ok) throw new HttpError(`${res.status} ${res.statusText}`, res.status, url);
+
+      /**
+       * What came back has to be capable of being a posting before it is read as one.
+       *
+       * Checked here and NOT in `fetchRobots`, deliberately: a robots.txt this refused would be
+       * an unreadable robots.txt, which this file treats as a complete disallow, so a host
+       * serving its rules as `application/octet-stream` — or as a `text/html` soft-404 page —
+       * would take that whole employer's site dark. The direction of harm is opposite in the
+       * two places, so the rule is applied in only one of them.
+       *
+       * Refused before the body is read, so a 300MB video is never decoded at all, and the
+       * stream is cancelled so the socket closes rather than being left to run — the same care
+       * `readCapped` takes on its way out. Not retryable: the same URL answers with the same
+       * PDF five times, and five backoff sleeps only delay the message the user needs to see.
+       */
+      const mediaType = (res.headers.get('content-type') ?? '').split(';')[0]!.trim().toLowerCase();
+      if (mediaType !== '' && !isTextualType(mediaType)) {
+        await res.body?.cancel().catch(() => undefined);
+        throw new HttpError(
+          `This address answered with ${mediaType}, not a page, so nothing was read from it. ` +
+            'Its bytes would have been stored as the posting description and read as its ' +
+            'requirements. If the posting is a PDF or another download, open the page that ' +
+            'links to it and use that address instead.',
+          415,
+          url,
+          { retryable: false },
+        );
+      }
 
       const body = await readCapped(res, MAX_BODY_BYTES, url, 'page');
       if (opts.jsonBody === undefined) {

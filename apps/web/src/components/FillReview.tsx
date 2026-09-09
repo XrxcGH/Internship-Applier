@@ -123,6 +123,19 @@ export function FillReview({
    * landing in that moment closed the browser the user had just signed into.
    */
   const [checked, setChecked] = useState(false);
+  /**
+   * Whether that first question came back at all, as opposed to came back "no run".
+   *
+   * `checked` was set in `finally`, so a failed check was indistinguishable from a clean
+   * "nothing open" — the same hole the panel already guards against DURING the request, one
+   * step later. The screen then drew the card offering "Open and read the form" over a browser
+   * it had simply failed to ask about, and starting a run discards the one already open: the
+   * user signs in at a login wall, the poll or the reload trips on a dropped request, and the
+   * button in front of them closes the browser they just signed into.
+   */
+  const [checkFailed, setCheckFailed] = useState(false);
+  /** Bumped by the "Try again" below, which is what re-asks — the check is the retry. */
+  const [checkAttempt, setCheckAttempt] = useState(0);
   /** Set once the poll below has given up, so nothing on screen goes on promising to update itself. */
   const [pollLost, setPollLost] = useState(false);
   /**
@@ -158,12 +171,15 @@ export function FillReview({
   useEffect(() => {
     let cancelled = false;
     setChecked(false);
+    setCheckFailed(false);
     getFill(applicationId)
       .then((r) => {
         if (!cancelled) setRun(r);
       })
       .catch((err: unknown) => {
-        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+        if (cancelled) return;
+        setError(err instanceof Error ? err.message : String(err));
+        setCheckFailed(true);
       })
       .finally(() => {
         if (!cancelled) setChecked(true);
@@ -171,7 +187,7 @@ export function FillReview({
     return () => {
       cancelled = true;
     };
-  }, [applicationId]);
+  }, [applicationId, checkAttempt]);
 
   /**
    * Follows a run this screen is not the one driving.
@@ -337,7 +353,40 @@ export function FillReview({
         </div>
       )}
 
-      {checked && !run && submitted === null && (
+      {/* The one card that must not appear over an unanswered question. Everything else on
+          this screen is a report; this is the control that discards whatever run is already
+          open, so it is the one place where "I could not find out" has to be said out loud
+          instead of being rendered as "there is nothing open". */}
+      {checked && checkFailed && submitted === null && (
+        <div className="u-card-flat px-5 py-5">
+          <p className="u-eyebrow mb-2">Could not tell</p>
+          <p className="text-dim u-prose">
+            This panel asked the server whether a browser is already open on this application and
+            got no answer. Starting a fill closes any run that is open, so nothing is offered here
+            until the question has one.
+          </p>
+          <div className="mt-4 flex flex-wrap gap-3">
+            <Button disabled={busy !== null} onClick={() => setCheckAttempt((n) => n + 1)}>
+              Ask again
+            </Button>
+            {/* Kept here rather than only on the card this one replaces. Holding back the
+                fill is the safe move; holding back the link to the posting as well would
+                leave a user whose server has stopped answering with no way forward at all,
+                and opening it themselves spends nothing and closes no browser. */}
+            <a
+              href={applyUrl}
+              target="_blank"
+              rel="noreferrer noopener"
+              className="u-data border-rule text-dim hover:text-ink hover:border-rule-strong hover:bg-ink/[0.04] inline-flex items-center rounded border px-4 py-2 tracking-wide uppercase transition-colors"
+            >
+              Open posting myself
+              <ExternalLink aria-hidden size={14} />
+            </a>
+          </div>
+        </div>
+      )}
+
+      {checked && !checkFailed && !run && submitted === null && (
         <div className="u-card-flat px-5 py-5">
           <p className="text-dim u-prose">
             This opens the application page in a browser you can watch, reads the form, and shows

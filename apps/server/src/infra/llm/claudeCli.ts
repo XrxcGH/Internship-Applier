@@ -331,6 +331,38 @@ export function notLoggedInMessage(text: string): string | null {
   );
 }
 
+/**
+ * What to say when the CLI failed and told us nothing whatsoever about why.
+ *
+ * Measured on a real machine, not imagined: the first resume extraction of the session
+ * exited 1 after 57 seconds with EMPTY stdout and EMPTY stderr, so the detail chain below
+ * fell through to its last link and the entire sentence a person got was "The Claude CLI
+ * reported an error: exit code 1". The identical request succeeded forty seconds later, so
+ * whatever it was, it was transient. The number names no cause, and the one action that
+ * actually works — do it again — was the one thing the message did not mention.
+ *
+ * It says no more than that on purpose. The process gave no reason, so anything here about
+ * credentials, the network or the account would be a diagnosis invented in this file. The
+ * exit code stays in for a bug report; the rest is only what is known.
+ *
+ * SIBLINGS COVERED, both written the same way and both reached by the same empty-handed
+ * failure:
+ *   - `exit code ${String(r.code)}` renders the literal word "null" when the child died on
+ *     a signal instead of exiting, which is the same non-explanation with a worse noun;
+ *   - an exit-0 run that printed nothing at all used to land in the `unreadable` branch and
+ *     be reported as "it may have been updated to a different output format" — a confident
+ *     claim about a program that produced no output to have a format.
+ */
+export function silentFailure(code: number | null): string {
+  const how = code === null ? 'it was killed before it could exit' : `exit code ${String(code)}`;
+  return (
+    `The Claude CLI stopped without saying why: no output, no error text (${how}).\n\n` +
+    'This is usually transient — the same request generally works on the next attempt, so ' +
+    'try again. If it keeps happening, run `claude` once in a terminal and see whether it ' +
+    'answers there.'
+  );
+}
+
 // ─────────────────────────────────────────────────────────────────── the backend
 
 /** Short, fixed, and safe on any command line. The real content arrives on stdin. */
@@ -551,16 +583,30 @@ export const claudeCliBackend: Backend = {
       // no output and "the output format must have changed" is then exactly the wrong
       // thing to tell someone. Order matters more than either message.
       if (env?.is_error === true || r.code !== 0) {
-        const detail =
-          (env ? extractText(env) : '') || r.stderr.trim() || `exit code ${String(r.code)}`;
+        // The chain is right in structure — the CLI's own words first, then whatever it put
+        // on stderr — but the last link used to be the exit code, and that link is the one
+        // that reaches a person. See `silentFailure` for the run that produced neither.
+        const detail = (env ? extractText(env) : '') || r.stderr.trim();
         logger.error(
-          { code: r.code, detail: detail.slice(0, 300) },
+          { code: r.code, detail: detail.slice(0, 300) || '(no output on either stream)' },
           'claude cli reported an error',
         );
-        throw new NoModelAccessError(`The Claude CLI reported an error: ${detail}`, 'cli_error');
+        throw new NoModelAccessError(
+          detail ? `The Claude CLI reported an error: ${detail}` : silentFailure(r.code),
+          'cli_error',
+        );
       }
 
       if (!env) {
+        // Exit 0 and not one byte on either stream. That is the same silent failure as the
+        // branch above wearing a success code, and the message below — written for output
+        // whose SHAPE changed — would tell the user their CLI has been updated to a
+        // different output format, on the evidence of no output at all.
+        if (!r.stdout.trim() && !r.stderr.trim()) {
+          logger.error({ code: r.code }, 'claude cli produced no output at all');
+          throw new NoModelAccessError(silentFailure(r.code), 'cli_error');
+        }
+
         logger.error(
           { code: r.code, stdout: r.stdout.slice(0, 400), stderr: r.stderr.slice(0, 400) },
           'could not parse Claude CLI output',

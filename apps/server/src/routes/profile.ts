@@ -189,6 +189,47 @@ export async function profileRoutes(app: FastifyInstance): Promise<void> {
     return p;
   });
 
+  /**
+   * A profile to fill in by hand, for anyone who cannot have one read for them.
+   *
+   * `GET /api/model-access` has always answered a machine with no model by saying "Resume
+   * reading is unavailable, so profile fields must be entered by hand." There was no by-hand
+   * path. Onboarding.tsx moves off its first step only through `onExtracted`, which only a
+   * successful model call fires, so a user with no Claude CLI and no API key met a dropzone
+   * that could not work, an error telling them to do something the interface did not offer,
+   * and no way forward — and because everything downstream is gated on G1, that was the whole
+   * application. The advice was right; the route it assumed was missing.
+   *
+   * Built from the same `toDraftProfile` an extraction goes through, on purpose. A blank
+   * profile assembled anywhere else would have to restate the derived fields and the review
+   * flags, and the copy that drifted would be the one deciding whether G1 can be passed.
+   * Everything unset arrives flagged, so this is a longer road to G1, never a way around it.
+   *
+   * Nothing is stored. Like an extraction, the draft goes to the client, which sends it back
+   * through `PUT /api/profile` once the user has put something in it.
+   */
+  app.post('/api/profile/blank', async () => {
+    const { ResumeExtraction } = await import('../core/ingestion/extractProfile');
+    const { toDraftProfile } = await import('../core/ingestion/toProfile');
+    const empty = ResumeExtraction.parse({
+      fullName: null,
+      pronouns: null,
+      email: null,
+      phone: null,
+      location: null,
+      links: { github: null, linkedin: null, portfolio: null },
+      education: [],
+      experience: [],
+      projects: [],
+      skills: [],
+      certifications: [],
+      languages: [],
+      needsReview: [],
+    });
+    const profile = toDraftProfile(empty);
+    return { profile, needsReview: profile.needsReview, withdrawnApprovals: [] };
+  });
+
   app.put('/api/profile', async (req, reply) => {
     const parsed = CandidateProfile.safeParse(req.body);
     if (!parsed.success) {

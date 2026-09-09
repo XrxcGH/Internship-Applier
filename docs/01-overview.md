@@ -78,13 +78,27 @@ This section is load-bearing; treat it as a spec, not a disclaimer.
 
 ### On sourcing
 
-Discovery uses official, documented APIs (Greenhouse, Lever, Ashby, SmartRecruiters,
-Workable, USAJOBS, Adzuna, and similar) plus public job feeds and structured `JobPosting`
-JSON-LD from company career pages. It does **not** scrape sites whose terms of service
-prohibit automated access or that require authentication to view listings — notably
-LinkedIn, Indeed, and Glassdoor. Those are supported only through a manual "paste a URL"
-path where the user brings the posting themselves. Details in
-[`04-job-discovery.md`](04-job-discovery.md).
+Discovery uses official, documented APIs (Greenhouse, Lever, Ashby, Workday,
+SmartRecruiters, Workable, USAJOBS, Adzuna, and similar) plus public job feeds and structured
+`JobPosting` JSON-LD from company career pages. It does **not** scrape sites whose terms of
+service prohibit automated access or that require authentication to view listings — notably
+LinkedIn, Indeed, Glassdoor and Handshake.
+
+There are two manual paths, and only one of them takes those postings. **Paste a URL**
+(`POST /api/discovery/manual`) fetches the address you give it, so it refuses those hosts
+outright with `SOURCE_REFUSED` before any request goes out — the refusal is a rule in
+`core/discovery/sourcingPolicy.ts` rather than a check in one adapter, because a stored
+address is fetched again later by the freshness refresh and opened by the signed-in
+form-filling browser. **Paste the text** (`POST /api/discovery/paste`) is the one that
+supports them: you read the posting there yourself, which is not automated access, and hand
+over the text. Its URL is stored as the posting's identity and never fetched.
+
+This document previously said the URL path was where LinkedIn, Indeed and Glassdoor were
+supported. It is the path that refuses them, so a reader holding exactly the posting the
+other box exists for was sent to the one box that will not take it. The running app recovers
+that reader — `AGGREGATOR_REFUSAL` names the paste-the-text box in the same sentence as the
+refusal — but the document sending them there in the first place should not have been the
+part that was wrong. Details in [`04-job-discovery.md`](04-job-discovery.md).
 
 ### On authorship and "human writing style"
 

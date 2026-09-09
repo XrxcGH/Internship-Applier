@@ -24,6 +24,17 @@ import {
 } from '../src/core/writing/answerLibrary';
 
 /**
+ * A reply is the text, or the text together with the reason the model stopped producing it.
+ *
+ * `stopReason` was hardcoded to null here, and null is the one value that can never show the
+ * defect: `draft.ts` returned `res.text` and dropped the stop reason, so an answer cut off at
+ * the token limit was stored as a finished draft and shown at G3 with nothing to say it ended
+ * where the budget did. A bare string still means a whole answer, which is what nearly every
+ * case in this file is about.
+ */
+type Reply = string | { text: string; stopReason: string | null };
+
+/**
  * A model that answers with whatever the test hands it.
  *
  * The suite pins LLM_PROVIDER=none, which is right for every other file but meant the
@@ -38,7 +49,7 @@ import {
  */
 const modelStub = vi.hoisted(() => ({
   enabled: false,
-  replies: [] as string[],
+  replies: [] as Array<string | { text: string; stopReason: string | null }>,
   calls: [] as Array<{ system: string; user: string }>,
 }));
 
@@ -57,7 +68,10 @@ vi.mock('../src/infra/llm', async (importOriginal) => {
         : actual.resolveBackend(),
     generate: async (req: { system: string; user: string }) => {
       modelStub.calls.push({ system: req.system, user: req.user });
-      return { text: modelStub.replies.shift() ?? '', stopReason: null, provider: 'api' as const };
+      const reply: Reply = modelStub.replies.shift() ?? '';
+      const { text, stopReason } =
+        typeof reply === 'string' ? { text: reply, stopReason: 'end_turn' } : reply;
+      return { text, stopReason, provider: 'api' as const };
     },
   };
 });
@@ -955,5 +969,130 @@ describe('drafting — the two names the profile cannot supply', () => {
     expect(evidenceBlock).toContain('Kestrel Analytics');
     // The posting's words reach retrieval, which is what made the two sets disagree.
     expect(modelStub.calls[0]!.user).toContain('Northwind Systems');
+  });
+});
+
+/**
+ * A draft the model was still writing.
+ *
+ * `draftAnswer` asked for the text and threw the stop reason away. So a model that ran out of
+ * output budget — `maxTokens` is `max(1500, maxWords * 6)`, and an adaptive-thinking call
+ * spends part of that before writing a word — stopped mid-sentence, and the fragment was
+ * written over `draftText`, `finalText` and `approvedAt` and rendered at G3 as a finished
+ * draft. Nothing was red, because half of a true sentence is still true: FactGuard has no
+ * opinion about an answer that stops, and the style pass reads it as a terse one. The student
+ * approves what they are shown.
+ *
+ * `extractProfile.ts` has named `max_tokens` as its own failure since the resume path was
+ * written. This is the same stop reason on the path where the text goes on to an employer.
+ */
+describe('drafting — an answer that did not come back whole', () => {
+  beforeEach(() => {
+    modelStub.enabled = true;
+    modelStub.replies = [];
+    modelStub.calls = [];
+  });
+  afterEach(() => {
+    modelStub.enabled = false;
+  });
+
+  const draft = (id: string) => app.inject({ method: 'POST', url: `/api/answers/${id}/draft` });
+  const stored = async (): Promise<Record<string, unknown>> => {
+    const res = await app.inject({ method: 'GET', url: `/api/applications/${applicationId}` });
+    return res.json().answers[0] as Record<string, unknown>;
+  };
+
+  const CUT_OFF =
+    'What draws me to Northwind Systems is the developer tooling. Last summer I built ' +
+    'internal tooling at Kestrel Analytics that let the support team resolve billing tickets ' +
+    'without an engineer, and the part I keep coming back to is the';
+
+  it('does not hand over a draft that stopped at the token limit', async () => {
+    modelStub.replies = [{ text: CUT_OFF, stopReason: 'max_tokens' }];
+    const id = await addQuestion('Why do you want to intern at Northwind Systems?');
+    const res = await draft(id);
+
+    expect(res.statusCode).toBe(502);
+    expect(res.json().error.code).toBe('DRAFT_FAILED');
+
+    // The fragment reached neither the row nor the workspace that renders it.
+    const row = await stored();
+    expect(row.text).toBe('');
+    expect(row.draftText).toBe('');
+  });
+
+  it('leaves an already approved answer exactly where it was when a redraft is cut off', async () => {
+    // The reason this fails rather than returning the fragment with a flag on it: the route
+    // writes the returned text over draftText, finalText AND approvedAt before anything looks
+    // at a flag. A student redrafting an answer they had already approved lost it to a
+    // sentence that stops mid-word, and the tick with it.
+    const approved =
+      'I interned at Kestrel Analytics, where I built internal tooling in TypeScript. ' +
+      'The support team had been filing tickets at engineers to answer billing questions, ' +
+      'so I gave them a way to resolve those themselves.';
+    const id = await addQuestion('Tell us about a project you are proud of.');
+    await write(id, approved);
+    expect(
+      (await app.inject({ method: 'POST', url: `/api/answers/${id}/approve` })).statusCode,
+    ).toBe(200);
+
+    modelStub.replies = [{ text: CUT_OFF, stopReason: 'max_tokens' }];
+    expect((await draft(id)).statusCode).toBe(502);
+
+    const row = await stored();
+    expect(row.text).toBe(approved);
+    expect(row.approvedAt).toBeTruthy();
+  });
+
+  it('does not store an empty answer as a draft', async () => {
+    modelStub.replies = [''];
+    const id = await addQuestion('Anything else you would like us to know?');
+    const res = await draft(id);
+
+    expect(res.statusCode).toBe(502);
+    expect((await stored()).text).toBe('');
+  });
+
+  it('does not store what the model wrote before it declined', async () => {
+    // A refusal is named rather than left to the empty case, because the API path can return
+    // the part it had written before it stopped — not empty, and not an answer either.
+    modelStub.replies = [{ text: 'I can help with that, but I should say', stopReason: 'refusal' }];
+    const id = await addQuestion('Why do you want to intern at Northwind Systems?');
+
+    expect((await draft(id)).statusCode).toBe(502);
+    expect((await stored()).text).toBe('');
+  });
+
+  it('keeps a whole first draft rather than a revision that stopped mid-word', async () => {
+    /**
+     * The sibling, and the one the revision loop was biased towards.
+     *
+     * `better` counts blocking claims and tells, and half an answer carries fewer of both — so
+     * a truncated revision beats a complete first draft by construction, every time. The first
+     * draft here invents Google, which the user needs to see and fix at G3; the revision
+     * stops mid-sentence with nothing left to flag, and used to replace it. The user was then
+     * shown a fragment with a clean bill, and the sentence that was wrong had been dropped
+     * rather than corrected.
+     */
+    modelStub.replies = [
+      'What draws me to Northwind Systems is the developer tooling they build. I spent last ' +
+        'summer at Google building search infrastructure.',
+      {
+        text:
+          'What draws me to Northwind Systems is the developer tooling they build. Last ' +
+          'summer I built internal tooling at',
+        stopReason: 'max_tokens',
+      },
+    ];
+    const id = await addQuestion('Why do you want to intern at Northwind Systems?');
+    const res = await draft(id);
+    const body = res.json();
+
+    expect(res.statusCode).toBe(200);
+    expect(modelStub.calls, 'the revision was still asked for').toHaveLength(2);
+    expect(body.text).toContain('Google');
+    expect(body.text.trim().endsWith('.')).toBe(true);
+    // And the fabrication it carries is still the user's to resolve at G3.
+    expect(body.unresolved).toBe(true);
   });
 });
