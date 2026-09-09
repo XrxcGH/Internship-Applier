@@ -170,6 +170,53 @@ describe('the simple form', () => {
     expect(file.readBack).toContain('resume.txt');
   }, 90_000);
 
+  /**
+   * THE NAME THE EMPLOYER RECEIVES.
+   *
+   * The stored copy is named for its database row — `01M21C4W42ZZYMRE4SP4QRKJ50.pdf` —
+   * because a user-supplied filename is not a thing to build a path out of. But
+   * `setInputFiles(path)` uploads under that basename, so the one document in the whole
+   * application a human being actually opens arrived at the employer called a ULID. Read back
+   * off the page's own file input, which is what the employer's form will submit.
+   */
+  it('sends it under the name the student uploaded, not the name it is stored as', async () => {
+    const stored = path.join(workDir, '01M21C4W42ZZYMRE4SP4QRKJ50.txt');
+    writeFileSync(stored, 'Rosa Alvarez — resume', 'utf8');
+
+    await session.page.goto(`${fixture.url}/simple`);
+    const map = await buildFormMap(session.page);
+    const plan = buildFillPlan({
+      fields: map.fields,
+      profile: PROFILE,
+      answers: [WHY_ANSWER, APPROVED_ANSWER],
+      resumePath: stored,
+      resumeFilename: 'Rosa Alvarez Resume.txt',
+    });
+    const result = await executePlan(session.page, plan);
+
+    const file = result.results.find((r) => r.field.semantic === 'resume_upload')!;
+    expect(file.status).toBe('ok');
+    expect(file.readBack).toContain('Rosa Alvarez Resume.txt');
+    expect(file.readBack).not.toContain('01M21C4W42ZZYMRE4SP4QRKJ50');
+  }, 90_000);
+
+  it('still attaches it when no name travelled with the file', async () => {
+    // `load()` sets the path and the name together or not at all, so an absent name is an
+    // older stored row rather than a bug — and a ULID reaching the employer beats no resume.
+    await session.page.goto(`${fixture.url}/simple`);
+    const map = await buildFormMap(session.page);
+    const plan = buildFillPlan({
+      fields: map.fields,
+      profile: PROFILE,
+      answers: [WHY_ANSWER, APPROVED_ANSWER],
+      resumePath,
+    });
+    const result = await executePlan(session.page, plan);
+    const file = result.results.find((r) => r.field.semantic === 'resume_upload')!;
+    expect(file.status).toBe('ok');
+    expect(file.readBack).toContain('resume.txt');
+  }, 90_000);
+
   it('reports honestly when it is done', async () => {
     const { result } = await run('/simple', [WHY_ANSWER, APPROVED_ANSWER]);
     // The summary must not read as finished, because it is not.

@@ -554,7 +554,31 @@ async function fillOne(page: Page, action: FillAction, documentUrl?: string): Pr
         if (!action.filePath) {
           return { field, status: 'skipped', note: 'No file to attach.' };
         }
-        await loc.setInputFiles(action.filePath);
+        /**
+         * THE EMPLOYER GETS THE STUDENT'S FILENAME, NOT THE ROW'S ID.
+         *
+         * The stored copy is named for its database row — `01M21C4W42ZZYMRE4SP4QRKJ50.pdf` —
+         * because a user-supplied filename is not a thing to build a path out of. But
+         * `setInputFiles(path)` uploads under that basename, so the one document in the whole
+         * application that a human being actually opens arrived called a ULID.
+         *
+         * The buffer form is the only way to set the name Playwright sends. It reads the file
+         * into memory, which is bounded: the upload route caps a resume at 12MB.
+         *
+         * Falls back to the path when no name travelled with it — `load()` sets the two
+         * together or not at all, so this is the older stored row rather than a bug, and a
+         * ULID reaching the employer is better than no resume reaching them.
+         */
+        if (action.fileName) {
+          const { readFile } = await import('node:fs/promises');
+          await loc.setInputFiles({
+            name: action.fileName,
+            mimeType: mimeForResume(action.fileName),
+            buffer: await readFile(action.filePath),
+          });
+        } else {
+          await loc.setInputFiles(action.filePath);
+        }
         const names = await loc.evaluate((el: unknown) => {
           const input = el as {
             files?: { length: number; item(i: number): { name: string } | null };
@@ -879,6 +903,22 @@ export interface ExecuteOptions {
  * every change and a field that appears only after another is answered has to be filled
  * in order. It is also what makes the visible browser watchable.
  */
+/**
+ * The content type to send a resume under, from its own extension.
+ *
+ * Playwright's buffer form needs one, and an employer's form is entitled to a truthful
+ * header — several ATS uploaders read it rather than the extension. Only the four formats
+ * the upload route accepts appear here; anything else was not stored by this app.
+ */
+function mimeForResume(name: string): string {
+  const ext = name.slice(name.lastIndexOf('.')).toLowerCase();
+  if (ext === '.pdf') return 'application/pdf';
+  if (ext === '.docx')
+    return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+  if (ext === '.md') return 'text/markdown';
+  return 'text/plain';
+}
+
 export async function executePlan(
   page: Page,
   plan: FillPlan,

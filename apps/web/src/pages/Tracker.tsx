@@ -125,7 +125,16 @@ function Card({
             </option>
           ))}
         </select>
-        {(app.status === 'submitted' || app.derived.effectiveStatus === 'ghosted') && (
+        {/* The states a follow-up is FOR, which is not the same as the states a nudge fires
+            in. The gate was submitted-or-ghosted, so an application sitting in the
+            fourteen-to-forty-five-day nudge window at `acknowledged` or `interview` got a
+            reminder whose detail reads "A draft is below." pointing at a button the card did
+            not draw. The server half was already right: GET /api/applications/:id/draft-message
+            returns the proper text for both of those. */}
+        {(app.status === 'submitted' ||
+          app.status === 'acknowledged' ||
+          app.status === 'interview' ||
+          app.derived.effectiveStatus === 'ghosted') && (
           <Button size="sm" onClick={onDraft}>
             Draft a follow-up
           </Button>

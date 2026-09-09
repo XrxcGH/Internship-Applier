@@ -99,6 +99,8 @@ interface Loaded {
   answers: ApplicationAnswer[];
   profile: ConfirmedProfile;
   resumePath?: string;
+  /** Travels with `resumePath`, and only when it does: a name without a file is nothing. */
+  resumeFilename?: string;
 }
 
 type LoadResult =
@@ -273,7 +275,14 @@ export function load(applicationId: string): LoadResult {
       applyUrl: row.application.applyUrl,
       answers,
       profile: profile as ConfirmedProfile,
-      resumePath: resume ? readableResumePath(resume.id, resume.path) : undefined,
+      // Set together or not at all. A name with no readable file behind it would be handed
+      // to the fill engine as if there were a resume to attach.
+      ...(() => {
+        const readable = resume ? readableResumePath(resume.id, resume.path) : undefined;
+        return readable
+          ? { resumePath: readable, resumeFilename: resume?.filename }
+          : { resumePath: undefined, resumeFilename: undefined };
+      })(),
     },
   };
 }
@@ -383,6 +392,7 @@ export async function fillingRoutes(app: FastifyInstance): Promise<void> {
       profile: loaded.data.profile,
       answers: loaded.data.answers,
       resumePath: loaded.data.resumePath,
+      resumeFilename: loaded.data.resumeFilename,
     };
 
     /**
@@ -450,6 +460,7 @@ export async function fillingRoutes(app: FastifyInstance): Promise<void> {
           profile: loaded.data.profile,
           answers: loaded.data.answers,
           resumePath: loaded.data.resumePath,
+          resumeFilename: loaded.data.resumeFilename,
         });
 
         /**

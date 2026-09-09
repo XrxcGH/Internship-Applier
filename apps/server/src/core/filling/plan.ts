@@ -29,6 +29,16 @@ export interface FillAction {
   source: 'profile' | 'answer' | 'file';
   /** Absolute path, for file inputs. */
   filePath?: string;
+  /**
+   * The name the file should reach the employer under.
+   *
+   * The stored copy is named for its row — `01M21C4W42ZZYMRE4SP4QRKJ50.pdf` — because a
+   * user-supplied filename is not something to build a path out of. Playwright's
+   * `setInputFiles(path)` uploads under that basename, so the employer received a ULID where
+   * the student's own "Maya Okonkwo Resume.pdf" should have been, on the one document in the
+   * application a human actually opens.
+   */
+  fileName?: string;
 }
 
 export interface FillSkip {
@@ -48,6 +58,8 @@ export interface PlanInput {
   /** Approved answers, keyed however the caller likes; matched by question text. */
   answers: ApplicationAnswer[];
   resumePath?: string;
+  /** The name the stored resume was uploaded under, for the employer's copy. */
+  resumeFilename?: string;
 }
 
 // ───────────────────────────────────────── approval measured against the profile of today
@@ -494,9 +506,13 @@ export function buildFillPlan(input: PlanInput): FillPlan {
       if (field.semantic === 'resume_upload' && input.resumePath) {
         actions.push({
           field,
-          value: input.resumePath,
+          // The name, not the path: this is the string the pre-submit review shows the
+          // student beside the field, and a stored path tells them nothing about which
+          // resume is going.
+          value: input.resumeFilename ?? input.resumePath,
           source: 'file',
           filePath: input.resumePath,
+          fileName: input.resumeFilename,
         });
       } else {
         skips.push({

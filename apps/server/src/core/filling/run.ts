@@ -203,6 +203,8 @@ export interface StartInput {
   profile: ConfirmedProfile;
   answers: ApplicationAnswer[];
   resumePath?: string;
+  /** The name the student uploaded it under — the name the employer should receive. */
+  resumeFilename?: string;
   /** Tests only. A real run is always watched. */
   headless?: boolean;
 }
@@ -437,6 +439,7 @@ async function open(input: StartInput): Promise<FillRun> {
       profile: input.profile,
       answers: input.answers,
       resumePath: input.resumePath,
+      resumeFilename: input.resumeFilename,
     });
     /**
      * What will be typed, not what was found.
@@ -598,6 +601,7 @@ async function drive(run: FillRun, input: StartInput): Promise<FillRun> {
       profile: input.profile,
       answers: input.answers,
       resumePath: input.resumePath,
+      resumeFilename: input.resumeFilename,
     });
 
     // A page with nothing on it to fill is not a form this tool has anything to say about.
