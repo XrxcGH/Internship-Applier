@@ -536,10 +536,31 @@ export async function fillingRoutes(app: FastifyInstance): Promise<void> {
           // the run in memory, and that is discarded when the browser is closed, when a
           // second run starts and when the server stops — so it is this column, read back
           // by GET /api/applications/:id, that can still answer the question afterwards.
+          /**
+           * MERGED ACROSS STEPS, NOT REPLACED.
+           *
+           * A multi-step form is filled by one continue per page, and each one wrote its own
+           * list over the last — so a wizard whose first page left the student an SSN box and
+           * whose second page filled cleanly ended with an empty list, and the app had nothing
+           * to say about the field it had deliberately not touched. Keyed by label because
+           * that is what the student reads, and the later run's note wins for a label seen
+           * twice: it describes the page as it stands now.
+           */
+          const previous = db
+            .select({ skippedFields: schema.application.skippedFields })
+            .from(schema.application)
+            .where(eq(schema.application.id, req.params.id))
+            .all()[0]?.skippedFields;
+          const byLabel = new Map<string, (typeof skipped)[number]>();
+          for (const f of Array.isArray(previous) ? (previous as typeof skipped) : []) {
+            if (f && typeof f.label === 'string') byLabel.set(f.label, f);
+          }
+          for (const f of skipped) byLabel.set(f.label, f);
+
           db.update(schema.application)
             .set({
               ...(next && filledSomething ? { status: next } : {}),
-              skippedFields: skipped,
+              skippedFields: [...byLabel.values()],
               updatedAt: new Date().toISOString(),
             })
             .where(eq(schema.application.id, req.params.id))

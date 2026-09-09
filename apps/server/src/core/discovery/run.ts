@@ -16,6 +16,7 @@ import { ATS_SOURCES } from './sources/ats';
 import { AGGREGATOR_SOURCES } from './sources/aggregators';
 import { webSearch } from './sources/webSearch';
 import { dedupe } from './dedupe';
+import { refreshPostings } from './refresh';
 import { fingerprint } from './dedupe';
 import type { JobSource, NormalizedPosting } from './sources/types';
 
@@ -67,6 +68,35 @@ export async function runDiscovery(
 ): Promise<RunSummary> {
   const runId = ulid();
   const startedAt = new Date().toISOString();
+
+  /**
+   * THE ONLY THING THAT EVER RUNS THE FRESHNESS PASS.
+   *
+   * `refreshPostings` is wired to two routes and docs/04 § Freshness says on-demand is the
+   * design — "there is no timer, cron entry or job runner anywhere in the repo", deliberately.
+   * What nothing noticed is that no CALLER exists either: apps/web has no client for either
+   * route, so a user of the interface could never trigger one and a posting that closed months
+   * ago stayed `is_open = 1` and kept passing the `posting_open` rule for ever. Only somebody
+   * driving the API by hand could clear it.
+   *
+   * A discovery run is the right moment: the student is already waiting, and stages 1 and 2 are
+   * pure SQL — a deadline that has passed, and a board re-read without the posting in it — so
+   * this costs two UPDATEs and no network at all.
+   *
+   * `checkUrls` is deliberately NOT set. That stage fans out a request per posting, which
+   * would make every discovery run silently minutes longer; re-fetching one posting to see
+   * whether it is still there stays what the per-posting route is for.
+   *
+   * Failure here must not cost the run. A student pressed "find postings" — losing the whole
+   * search because a tidy-up query threw would be trading the thing they asked for against
+   * housekeeping they never mentioned.
+   */
+  try {
+    await refreshPostings({});
+  } catch (err) {
+    logger.warn({ err }, 'freshness pass before the discovery run failed; searching anyway');
+  }
+
   const reports: SourceReport[] = [];
   const collected: Array<{ posting: NormalizedPosting; source: string }> = [];
   const skipped: string[] = [];

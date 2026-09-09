@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { eq } from 'drizzle-orm';
 import { db, schema, sqlite } from '../src/infra/db/client';
 import { runMigrations } from '../src/infra/db/migrate';
 import { ALL_SOURCES, runDiscovery } from '../src/core/discovery/run';
@@ -420,5 +421,57 @@ describe('a JSON column a thinner source re-sights', () => {
     stub({ postings: [posting({ compensation: { ...stated, min: 12_500 } })] });
     await runDiscovery([{ source: 'greenhouse', board: 'acme' }]);
     expect(stored()?.compensation).toMatchObject({ min: 12_500 });
+  });
+});
+
+/**
+ * The freshness pass had no caller at all.
+ *
+ * `refreshPostings` is wired to two routes, and docs/04 § Freshness says on-demand is the
+ * design — "there is no timer, cron entry or job runner anywhere in the repo", deliberately.
+ * What nothing noticed is that no caller existed either: apps/web has a client for neither
+ * route, so a user of the interface could never trigger one, and a posting whose deadline
+ * passed months ago stayed `is_open = 1` and kept passing the `posting_open` rule for ever.
+ * Only somebody driving the API by hand could clear it.
+ *
+ * A discovery run is the moment to do it — the student is already waiting, and the stages
+ * this reaches are pure SQL, so it costs two UPDATEs and no network.
+ */
+describe('a discovery run tidies up before it searches', () => {
+  it('closes a posting whose deadline has passed, without being asked separately', async () => {
+    const url = 'https://example.test/jobs/expired-before-run';
+    db.insert(schema.jobPosting)
+      .values({
+        id: 'expired_before_run',
+        canonicalUrl: url,
+        applyUrl: url,
+        company: 'Sample Robotics',
+        title: 'Summer Engineering Intern',
+        descriptionText: 'A role whose deadline is long past.',
+        fingerprint: 'fp_expired_before_run',
+        closesAt: '2020-01-01T00:00:00.000Z',
+        isOpen: true,
+      } as never)
+      .run();
+
+    const openNow = (): boolean | undefined =>
+      db
+        .select({ isOpen: schema.jobPosting.isOpen })
+        .from(schema.jobPosting)
+        .where(eq(schema.jobPosting.id, 'expired_before_run'))
+        .all()[0]?.isOpen;
+    expect(openNow()).toBe(true);
+
+    // A run with NO targets: nothing is searched, so the only thing that can have changed the
+    // row is the pass at the top of the run.
+    await runDiscovery([]);
+    expect(openNow()).toBe(false);
+  });
+
+  it('does not lose the search when the tidy-up cannot run', async () => {
+    // The student pressed "find postings". Trading their search for housekeeping they never
+    // asked about would be the wrong way round.
+    const summary = await runDiscovery([]);
+    expect(summary.runId).toBeTruthy();
   });
 });

@@ -550,6 +550,33 @@ export function FillReview({
             </ul>
           </div>
 
+          {/* A FORM WITH MORE THAN ONE STEP, WHICH THIS SCREEN USED TO DEAD-END ON.
+
+              Plenty of ATS forms are a wizard: page one is name and email, page two is the
+              essays. The run fills page one, reaches `done`, and this block offered only "I
+              submitted it" and "Close the browser" — so the student's approved answers, sitting
+              ready for page two, could only be typed by hand.
+
+              The server was ready the whole time. `continueRun` has no state guard, re-reads the
+              page with `buildFormMap` and fills whatever is on it NOW; the route allows it
+              (`load()`'s FILL_PATH includes awaiting_submit and advancing from it is a no-op),
+              and fillRun.test.ts already pins a second continue going through. Only the button
+              was missing. */}
+          <div className="u-card-flat px-5 py-4">
+            <p className="text-dim u-prose text-sm">
+              Is this form more than one page? Move to the next step in the browser yourself — the
+              tool never presses a button that sends anything — then fill that page too.
+            </p>
+            <Button
+              size="sm"
+              className="mt-3"
+              disabled={busy !== null}
+              onClick={() => void act('continue', () => continueFill(applicationId))}
+            >
+              Fill the next step
+            </Button>
+          </div>
+
           {/* The gate itself. */}
           <div className="u-tint-accent rounded px-5 py-5">
             <p className="u-eyebrow mb-2">Gate G4</p>

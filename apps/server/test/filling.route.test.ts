@@ -1272,7 +1272,24 @@ describe('what a fill run records when it filled nothing', () => {
   });
 
   it('does not put the skipped list behind the fill count again', () => {
-    // The regression this exists to catch, stated as the shape it would take.
-    expect(source).not.toMatch(/run\.result\.filled > 0\) \{[\s\S]{0,600}skippedFields: skipped/);
+    // The regression this exists to catch, stated as the shape it would take: the write
+    // landing inside the fill-count guard rather than beside it.
+    expect(source).not.toMatch(/run\.result\.filled > 0\) \{[\s\S]{0,900}skippedFields:/);
+  });
+
+  /**
+   * And merged across the steps of a wizard rather than replaced.
+   *
+   * A multi-step form is filled by one continue per page. Each one wrote its own list over the
+   * last, so a form whose FIRST page left the student an SSN box and whose second filled
+   * cleanly ended with an empty list — the app silent about the one field it had deliberately
+   * refused to touch.
+   */
+  it('keeps what an earlier step left for the student', () => {
+    expect(source).toMatch(/const byLabel = new Map/);
+    expect(source).toMatch(/skippedFields: \[\.\.\.byLabel\.values\(\)\]/);
+    // Keyed by label, and the later run wins for a label seen twice: its note describes the
+    // page as it stands now.
+    expect(source).toMatch(/for \(const f of skipped\) byLabel\.set\(f\.label, f\);/);
   });
 });
