@@ -505,6 +505,23 @@ const INTERNSHIP_TITLE: RegExp[] = [
   /est[áa]gi/i,
   // Italian.
   /tirocin/i,
+  /**
+   * What banks, consultancies and law firms call theirs.
+   *
+   * "Summer Analyst" and "Summer Associate" are the standard names for an internship across
+   * finance, consulting and law, and neither contains a word on the list above — so a real
+   * run dropped every one of them and told the user in its own note that they were "not
+   * internships". That is the worst way to lose a posting: silently, with a sentence
+   * asserting the opposite.
+   *
+   * The season is what carries it, and it has to. "Analyst" and "Associate" on their own are
+   * the full-time roles these programmes feed into, and matching those would fill the queue
+   * with jobs no student can hold — so the qualifier is required, and only the qualifiers
+   * that actually mean a student programme. "Summer" alone is not enough either: a "Summer
+   * Camp Counselor" is a summer job and not one of these, but it is caught by neither half
+   * of this pattern and is left to the words above.
+   */
+  /\b(?:summer|spring|fall|autumn|winter)\s+(?:analyst|associate|scholar|fellow|trainee)\b/i,
 ];
 
 export function internshipShaped(title: string): boolean {

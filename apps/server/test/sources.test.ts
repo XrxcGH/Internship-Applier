@@ -492,7 +492,41 @@ describe('internshipShaped', () => {
     // Near misses of the stems: none of these is a student position.
     'Practical Nurse',
     'Praktische Umsetzung von Marketingstrategien',
+    /**
+     * The full-time roles a "Summer Analyst" programme feeds into. The season is what makes
+     * the title a student post, and without it these are the careers themselves — matching
+     * them would fill the queue with jobs no student can hold, which is the overcorrection
+     * that pays for the coverage below.
+     */
+    'Analyst',
+    'Associate',
+    'Senior Analyst',
+    'Data Analyst',
+    'Business Associate',
+    'Associate Director',
+    // A summer job, but not one of these programmes, and no other word here catches it.
+    'Summer Camp Counselor',
   ];
+
+  /**
+   * What finance, consulting and law call theirs. Neither word appears anywhere else in
+   * INTERNSHIP_TITLE, so a real run dropped every one of these and said in its own note that
+   * they were "not internships" — a posting lost silently, under a sentence asserting the
+   * opposite.
+   */
+  const SEASONAL_PROGRAMMES = [
+    'Summer Analyst',
+    'Summer Analyst Program 2027',
+    'Summer Associate',
+    '2027 Summer Analyst - Investment Banking',
+    'Spring Fellow',
+    'Summer Scholar',
+  ];
+
+  it('reads the seasonal programme names finance and law use', () => {
+    for (const title of SEASONAL_PROGRAMMES)
+      expect({ title, shaped: internshipShaped(title) }).toEqual({ title, shaped: true });
+  });
 
   it('reads an internship title in the languages these boards are written in', () => {
     for (const title of KEEP)
