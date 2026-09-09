@@ -139,20 +139,28 @@ export async function resumeRoutes(app: FastifyInstance): Promise<void> {
       // or a key, so "sign in to the CLI" and "set ANTHROPIC_API_KEY" are both no-ops here —
       // the only action that changes anything is flipping the switch back. Give that advice
       // in that state, and the CLI/key advice in every other state where it does apply.
+      // `access.description` has already said WHICH state this is; the advice says what to do
+      // about it and must not say the state over again. The `none` branch opened with "Model
+      // calls are switched off" behind a description reading "Model calls are switched off
+      // (LLM_PROVIDER=none)", so the one screen a blocked user reads told them the same thing
+      // twice and gave the impression of a message assembled rather than written.
       const advice =
         config.llm.provider === 'none'
-          ? 'Model calls are switched off. Set LLM_PROVIDER=auto (or remove the line) in the ' +
-            '.env file at the root of this project and restart the server.'
+          ? 'Set LLM_PROVIDER=auto (or remove the line) in the .env file at the root of this ' +
+            'project and restart the server.'
           : 'Either sign in to the Claude Code CLI by running `claude` once in a terminal, ' +
             'or set ANTHROPIC_API_KEY in the .env file at the root of this project and ' +
             'restart the server.';
+      // "without either" needs the two things the sentence before it offered. The switched-off
+      // branch offers one, and the word pointed at nothing.
+      const tail =
+        config.llm.provider === 'none'
+          ? 'Everything else — matching, eligibility, the writing checks — works without a model.'
+          : 'Everything else — matching, eligibility, the writing checks — works without either.';
       return reply.code(400).send({
         error: {
           code: 'NO_MODEL_ACCESS',
-          message:
-            `Reading a resume needs a model, and none is reachable. ${access.description} ` +
-            `${advice} Everything else — matching, eligibility, the writing checks — works ` +
-            'without either.',
+          message: `Reading a resume needs a model, and none is reachable. ${access.description} ${advice} ${tail}`,
         },
       });
     }

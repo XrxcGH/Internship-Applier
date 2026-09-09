@@ -68,6 +68,8 @@ interface ApplicationContext {
   title: string;
   description: string;
   applyUrl: string;
+  status: string;
+  submittedAt: string | null;
 }
 
 function loadContext(applicationId: string): ApplicationContext | null {
@@ -86,6 +88,21 @@ function loadContext(applicationId: string): ApplicationContext | null {
     title: row.job_posting.title,
     description: row.job_posting.descriptionText,
     applyUrl: row.application.applyUrl,
+    /**
+     * Where this application has got to, sent by the endpoint that knows.
+     *
+     * It was not here, and the detail screen said so out loud: Applications.tsx carried the
+     * comment "The list row is the only thing that knows whether this one has been
+     * submitted" and looked the answer up in the summary list beside it. That works only
+     * while the list happens to be loaded and happens to contain this row — open the detail
+     * before the list settles, or by a link, and `submittedAt` reads null, so an application
+     * the user has already sent renders as unsent and the fill panel offers to fill it again.
+     * G4 is not breached by that — a human still submits — but the screen is telling them
+     * something untrue about their own application at the moment they are deciding what to do
+     * with it.
+     */
+    status: row.application.status,
+    submittedAt: row.application.submittedAt,
   };
 }
 

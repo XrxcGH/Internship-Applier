@@ -23,7 +23,7 @@ import {
 import { detectIntervention, openSession, type BrowserSession } from '../src/core/filling/browser';
 import { CONFIDENCE_FLOOR } from '../src/core/filling/classify';
 import { buildFormMap, frameKey } from '../src/core/filling/formMap';
-import { buildFillPlan, summarizePlan } from '../src/core/filling/plan';
+import { buildFillPlan, summarizePlan, type FillAction } from '../src/core/filling/plan';
 import {
   chooseOption,
   describeFill,
@@ -257,6 +257,32 @@ describe('the hostile form', () => {
     const { plan } = await run('/nasty', [long]);
     const essay = plan.actions.find((a) => a.field.semantic === 'essay');
     expect(essay?.value.length).toBe(600);
+  }, 90_000);
+
+  /**
+   * The half of that the test above does not follow: what reaches the page and the report.
+   *
+   * The plan's 600-character slice was typed into the box, read back whole, and reported
+   * filled. The student approved 2000 characters at G3 and the employer would have received
+   * the first 600 of them, stopping mid-word, with a green tick beside the field — the tool
+   * doing exactly what its own test name blames the form for. On this fixture the box says
+   * "600 characters max" in its label, so there is a number to tell them, and there is a
+   * shorter answer they can approve.
+   */
+  it('does not type an approved answer the box cannot hold, and names the limit', async () => {
+    const long = {
+      ...APPROVED_ANSWER,
+      finalText: `I built a tide chart that works offline. ${'x'.repeat(2000)}`,
+    } as ApplicationAnswer;
+    const { result } = await run('/nasty', [long]);
+    const essay = result.results.find((r) =>
+      r.field.label.startsWith('Tell us about a project you are proud of.'),
+    )!;
+
+    expect(essay.status).toBe('skipped');
+    expect(essay.note).toContain('600 characters');
+    // And the employer's box is empty rather than holding two thirds of a sentence.
+    expect(await session.page.locator('#f-essay').inputValue()).toBe('');
   }, 90_000);
 });
 
@@ -684,9 +710,21 @@ function pageOfFrames(
   } as unknown as Page;
 }
 
-async function fillOnce(page: Page, field: FormField, value: string) {
+/**
+ * `source` defaults to 'profile', which is what nearly every case here is about.
+ *
+ * It is a parameter because the source is not decoration: 'answer' means these are the words
+ * the user read and approved at G3, and fill.ts holds them to a stricter standard than a
+ * phone number the page is free to reformat. See 'an approved answer that does not fit the box'.
+ */
+async function fillOnce(
+  page: Page,
+  field: FormField,
+  value: string,
+  source: FillAction['source'] = 'profile',
+) {
   const result = await executePlan(page, {
-    actions: [{ field, value, source: 'profile' }],
+    actions: [{ field, value, source }],
     skips: [],
   });
   return result.results[0]!;
@@ -859,6 +897,53 @@ describe('how much of a value counts as kept', () => {
     expect((await fillOnce(page, essayField(), ESSAY)).status).toBe('ok');
   });
 
+  /**
+   * The same page and the same five characters, against words the user approved at G3.
+   *
+   * `KEPT_ENOUGH` is a tenth, and it applied to everything. A tenth of a reformatted phone
+   * number is the form being helpful; a tenth of an essay is the last two sentences of it. An
+   * ATS that caps a textarea from its own `input` handler — a character counter that slices,
+   * with no maxlength attribute for the scanner to have read — kept 570 of 600 approved
+   * characters and the run reported the field filled, in green, above "Read the page, then
+   * submit it yourself". The test above is unchanged: the allowance is right where it came
+   * from, and an approved answer is the case it was never meant to cover.
+   */
+  it('calls a box that dropped the end of an approved answer a mismatch, at the same five', async () => {
+    const kept = ESSAY.slice(0, ESSAY.length - 5);
+    const box = {
+      nth: () => box,
+      waitFor: () => Promise.resolve(),
+      click: () => Promise.resolve(),
+      fill: () => Promise.resolve(),
+      pressSequentially: () => Promise.resolve(),
+      inputValue: () => Promise.resolve(kept),
+    };
+    const page = pageOfFrames([{ url: 'http://form.test/', locator: box }]);
+    const r = await fillOnce(page, essayField(), ESSAY, 'answer');
+
+    expect(r.status).toBe('mismatch');
+    // The two numbers, not the essay printed back at them: how much of the end is missing is
+    // the one thing the student cannot see by looking at the box.
+    expect(r.note).toContain('596 characters of the 601 you approved');
+    expect(r.note).not.toContain(kept);
+  });
+
+  it('still calls an approved answer the page kept whole ok, however it respaced it', async () => {
+    // The direction that would make the rule above unusable if it were wrong: a box that
+    // doubles the space after a full stop has dropped no words at all.
+    const respaced = ESSAY.replace('offline. ', 'offline.  ');
+    const box = {
+      nth: () => box,
+      waitFor: () => Promise.resolve(),
+      click: () => Promise.resolve(),
+      fill: () => Promise.resolve(),
+      pressSequentially: () => Promise.resolve(),
+      inputValue: () => Promise.resolve(respaced),
+    };
+    const page = pageOfFrames([{ url: 'http://form.test/', locator: box }]);
+    expect((await fillOnce(page, essayField(), ESSAY, 'answer')).status).toBe('ok');
+  });
+
   it('clears a contenteditable first, so a second run does not answer twice', async () => {
     const answer = 'I build things that outlive the semester.';
     const box = richtextStub(answer);
@@ -873,6 +958,99 @@ describe('how much of a value counts as kept', () => {
 
     expect(box.held).toBe(answer);
     expect(r.status).toBe('ok');
+  });
+});
+
+/**
+ * An approved answer that is longer than the box the form gives it.
+ *
+ * 'respects a maxlength budget rather than letting the form truncate silently' above pins one
+ * thing: `plan.actions[…].value` comes out 600 characters long for a 2000-character answer.
+ * It follows the slice and stops there. What happens NEXT is that the page keeps all 600, the
+ * read-back matches all 600, and the run reports the field filled — so a student who approved
+ * 2000 characters at G3 sends an employer 600 of them ending mid-word, under a green tick,
+ * with nothing anywhere saying a word was lost. The form was never the one truncating.
+ *
+ * There are only two honest endings, and this file is downstream of the first: shorten the
+ * answer BEFORE approval where the user can see what goes, or report the field as not filled
+ * and say why. Silently cutting it and calling it filled is not one of them.
+ */
+describe('an approved answer that does not fit the box', () => {
+  const CAP = 200;
+
+  function cappedEssay(maxLength?: number) {
+    return fieldOf({
+      label: 'Tell us about a project you are proud of. (200 characters max)',
+      control: 'textarea',
+      semantic: 'essay',
+      locator: '#essay',
+      maxLength,
+    });
+  }
+
+  it('is not typed at all, and the field is reported as still needing the user', async () => {
+    const box = textStub();
+    const page = pageOfFrames([{ url: 'http://form.test/', locator: box.locator }]);
+    // What `plan.ts` hands over: an answer already cut to the field's own budget.
+    const r = await fillOnce(page, cappedEssay(CAP), 'y'.repeat(CAP), 'answer');
+
+    expect(r.status).toBe('skipped');
+    expect(r.note).toContain('200 characters');
+    expect(r.note).toMatch(/Shorten the answer/);
+    // Nothing was typed. Half an approved answer sitting in an employer's box is worse than
+    // an empty box, because an empty box is visible from across the room.
+    expect(box.held).toBe('');
+    expect(describeFill({ results: [r], filled: 0, mismatched: 0, failed: 0 })).toMatch(
+      /still needs you/,
+    );
+  });
+
+  it('still types an approved answer that fits, so this is not a blanket refusal', async () => {
+    const box = textStub();
+    const page = pageOfFrames([{ url: 'http://form.test/', locator: box.locator }]);
+    const answer = 'z'.repeat(CAP - 1);
+    const r = await fillOnce(page, cappedEssay(CAP), answer, 'answer');
+
+    expect(r.status).toBe('ok');
+    expect(box.held).toBe(answer);
+  });
+
+  it('types an approved answer into a box that declares no budget at all', async () => {
+    const box = textStub();
+    const page = pageOfFrames([{ url: 'http://form.test/', locator: box.locator }]);
+    const answer = 'w'.repeat(4000);
+    const r = await fillOnce(page, cappedEssay(undefined), answer, 'answer');
+
+    expect(r.status).toBe('ok');
+    expect(box.held).toBe(answer);
+  });
+
+  /**
+   * The sibling this deliberately does NOT cover, pinned so a later edit does not extend the
+   * rule over it by accident.
+   *
+   * `plan.ts` runs the same `slice(0, field.maxLength)` on profile values one branch below the
+   * answers. The identical test there would fire on nearly every form that sets a maxlength at
+   * all: a state field is `maxlength="2"` and holds "NJ", a postal field `maxlength="5"` and
+   * holds "08901", a phone `maxlength="10"`. Those caps are the length of the data, so a value
+   * ending on the cap says nothing — and a page of correct fields marked "needs you" is how
+   * you teach someone to click past the one that matters. On an approved answer the cap is a
+   * budget nobody wrote to, so landing exactly on it is evidence.
+   */
+  it('leaves a profile value that ends on its own cap alone, because "NJ" is not a cut', async () => {
+    const box = textStub();
+    const page = pageOfFrames([{ url: 'http://form.test/', locator: box.locator }]);
+    const state = fieldOf({
+      label: 'State',
+      control: 'text',
+      semantic: 'region',
+      locator: '#state',
+      maxLength: 2,
+    });
+    const r = await fillOnce(page, state, 'NJ');
+
+    expect(r.status).toBe('ok');
+    expect(box.held).toBe('NJ');
   });
 });
 

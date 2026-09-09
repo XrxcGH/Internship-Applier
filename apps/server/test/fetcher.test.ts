@@ -801,3 +801,207 @@ describe('the client this module calls', () => {
     expect(src).toMatch(/config\.isTest && globalThis\.fetch !== nativeFetch/);
   });
 });
+
+/**
+ * A header the caller sets replaces the fetcher's own — it does not join it.
+ *
+ * `...opts.headers` looks like it replaces, and does only when the spelling matches. The
+ * USAJOBS adapter sends `'User-Agent'`, capitalised the way the vendor's docs write it, so the
+ * object carried `user-agent` and `User-Agent` as two keys and undici's `Headers` lowercased
+ * them into one and APPENDED. Measured against a local server, the request went out as
+ * `user-agent: internship-applier/0.1 (+local personal job-search tool), student@example.edu`.
+ * USAJOBS requires the User-Agent to be the address registered against the key, so the one
+ * source of federal internships and Pathways identified itself as something neither side
+ * configured — and `Accept: application/json` from the same adapter arrived joined too.
+ */
+describe('a header the caller sets', () => {
+  /** Records the full header set of every request, so a joined value is visible. */
+  async function hostSeeingHeaders(
+    seen: Array<{ url: string; headers: Record<string, string | string[] | undefined> }>,
+  ): Promise<string> {
+    const server = createServer((req, res) => {
+      seen.push({ url: req.url ?? '', headers: req.headers });
+      if ((req.url ?? '') === '/robots.txt') {
+        res.writeHead(404, { 'content-type': 'text/plain' });
+        res.end('');
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('a job posting');
+    });
+    running.push(server);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (address === null || typeof address === 'string') throw new Error('no port');
+    return `http://127.0.0.1:${String(address.port)}`;
+  }
+
+  type Seen = Array<{ url: string; headers: Record<string, string | string[] | undefined> }>;
+
+  it('replaces the user-agent rather than being appended to it', async () => {
+    const seen: Seen = [];
+    const origin = await hostSeeingHeaders(seen);
+
+    // Exactly what the USAJOBS adapter passes, capitalisation included.
+    await politeFetch(`${origin}/api/search`, {
+      rps: 100,
+      isDocumentedApi: true,
+      headers: { 'Authorization-Key': 'KEY', 'User-Agent': 'student@example.edu' },
+    });
+
+    const page = seen.find((s) => s.url === '/api/search');
+    expect(page?.headers['user-agent']).toBe('student@example.edu');
+    // The failure this closes, spelled out: the vendor saw both agents in one line.
+    expect(page?.headers['user-agent']).not.toContain('internship-applier');
+    expect(page?.headers['user-agent']).not.toContain(',');
+    // And the credential still arrives, since normalising the names must not drop any.
+    expect(page?.headers['authorization-key']).toBe('KEY');
+  });
+
+  it('replaces it when the caller spells the name in lower case too', async () => {
+    // The spelling that happened to work before. It has to keep working.
+    const seen: Seen = [];
+    const origin = await hostSeeingHeaders(seen);
+    await politeFetch(`${origin}/api/search`, {
+      rps: 100,
+      isDocumentedApi: true,
+      headers: { 'user-agent': 'student@example.edu' },
+    });
+    expect(seen.find((s) => s.url === '/api/search')?.headers['user-agent']).toBe(
+      'student@example.edu',
+    );
+  });
+
+  it('joins nothing on Accept either, which is the same bug wearing another name', async () => {
+    const seen: Seen = [];
+    const origin = await hostSeeingHeaders(seen);
+    await politeFetch(`${origin}/api/search`, {
+      rps: 100,
+      isDocumentedApi: true,
+      headers: { Accept: 'application/json' },
+    });
+    // Before the fix: 'application/json, text/html;q=0.9, */*;q=0.5, application/json'.
+    expect(seen.find((s) => s.url === '/api/search')?.headers.accept).toBe('application/json');
+  });
+
+  it('still identifies this tool when the caller sets no agent at all', async () => {
+    // The other direction. Overcorrecting into "the caller's headers are the headers" would
+    // send a request with no user-agent, and a board is entitled to refuse an anonymous one.
+    const seen: Seen = [];
+    const origin = await hostSeeingHeaders(seen);
+    await politeFetch(`${origin}/job/1`, { rps: 100 });
+
+    const page = seen.find((s) => s.url === '/job/1');
+    expect(page?.headers['user-agent']).toMatch(/^internship-applier\/[\d.]+ \(\+local/);
+    expect(page?.headers.accept).toContain('text/html');
+    // The robots.txt read speaks for the tool whatever a caller asked for: that request is a
+    // promise this tool makes, not a call on the caller's API key.
+    expect(seen.find((s) => s.url === '/robots.txt')?.headers['user-agent']).toMatch(
+      /^internship-applier\//,
+    );
+  });
+});
+
+/**
+ * What came back has to be capable of being a posting before it is read as one.
+ *
+ * Nothing looked at Content-Type, so whatever arrived with a 200 was decoded as UTF-8 and
+ * stored as the posting's description. A careers link that turns out to be a PDF put `%PDF-1.4`
+ * and a run of replacement characters through `stripHtml` and into the text a student reads at
+ * G3 — and requirement extraction ran over the same mojibake, so a phrase no posting contains
+ * could decide whether that student is eligible.
+ */
+describe('a response that is not a page at all', () => {
+  /** A host that answers with a chosen Content-Type, or with none at all. */
+  async function typedHost(type: string | null, body: string, hits: string[]): Promise<string> {
+    const server = createServer((req, res) => {
+      if ((req.url ?? '') === '/robots.txt') {
+        res.writeHead(404, { 'content-type': 'text/plain' });
+        res.end('');
+        return;
+      }
+      hits.push(req.url ?? '');
+      res.writeHead(200, type === null ? {} : { 'content-type': type });
+      res.end(body);
+    });
+    running.push(server);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (address === null || typeof address === 'string') throw new Error('no port');
+    return `http://127.0.0.1:${String(address.port)}`;
+  }
+
+  it.each([
+    ['application/pdf'],
+    ['image/png'],
+    ['application/octet-stream'],
+    ['application/zip'],
+    ['video/mp4'],
+    ['font/woff2'],
+    ['application/javascript'],
+  ])('refuses %s rather than storing its bytes as a description', async (type) => {
+    const hits: string[] = [];
+    const origin = await typedHost(type, '%PDF-1.4 binary', hits);
+
+    const err = await politeFetch(`${origin}/job/1`, { rps: 100 }).then(
+      () => null,
+      (e: unknown) => e as HttpError,
+    );
+
+    expect(err).toBeInstanceOf(HttpError);
+    expect(err?.status).toBe(415);
+    expect(err?.message).toContain(type);
+    expect(err?.message).toMatch(/not a page/);
+    // Derived from what the server said rather than reported as a failure, so retrying asks
+    // the same question five times and only delays the sentence the user needs to read.
+    expect(hits).toHaveLength(1);
+  });
+
+  it.each([
+    ['text/html'],
+    ['text/html; charset=UTF-8'],
+    ['text/plain'],
+    ['application/json'],
+    // USAJOBS answers hal+json and feeds answer +xml. An equality check on `application/json`
+    // would have refused every federal posting — a false failure of exactly the kind this repo
+    // cares more about than the one being fixed.
+    ['application/hal+json'],
+    ['application/rss+xml'],
+    ['application/ld+json'],
+  ])('reads %s, because that is a body made of language', async (type) => {
+    const hits: string[] = [];
+    const origin = await typedHost(type, 'a job posting', hits);
+    expect(await politeFetch(`${origin}/job/1`, { rps: 100 })).toBe('a job posting');
+  });
+
+  it('reads a response that names no type, because saying nothing is not saying binary', async () => {
+    // Small employer sites omit the header, and refusing them would hide the jobs on them.
+    const hits: string[] = [];
+    const origin = await typedHost(null, '<p>A normal posting</p>', hits);
+    expect(await politeFetch(`${origin}/job/1`, { rps: 100 })).toBe('<p>A normal posting</p>');
+  });
+
+  it('does not apply the rule to robots.txt, where the harm runs the other way', async () => {
+    // A robots.txt this refused would be an unreadable robots.txt, which this file treats as a
+    // COMPLETE disallow — so a host serving its rules as octet-stream would take that whole
+    // employer's site dark. Same check, opposite direction of harm, so it lives in one place.
+    const server = createServer((req, res) => {
+      if ((req.url ?? '') === '/robots.txt') {
+        res.writeHead(200, { 'content-type': 'application/octet-stream' });
+        res.end('User-agent: *\nDisallow: /private/\n');
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('a job posting');
+    });
+    running.push(server);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (address === null || typeof address === 'string') throw new Error('no port');
+    const origin = `http://127.0.0.1:${String(address.port)}`;
+
+    // Read, and obeyed: the allowed page comes back and the disallowed one is refused.
+    expect(await politeFetch(`${origin}/job/1`, { rps: 100 })).toBe('a job posting');
+    await expect(politeFetch(`${origin}/private/x`, { rps: 100 })).rejects.toThrow(/robots/i);
+  });
+});

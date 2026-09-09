@@ -1538,6 +1538,18 @@ function stripRemoteToken(part: string): string {
       // "Remote (US)" leaves a lone bracketed country behind. Only a part that is bracketed
       // end to end is unwrapped, so "New York (NY)" keeps both of its brackets.
       .replace(/^[([{]([^()[\]{}]*)[)\]}]$/, '$1')
+      // The word that joined the two halves, left holding the place it introduced.
+      //
+      // Same shape as NOT_A_PLACE, one word further on: "Remote in USA" lost the remote
+      // wording and handed back "in USA", which parseLocation filed as the CITY. A live run
+      // over 2,941 postings recorded forty of them as based in a town called "in USA", "in
+      // Canada" or "in UK" — and the country each of those strings actually named was
+      // thrown away, because "in USA" is not a country name and "USA" is.
+      //
+      // Only a preposition with a place after it goes. The `\s+` is what makes that safe:
+      // Independence, Indianapolis and Inglewood have nothing after the "in" to match, and
+      // nothing reaches here at all unless the part mentioned remoteness.
+      .replace(/^(?:in|within|across|throughout|around|based\s+in|anywhere\s+in)\s+/i, '')
       .trim()
   );
 }

@@ -8,6 +8,14 @@ endpoint groups that were never built and a dozen paths under names they do not 
 row below was read out of `apps/server/src/routes`; anything unbuilt is marked as such
 rather than listed as if it worked.
 
+That rewrite fixed the routes that were listed and did not check for the ones that were not,
+which is the other half of the same claim. `routes/tracker.ts` was missing entirely except
+for its status endpoint, `POST /api/discovery/paste` was missing while the URL path beside it
+was documented — and that pair is the one that decides whether a LinkedIn posting can be used
+at all — and `POST /api/profile/blank`, added later, was the only way past G1 on a machine
+with no model and appeared nowhere. All are below. A document that says it lists every route
+is read as a closed list, so an omission here is a stronger error than a wrong description.
+
 **Auth:** none — loopback-only, single user, single machine. A random per-run token is
 required in an `X-App-Token` header on every `/api/*` route except `/api/health` and
 `/api/session`. The frontend fetches it from `GET /api/session` (`apps/web/src/lib/session.ts`),
@@ -39,6 +47,7 @@ Errors use a consistent envelope:
 | `POST` | `/api/resumes` | Multipart upload. Returns `{ documentId, filename, mime, sha256 }`. Extraction is a separate call, not a task. |
 | `GET` | `/api/resumes` | List documents. |
 | `POST` | `/api/resumes/:id/extract` | Read the document into a draft profile. Returns `{ profile, needsReview }`. |
+| `POST` | `/api/profile/blank` | A draft profile with nothing in it, for a machine with no model. Same `{ profile, needsReview }` envelope as the extract route above, built from the same `toDraftProfile`, so every unset field arrives flagged. Stores nothing; the client sends it back through `PUT /api/profile`. |
 | `POST` | `/api/resumes/:id/primary` | Set the default resume for applications. |
 | `DELETE` | `/api/resumes/:id` | Delete the row and the file, and promote the newest remaining resume if this was the primary. |
 
@@ -69,7 +78,8 @@ Errors use a consistent envelope:
 | `GET` | `/api/discovery/runs/:id` | One summary: per-source counts, errors, skips, duplicates. |
 `GET /api/discovery/stats` — `{ total, open }`: every stored posting, and how many are still open. Nothing is grouped by source and nothing reports freshness.
 | `GET` | `/api/postings` | The raw posting table, for inspection. |
-| `POST` | `/api/discovery/manual` | Body: `{ url }`. The paste-a-URL path — fetch, normalize, store one posting. |
+| `POST` | `/api/discovery/manual` | Body: `{ url }`. The paste-a-URL path — fetch, normalize, store one posting. Answers 400 `SOURCE_REFUSED` for a host on the sourcing-policy list, before any request goes out. |
+| `POST` | `/api/discovery/paste` | Body: `{ text, title, company, url, readOn? }`, every field required and `text` at least 40 characters. The paste-**the-text** path, and the only one that takes a LinkedIn, Indeed, Glassdoor or Handshake posting: the user read it themselves, the URL is stored as the dedupe key and never fetched. No network on this path at all, so it has no 502 branch. |
 `POST /api/companies/resolve` — probes six vendors per slug candidate (Greenhouse, Lever, Ashby, SmartRecruiters, Workable by GET, Workday by a bounded POST), across up to three candidates. docs/04 § Company target list states the request bound.
 | `POST` | `/api/discovery/refresh` | Re-check open/closed and deadlines across the table. |
 | `POST` | `/api/postings/:id/refresh` | The same, for one posting. |
@@ -131,6 +141,22 @@ same transition check the status route does.
 
 > **Not built:** a `dryRun` flag on `/fill`, and `GET /api/applications/:id/presubmit`.
 > The pre-submit review is served by `GET /api/applications/:id/fill`.
+
+## Tracker
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/tracker` | Everything the board, the table and the nudges read: each application with its `derived` state, the reminders due, and the outcome stats. |
+| `GET` | `/api/applications/:id/draft-message` | `?kind=follow_up` (default) or `withdrawal`. Returns `{ kind, text, note }`. It is a **draft**: nothing in this app has mail credentials and nothing sends email. |
+| `GET` | `/api/tracker/export.csv` | The whole tracker as CSV, `content-disposition: attachment`. Values that would become a spreadsheet formula are neutralised (docs/11 § M7). |
+
+`POST /api/applications/:id/status` is the fourth route in `routes/tracker.ts` and is listed
+under § Filling & submission above, beside `mark-submitted`, because those two are the pair
+that can write `submitted_at`. Two refusals worth stating where the tracker is documented:
+it answers 409 `ILLEGAL_TRANSITION` for any move the status model does not allow a user to
+make, and 409 `ANSWERS_NOT_APPROVED` for a move that newly claims `filled` or
+`awaiting_submit` while any answer lacks `approvedAt` — gate G3 holds on this column too,
+because the board and the CSV export are what the user keeps as their record.
 
 ## Cost & privacy
 
@@ -209,7 +235,14 @@ Enforced in the route layer, above the core modules:
    check that cannot run is not a check that passed.
 4. `submitted_at` is written only by a user action: `mark-submitted` or a `/status`
    transition to `submitted`. No fill or drafting path can write it.
-5. Decrypted 🔒 fields are returned on the profile route, the export route, and as
+5. `/api/applications/:id/status` rejects a transition into `filled` or `awaiting_submit`
+   while any answer for that application lacks `approvedAt`. This is invariant 2 again on a
+   second surface, and it was missing from this list along with the rest of the tracker
+   module: `/fill` is where G3 stops anything reaching an employer, but the status column is
+   what the board and the CSV export report, and `answers_ready → filled → awaiting_submit`
+   is a legal walk for a user. Only a transition that newly claims one of those two is
+   checked — re-recording a status a row already holds claims nothing new.
+6. Decrypted 🔒 fields are returned on the profile route, the export route, and as
    `readBack` on the fill-run routes. **The last of those used to be left out**, which made
    this read as a stronger promise than the code keeps: `serializeRun` puts the value read
    off the page into every field result, so `GET /api/applications/:id/fill` and both POST

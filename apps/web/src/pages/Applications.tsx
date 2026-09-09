@@ -45,10 +45,12 @@ export function Applications({ onBack }: { onBack: () => void }) {
     return (
       <Detail
         id={openId}
-        // The list row is the only thing that knows whether this one has been submitted:
-        // GET /api/applications/:id answers with the posting and the answers and nothing
-        // about the application's own state. Without it the fill panel offered to open
-        // and fill a form the user had already told it they sent.
+        // GET /api/applications/:id now answers with the application's own state, so the
+        // detail no longer has to look itself up in the list beside it. That lookup was
+        // right only while the list happened to be loaded and happened to hold this row —
+        // otherwise it read null and the fill panel offered to open and fill a form the user
+        // had already told it they sent. Kept as the fallback for the first paint, before
+        // the detail request lands.
         submittedAt={list?.find((a) => a.id === openId)?.submittedAt ?? null}
         onBack={() => {
           setOpenId(null);
@@ -408,7 +410,10 @@ function Detail({
                 'Every answer needs your approval at gate G3 before the form can be filled — ' +
                 'the count is at the top of this page.'
           }
-          submittedAt={submittedAt}
+          // The application's own answer first; the list row only while the detail request
+          // is still in flight. The other way round, a detail opened before the list had
+          // settled showed a submitted application as unsubmitted and offered to fill it.
+          submittedAt={app.submittedAt ?? submittedAt}
           // Read back from the application rather than from the fill run, which is why it
           // is still here after the browser has been closed. An application saved before
           // this column existed has nothing in it, which is the same as nothing skipped.

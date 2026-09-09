@@ -77,23 +77,25 @@ function loadRequirements(postingId: string): JobRequirement[] {
  * the outcome this repo calls the worst thing it can do to somebody, from a partial write a
  * transaction removes for free.
  */
-const saveRequirements = sqlite.transaction((postingId: string, reqs: JobRequirement[]): void => {
-  db.delete(schema.jobRequirement).where(eq(schema.jobRequirement.postingId, postingId)).run();
-  for (const r of reqs) {
-    db.insert(schema.jobRequirement)
-      .values({
-        id: r.id,
-        postingId,
-        kind: r.kind,
-        operator: r.operator,
-        value: r.value,
-        necessity: r.necessity,
-        sourceQuote: r.sourceQuote,
-        confidence: Math.round(r.confidence * 100),
-      })
-      .run();
-  }
-});
+export const saveRequirements = sqlite.transaction(
+  (postingId: string, reqs: JobRequirement[]): void => {
+    db.delete(schema.jobRequirement).where(eq(schema.jobRequirement.postingId, postingId)).run();
+    for (const r of reqs) {
+      db.insert(schema.jobRequirement)
+        .values({
+          id: r.id,
+          postingId,
+          kind: r.kind,
+          operator: r.operator,
+          value: r.value,
+          necessity: r.necessity,
+          sourceQuote: r.sourceQuote,
+          confidence: Math.round(r.confidence * 100),
+        })
+        .run();
+    }
+  },
+);
 
 export async function runMatching(
   opts: { limit?: number; reextract?: boolean; useModel?: boolean; now?: Date } = {},

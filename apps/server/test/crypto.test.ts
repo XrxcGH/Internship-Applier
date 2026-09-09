@@ -1,15 +1,22 @@
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import Module from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { describe, expect, it } from 'vitest';
+import Database from 'better-sqlite3';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { config } from '../src/config';
 import {
   constantTimeEquals,
   decryptField,
   encryptField,
   isEncrypted,
 } from '../src/infra/crypto/fieldCrypto';
+import type * as KeychainModuleNS from '../src/infra/crypto/keychain';
+
+/** The keychain module as it is re-required under the fake binding below. */
+type KeychainModule = typeof KeychainModuleNS;
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SRC = path.resolve(HERE, '../src');
@@ -130,7 +137,17 @@ describe('master key custody, under the runtime the server actually uses', () =>
 
     const run = spawnSync(process.execPath, ['--import', 'tsx', script], {
       encoding: 'utf8',
-      env: { ...process.env, DATA_DIR: dataDir, NODE_ENV: 'test' },
+      // DATABASE_PATH as well as DATA_DIR, because the child inherits this worker's
+      // environment and that variable is the one path that does not follow DATA_DIR.
+      // `getMasterKey` now reads the database before it will mint anything, so a child left
+      // pointing at the worker's app.db would be answering a question about somebody else's
+      // data — the same half-isolation vitest.setup.ts exists to make impossible.
+      env: {
+        ...process.env,
+        DATA_DIR: dataDir,
+        DATABASE_PATH: path.join(dataDir, 'app.db'),
+        NODE_ENV: 'test',
+      },
     });
     const line = (run.stdout + run.stderr).split('\n').find((l) => l.startsWith('RESULT '));
     expect(line, `child produced no result:\n${run.stdout}\n${run.stderr}`).toBeDefined();
@@ -202,5 +219,196 @@ describe('constant-time comparison', () => {
   it('handles multi-byte characters by comparing bytes, not code units', () => {
     expect(constantTimeEquals('café', 'café')).toBe(true);
     expect(constantTimeEquals('café', 'cafe')).toBe(false);
+  });
+});
+
+/**
+ * Minting a master key is the one act in keychain.ts that cannot be undone.
+ *
+ * The reported failure: macOS, a week in, the key in the login Keychain and no
+ * data/.master.key on disk. `getPassword()` threw — a locked keychain, a dismissed prompt, a
+ * changed ACL, it does not matter which — and the catch below it treats an unavailable store
+ * as "no key yet", so the fallback path generated a fresh random key and the app went on
+ * writing under it. The profile, the resume text and every writing sample stayed sealed under
+ * the key that was in the Keychain the whole time, unreadable and unmentioned.
+ *
+ * These drive the module with a credential store of their own, because the suite's stand-in
+ * in vitest.setup.ts always answers and never throws — which is the one behaviour this bug
+ * needed to show itself.
+ */
+describe('what happens when the master key cannot be found', () => {
+  const KEYFILE = config.paths.masterKey;
+  const DB = config.paths.database;
+
+  interface FakeKeyring {
+    /** What `getPassword()` does: hand back a key, hand back null, or throw. */
+    read?: () => string | null;
+    /** Thrown instead of handing over the binding at all. */
+    loadError?: unknown;
+    /** Everything `setPassword()` was given, so a silent re-key is visible. */
+    written?: string[];
+  }
+
+  async function withCredentialStore<T>(
+    fake: FakeKeyring,
+    fn: (keychain: KeychainModule) => T | Promise<T>,
+  ): Promise<T> {
+    // The same interception point vitest.setup.ts uses, for the same reason: keychain.ts
+    // reaches the binding through `createRequire`, and that ends up in `Module._load`.
+    const cjs = Module as unknown as {
+      _load: (request: string, parent: unknown, isMain: boolean) => unknown;
+    };
+    const real = cjs._load;
+    cjs._load = function patched(this: unknown, request, parent, isMain) {
+      if (request !== '@napi-rs/keyring') return real.call(this, request, parent, isMain);
+      if (fake.loadError) throw fake.loadError;
+      return {
+        Entry: class {
+          getPassword(): string | null {
+            return fake.read ? fake.read() : null;
+          }
+          setPassword(value: string): void {
+            fake.written?.push(value);
+          }
+          deletePassword(): boolean {
+            return false;
+          }
+        },
+      };
+    };
+    try {
+      // A fresh copy of the module, because `cached` in the real one is already filled by
+      // the encryption tests above and would answer before any of this ran.
+      vi.resetModules();
+      return await fn(await import('../src/infra/crypto/keychain'));
+    } finally {
+      cjs._load = real;
+      vi.resetModules();
+    }
+  }
+
+  /** A database that only the master key can open, which is what makes minting a loss. */
+  function seedSealedRow(): void {
+    const db = new Database(DB);
+    db.exec('CREATE TABLE profile (id TEXT PRIMARY KEY, full_name TEXT NOT NULL)');
+    db.prepare('INSERT INTO profile (id, full_name) VALUES (?, ?)').run(
+      'p1',
+      encryptField('Eric Dean', 'p1'),
+    );
+    db.close();
+  }
+
+  function clean(): void {
+    for (const f of [KEYFILE, DB, `${DB}-wal`, `${DB}-shm`]) fs.rmSync(f, { force: true });
+  }
+
+  beforeEach(clean);
+  afterEach(clean);
+
+  it('refuses, rather than minting, when the credential store cannot be READ', async () => {
+    seedSealedRow();
+    const fake: FakeKeyring = {
+      // What the macOS Security framework says through the binding when the login keychain
+      // is locked, or the prompt in front of it is denied.
+      read: () => {
+        throw new Error('User interaction is not allowed.');
+      },
+      written: [],
+    };
+
+    await withCredentialStore(fake, (keychain) => {
+      expect(() => keychain.getMasterKey()).toThrow(/could not be read/i);
+      expect(fs.existsSync(KEYFILE), 'a fresh key was minted over sealed data').toBe(false);
+      expect(fake.written, 'the store was written to on the way past').toEqual([]);
+    });
+  });
+
+  it('refuses on an unreadable store even with nothing stored yet', async () => {
+    // Not conditional on there being something to lose, and deliberately so: a keyfile
+    // written during one locked moment is preferred over the credential store from then on
+    // — see the "DIFFERENT keys" branch — so a single denied prompt would otherwise leave
+    // this user on a plaintext key on disk permanently, on a machine whose keychain works.
+    await withCredentialStore(
+      {
+        read: () => {
+          throw new Error('User interaction is not allowed.');
+        },
+      },
+      (keychain) => {
+        expect(() => keychain.getMasterKey()).toThrow(/could not be read/i);
+        expect(fs.existsSync(KEYFILE)).toBe(false);
+      },
+    );
+  });
+
+  it('still falls back to a keyfile where there is genuinely no credential store', async () => {
+    // The other direction, and the one the fix above must not break: headless Linux and CI
+    // have no store to read, the keyfile is the documented path there, and a tool that
+    // refuses to start is a tool nobody can run.
+    const absent = Object.assign(new Error("Cannot find module '@napi-rs/keyring'"), {
+      code: 'MODULE_NOT_FOUND',
+    });
+
+    await withCredentialStore({ loadError: absent }, (keychain) => {
+      expect(keychain.getMasterKey().length).toBe(32);
+      expect(fs.existsSync(KEYFILE)).toBe(true);
+    });
+  });
+
+  it('does not mint through the keyfile path either, when data is already sealed', async () => {
+    // The sibling. `readFallbackKey` mints too, and it is reached whenever the binding will
+    // not load, the `Entry` constructor throws, or `setPassword` is refused — so guarding
+    // only the credential-store branch would have left three more ways to the same fresh
+    // random key over the same database.
+    seedSealedRow();
+    const absent = Object.assign(new Error("Cannot find module '@napi-rs/keyring'"), {
+      code: 'MODULE_NOT_FOUND',
+    });
+
+    await withCredentialStore({ loadError: absent }, (keychain) => {
+      expect(() => keychain.getMasterKey()).toThrow(/already holds encrypted data/i);
+      expect(fs.existsSync(KEYFILE), 'a fresh key was minted over sealed data').toBe(false);
+    });
+  });
+
+  it('refuses when the store answers "empty" over a database that is not', async () => {
+    // An empty store is not proof of a first run. An entry removed by a keychain repair, a
+    // login item that did not survive a migration, a profile moved between accounts: the
+    // ciphertext on disk is then the only evidence a key ever existed, and generating a
+    // second one is the same destruction arrived at politely.
+    seedSealedRow();
+    const fake: FakeKeyring = { read: () => null, written: [] };
+
+    await withCredentialStore(fake, (keychain) => {
+      expect(() => keychain.getMasterKey()).toThrow(/already holds encrypted data/i);
+      expect(fake.written, 'a new key was pushed into the store').toEqual([]);
+      expect(fs.existsSync(KEYFILE)).toBe(false);
+    });
+  });
+
+  it('still mints on a genuinely first run', async () => {
+    // The direction that keeps the guard from becoming a bug of its own: no key anywhere, no
+    // database, nothing to orphan. This is the path every new install takes.
+    const fake: FakeKeyring = { read: () => null, written: [] };
+
+    await withCredentialStore(fake, (keychain) => {
+      const key = keychain.getMasterKey();
+      expect(key.length).toBe(32);
+      expect(fake.written).toEqual([key.toString('base64')]);
+    });
+  });
+
+  it('mints when the database exists but holds nothing sealed yet', async () => {
+    // Migrations have run and the user has not confirmed a profile: the tables are there and
+    // empty. Reading "a database file exists" as "there is data" would refuse every start of
+    // an install that has not been used yet.
+    const db = new Database(DB);
+    db.exec('CREATE TABLE profile (id TEXT PRIMARY KEY, full_name TEXT NOT NULL)');
+    db.exec('CREATE TABLE writing_sample (id TEXT PRIMARY KEY, content TEXT NOT NULL)');
+    db.close();
+
+    await withCredentialStore({ read: () => null, written: [] }, (keychain) => {
+      expect(keychain.getMasterKey().length).toBe(32);
+    });
   });
 });

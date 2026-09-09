@@ -346,21 +346,61 @@ export function parseHybridDays(text: string): number | null {
 
 // ---------------------------------------------------------------- dates & duration
 
-/** Extracts an explicit term window, e.g. "June 2027 – August 2027". */
+/**
+ * The term window a posting states for the job, e.g. "June 2027 – August 2027".
+ *
+ * This took the first "<month> <year> to <month> <year>" anywhere in the text on no terms at
+ * all, and a posting dates far more than the job: when it opens applications, how long it
+ * reviews them, when decisions go out, when onboarding runs. Everything downstream then reads
+ * the result as the term. "Summer 2027 Software Engineering Internship. Applications open
+ * March 2027 to June 2027 and are reviewed on a rolling basis." was stored as a term of
+ * 2027-03..2027-06, and because those months overlap the Summer 2027 season window the
+ * eligibility rule treated them as CORROBORATED — an exact window, the one kind it is allowed
+ * to reject on. A student free 2027-06-01 to 2027-08-20, who could have taken that internship
+ * outright, was hard-failed with "Overlaps your availability by only about 4.2 weeks; 6 are
+ * needed." docs/05 says an inferred window may raise a question and never hard-fail; the way
+ * to keep that promise is not to hand the rule a window that was never the term.
+ *
+ * So a range has to be introduced as the job's own dates (TERM_WINDOW_INTRO) and must not be
+ * introduced as anything else the posting dates (NOT_TERM_WINDOW), and the reject wins when
+ * both are present — "Applications for this role open March 2027 to June 2027" names the role
+ * and is still an application window. Every range in the text gets that look rather than only
+ * the first, so "Applications are reviewed on a rolling basis from October 2026 until January
+ * 2027. The internship runs June 2027 to August 2027." now finds the real term instead of
+ * stopping on the first thing that looked like one. (That loop also fixes a smaller bug of the
+ * same shape: a first match whose words are not months — "Fall 2026 to Spring 2027" matches the
+ * range pattern and resolves to no months at all — used to abandon the search outright, so a
+ * co-op that then spelled its dates out was stored with no term.)
+ *
+ * A bare "June 2027 - August 2027" with nothing around it now yields null, and that is the
+ * intended trade. An unlabelled range is exactly the one this cannot tell from an application
+ * window, and the posting's season and year still give the rule an approximate window to work
+ * from — which can raise a question but can never reject anyone.
+ */
 export function parseTermDates(text: string): { start: string; end: string } | null {
   const re =
-    /\b([a-z]{3,9})\.?\s+(20\d{2})\s*(?:-|–|—|to|through|until)\s*([a-z]{3,9})\.?\s+(20\d{2})\b/i;
-  const m = text.match(re);
-  if (!m) return null;
+    /\b([a-z]{3,9})\.?\s+(20\d{2})\s*(?:-|–|—|to|through|until)\s*([a-z]{3,9})\.?\s+(20\d{2})\b/gi;
 
-  const sm = MONTHS[m[1]!.slice(0, 3).toLowerCase()];
-  const em = MONTHS[m[3]!.slice(0, 3).toLowerCase()];
-  if (!sm || !em) return null;
+  for (const m of text.matchAll(re)) {
+    const sm = MONTHS[m[1]!.slice(0, 3).toLowerCase()];
+    const em = MONTHS[m[3]!.slice(0, 3).toLowerCase()];
+    if (!sm || !em) continue;
 
-  return {
-    start: `${m[2]}-${String(sm).padStart(2, '0')}`,
-    end: `${m[4]}-${String(em).padStart(2, '0')}`,
-  };
+    // Only the clause the range sits in speaks for it, the same rule parseDurationWeeks and
+    // parseCompensation use: a deadline in the next sentence says nothing about these months.
+    const before = clauseBefore(text, m.index);
+    const after = clauseAfter(text, m.index + m[0].length);
+
+    if (NOT_TERM_WINDOW.test(before) || NOT_TERM_WINDOW.test(after)) continue;
+    if (!TERM_WINDOW_INTRO.test(before) && !TERM_WINDOW_INTRO.test(after)) continue;
+
+    return {
+      start: `${m[2]}-${String(sm).padStart(2, '0')}`,
+      end: `${m[4]}-${String(em).padStart(2, '0')}`,
+    };
+  }
+
+  return null;
 }
 
 const WEEKS_RE = /\b(\d{1,2})\s*[-–]?\s*(?:to\s*)?(\d{1,2})?\s*weeks?\b/gi;
@@ -373,6 +413,45 @@ const TERM_CONTEXT =
 /** Wording that makes it the length of something else the posting mentions. */
 const NOT_TERM_CONTEXT =
   /\b(?:paid time off|pto|vacation|holidays?|leave|sick|notice|onboarding|orientation|training|ramp[- ]?up|applications?\s+(?:close|closing|open)|deadline|respon(?:se|d)|hear back|review|probation|extension|notice period)\b/i;
+
+/**
+ * Wording that introduces a month range as the window the JOB runs in — what parseTermDates
+ * above demands before it will call a range the term.
+ *
+ * The season words are in here because "Summer 2027: June 2027 – August 2027" and "Summer 2027
+ * cohort, running June 2027 to August 2027" are ordinary phrasings and the range is the term in
+ * both; a season word next to an application word loses anyway, since the reject is tested
+ * first.
+ */
+const TERM_WINDOW_INTRO =
+  /\b(?:internships?|interns?|co-?ops?|program(?:me)?s?|placements?|fellowships?|apprenticeships?|externships?|rotations?|cohorts?|sessions?|positions?|roles?|jobs?|assignments?|terms?|semesters?|dates?|duration|runs?|running|ran|lasts?|lasting|starts?|starting|begins?|beginning|scheduled|takes? place|taking place|works?|working|employed|summer|fall|autumn|winter|spring)\b/i;
+
+/**
+ * Wording that makes a month range some OTHER window the posting dates.
+ *
+ * Built on NOT_TERM_CONTEXT because the question is the same one asked of a span of weeks, and
+ * the two drifting apart is how this class of bug survives a fix: an onboarding, training or
+ * probation window is no more the term when it is written "May 2027 to June 2027" than when it
+ * is written "6 weeks". What is added here is the hiring calendar, which a length in weeks
+ * rarely describes but a month range constantly does — the reported case was an application
+ * window, and the siblings that read exactly the same way are "applications are accepted from
+ * September 2026 through November 2026", "the review period runs January 2027 to March 2027",
+ * "decisions will be sent March 2027 through May 2027", "interviews take place October 2026 to
+ * December 2026", "offers are extended November 2026 through January 2027" and every posting
+ * that says applications are read on a rolling basis between two months.
+ *
+ * `offer` is the one word here that has to be qualified: "This internship offers a placement
+ * from June 2027 to August 2027" is a term, so only an offer that is sent, made or extended
+ * counts as the hiring calendar.
+ */
+const NOT_TERM_WINDOW = new RegExp(
+  `${NOT_TERM_CONTEXT.source}|` +
+    '\\b(?:appl(?:y|ies|ied|ying)|applications?|applicants?|submi(?:t|ts|tted|tting|ssions?)|' +
+    'deadlines?|closes?|closed|closing|rolling|interviews?|interviewing|screening|' +
+    'assessments?|decisions?|notif\\w*|recruit\\w*|selection|shortlist\\w*|offer letters?|' +
+    'offers? (?:are|will|go|made|sent|extended|released))\\b',
+  'i',
+);
 
 /**
  * How long the job lasts.

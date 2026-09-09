@@ -677,3 +677,48 @@ describe('what those dates do at G3', () => {
     expect(guard(withDate('2023-01'), say('three years'), question).blocking).toEqual([]);
   });
 });
+
+/**
+ * The header line, split into a city and a state the rest of the app can use.
+ *
+ * "Portland, OR 97214" is the ordinary way a US resume writes it, and splitting on the comma
+ * alone put the whole of "OR 97214" in the region. That value does not just sit there:
+ * `valueFor` in core/filling/plan.ts falls back to `locationPrefs.base.region` for a form's
+ * State field, so a real application got "OR 97214" typed into a control that wanted "OR" —
+ * a state no dropdown offers, asserted in the user's name on a screen with no state control
+ * to correct it on.
+ *
+ * Both directions are pinned. Trimming harder than this is its own bug: "Brooklyn, New York"
+ * and "Region 5, CA" have to come through untouched, and a part that is nothing BUT a
+ * postcode is left where the user can see it rather than silently emptied.
+ */
+describe('a resume header that prints the postcode next to the state', () => {
+  const base = (location: string) => draft({ location }).locationPrefs.base;
+
+  it('keeps the state and drops the postcode printed beside it', () => {
+    expect(base('Portland, OR 97214')).toMatchObject({ city: 'Portland', region: 'OR' });
+    expect(base('Austin, TX 78701-1234')).toMatchObject({ city: 'Austin', region: 'TX' });
+    expect(base('Toronto, ON M5V 3A8')).toMatchObject({ city: 'Toronto', region: 'ON' });
+  });
+
+  it('leaves a region alone that is not a state followed by a postcode', () => {
+    expect(base('Columbus, OH').region).toBe('OH');
+    expect(base('Brooklyn, New York').region).toBe('New York');
+    expect(base('Region 5, CA').region).toBe('CA');
+    // Nothing precedes it, so there is no state to keep — and emptying the box would throw
+    // away the one thing the line did say. It stays, flagged, for the user to sort out.
+    expect(base('Portland, 97214').region).toBe('97214');
+  });
+
+  /**
+   * The reason this matters, asserted where the damage actually happened rather than only on
+   * the parser. A guard on `splitLocation` alone would not notice if `valueFor` started
+   * reading some other field.
+   */
+  it('so the State field of a form is offered a state', async () => {
+    const { valueFor } = await import('../src/core/filling/plan');
+    const profile = confirmed(draft({ location: 'Portland, OR 97214' }));
+    const field = { semantic: 'region' } as never;
+    expect(valueFor(field, profile as never)).toBe('OR');
+  });
+});

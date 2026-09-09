@@ -27,6 +27,47 @@ const BADGE: Record<string, { label: string; color: string }> = {
 };
 
 /**
+ * How much of a stored description the disclosure below the decision buttons will draw.
+ *
+ * A ceiling rather than the whole string because a few Workday postings carry forty thousand
+ * characters of boilerplate, and the browser lays out every one of them the moment the
+ * <details> opens.
+ */
+const DESCRIPTION_LIMIT = 8000;
+
+/**
+ * The description as it will be shown, and where it had to stop.
+ *
+ * `slice(0, 8000)` was applied unconditionally with nothing after it: no ellipsis, no note,
+ * no link. The text simply ended, mid-sentence, under a summary that says "Full job
+ * description" — and the paragraph an internship posting most often puts last is the one
+ * naming a hard requirement ("must be a US citizen", "must be enrolled through spring 2028").
+ * At G2 the user is deciding on that text; a cut it cannot see is a decision made on half a
+ * posting.
+ */
+export function descriptionExcerpt(text: string): { shown: string; cutAt: number | null } {
+  if (text.length <= DESCRIPTION_LIMIT) return { shown: text, cutAt: null };
+  return { shown: `${text.slice(0, DESCRIPTION_LIMIT)}…`, cutAt: DESCRIPTION_LIMIT };
+}
+
+/** What the detail column has to draw right now. */
+export type PaneState = 'failed' | 'loading' | 'ready';
+
+/**
+ * Three states, because the pane had one.
+ *
+ * It rendered on `current && detail`, and `detail` is set to null the instant the selection
+ * moves and left null when the fetch rejects. So the column was blank while a match loaded
+ * and blank forever after a match failed to load, and the two were indistinguishable from
+ * each other and from a posting with nothing in it — beside a list of rows the user had just
+ * clicked, at the gate where they are about to approve one.
+ */
+export function detailPaneState(detail: MatchDetail | null, error: string | null): PaneState {
+  if (error !== null) return 'failed';
+  return detail === null ? 'loading' : 'ready';
+}
+
+/**
  * The review queue — docs/08 § Matches. Gate G2 lives here.
  *
  * Keyboard-first: triaging forty postings should feel like triaging email. There is
@@ -55,6 +96,17 @@ export function Matches({
   const [band, setBand] = useState<Band>('eligible_and_unknown');
   const [selected, setSelected] = useState<string | null>(null);
   const [detail, setDetail] = useState<MatchDetail | null>(null);
+  /**
+   * A failed detail fetch, kept beside the pane it belongs to rather than in the page banner.
+   *
+   * The catch below set the page-level `error`, at the top of the screen above the band
+   * chips, while the pane the user was looking at stayed empty — so the posting they had just
+   * clicked read as one with no title, no requirements and no score, and the sentence saying
+   * why was somewhere off the top of a scrolled queue. The message belongs where the hole is.
+   */
+  const [detailError, setDetailError] = useState<string | null>(null);
+  /** Bumped by the pane's own "Try again", which is what re-runs the fetch below. */
+  const [detailAttempt, setDetailAttempt] = useState(0);
   const [rejecting, setRejecting] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   /**
@@ -129,23 +181,27 @@ export function Matches({
   }, [load]);
 
   useEffect(() => {
-    if (!selected) {
-      setDetail(null);
-      return;
-    }
     // Cleared first. Without this the pane rendered the PREVIOUS posting's title,
     // rationale, requirements and score beside the NEW posting's location, because
     // the selected row updates synchronously and the detail only when the fetch resolves.
     // On a failed fetch the mismatch stayed on screen for the rest of the session.
     setDetail(null);
+    // And the previous posting's failure with it, or moving off a match that would not load
+    // left its error sitting over the next one, which loads fine.
+    setDetailError(null);
+    if (!selected) return;
     let cancelled = false;
     getMatch(selected)
-      .then((d) => !cancelled && setDetail(d))
-      .catch((e: unknown) => !cancelled && setError(e instanceof Error ? e.message : String(e)));
+      .then((d) => {
+        if (!cancelled) setDetail(d);
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) setDetailError(e instanceof Error ? e.message : String(e));
+      });
     return () => {
       cancelled = true;
     };
-  }, [selected]);
+  }, [selected, detailAttempt]);
 
   const move = useCallback(
     (delta: number) => {
@@ -472,6 +528,22 @@ export function Matches({
 
           {/* detail */}
           <div>
+            {/* A slow read and a dead one said the same thing, which was nothing at all.
+                Both now speak, and the failure carries the control that actually re-runs the
+                fetch that failed rather than one that quietly re-reads something else. */}
+            {detailPaneState(detail, detailError) === 'loading' && (
+              <p className="text-dim a-pulse">Reading the posting…</p>
+            )}
+            {detailPaneState(detail, detailError) === 'failed' && (
+              <Notice tone="redline">
+                <strong>This posting would not open.</strong> {detailError}
+                <div className="mt-3">
+                  <Button size="sm" onClick={() => setDetailAttempt((n) => n + 1)}>
+                    Try again
+                  </Button>
+                </div>
+              </Notice>
+            )}
             {current && detail && (
               <>
                 <Section n="01" title="The posting" step={3}>
@@ -510,64 +582,24 @@ export function Matches({
                 </Section>
 
                 <Section n="04" title="Your call" step={6}>
-                  {rejecting ? (
-                    <div>
-                      <p className="text-dim mb-3 text-base">Why not this one?</p>
-                      <div className="flex flex-wrap gap-2">
-                        {REJECT_REASONS.map((r) => (
-                          <Button key={r.tag} onClick={() => void reject(r.tag, r.label)}>
-                            {r.label}
-                          </Button>
-                        ))}
-                        <Button onClick={() => setRejecting(false)}>Cancel</Button>
-                      </div>
-                    </div>
-                  ) : (
-                    <>
-                      <div className="flex flex-wrap gap-3">
-                        <Button variant="solid" onClick={() => void act('approved')}>
-                          Approve (A)
-                        </Button>
-                        <Button onClick={() => void act('saved')}>Save (L)</Button>
-                        <Button onClick={() => void act('skipped')}>Skip (S)</Button>
-                        <Button variant="danger" onClick={() => setRejecting(true)}>
-                          Reject (X)
-                        </Button>
-                        <a
-                          href={detail.posting.applyUrl}
-                          target="_blank"
-                          rel="noreferrer noopener"
-                          className="u-data border-rule text-dim hover:text-ink hover:border-rule-strong hover:bg-ink/[0.04] inline-flex items-center rounded border px-4 py-2 tracking-wide uppercase transition-colors"
-                        >
-                          Open posting
-                          <ExternalLink aria-hidden size={14} />
-                        </a>
-                      </div>
-                      {/* The second sentence is here because Save, Skip and Reject look like
-                        three outcomes and behave like one. Each is written down as its own
-                        decision on the server, and nothing in this interface reads any of
-                        them back: there is no saved list, no decided view and no undo, so
-                        someone who pressed Save meaning "come back to this" watched the
-                        posting leave the queue for good and went looking for a screen that
-                        does not exist. Say so until one does. */}
-                      <p className="text-faint mt-4 u-prose text-sm">
-                        Approving creates an application you review at gate G3. It does not submit
-                        anything — you do that <em>yourself</em>, on the real page. Save and Skip
-                        both take the posting out of the queue, as does Reject. Each is recorded as
-                        its own decision, but nothing here reads any of them back yet, so treat all
-                        three as final.
-                      </p>
-                    </>
-                  )}
+                  <DecisionRow
+                    busy={busy}
+                    rejecting={rejecting}
+                    onRejecting={setRejecting}
+                    act={act}
+                    reject={reject}
+                    applyUrl={detail.posting.applyUrl}
+                  />
                 </Section>
 
                 <details className="u-card-flat mt-8 px-5 py-4">
                   <summary className="u-eyebrow hover:text-ink cursor-pointer transition-colors">
                     Full job description
                   </summary>
-                  <div className="text-dim mt-4 u-prose text-sm leading-relaxed whitespace-pre-wrap">
-                    {detail.posting.descriptionText.slice(0, 8000)}
-                  </div>
+                  <FullDescription
+                    text={detail.posting.descriptionText}
+                    applyUrl={detail.posting.applyUrl}
+                  />
                 </details>
               </>
             )}
@@ -583,5 +615,164 @@ export function Matches({
         <p className="u-eyebrow">j&nbsp;/&nbsp;k&nbsp;move&nbsp;between&nbsp;postings</p>
       </footer>
     </Page>
+  );
+}
+
+/**
+ * Gate G2's four decisions, and the one link out.
+ *
+ * Split out of the pane so the disabling below can be tested rather than only looked at.
+ *
+ * EVERY control here is held while anything at all is running, which is the fix: `act` and
+ * `reject` both open with `if (!selected || busyRef.current) return`, and nothing on screen
+ * said so. During a Recompute — which takes as long as it takes, re-extracting requirements
+ * with the model — all four buttons stayed lit, and pressing Approve returned at that first
+ * line. No application was created, no row left the list, no message appeared: the user had
+ * approved a posting and the screen agreed with them that nothing had happened. The same held
+ * for a second press during any decision's own round trip.
+ *
+ * The sentence beside them is for the keyboard, which cannot be greyed out. `a`, `s`, `l` and
+ * the reject sheet run through the same guard and drop just as silently, so the reason they
+ * are doing nothing is written where someone reaching for them will read it.
+ */
+export function DecisionRow({
+  busy,
+  rejecting,
+  onRejecting,
+  act,
+  reject,
+  applyUrl,
+}: {
+  busy: string | null;
+  rejecting: boolean;
+  onRejecting: (value: boolean) => void;
+  act: (action: 'approved' | 'skipped' | 'saved') => void;
+  reject: (tag: string, label: string) => void;
+  applyUrl: string;
+}) {
+  const held = busy !== null;
+
+  return (
+    <>
+      {rejecting ? (
+        <div>
+          <p className="text-dim mb-3 text-base">Why not this one?</p>
+          <div className="flex flex-wrap gap-2">
+            {REJECT_REASONS.map((r) => (
+              <Button key={r.tag} disabled={held} onClick={() => reject(r.tag, r.label)}>
+                {r.label}
+              </Button>
+            ))}
+            {/* Not held: closing the sheet asks the server for nothing, and taking away the
+                way out of a sheet whose seven other buttons have just gone grey would leave
+                the user with no move at all. */}
+            <Button onClick={() => onRejecting(false)}>Cancel</Button>
+          </div>
+        </div>
+      ) : (
+        <>
+          <div className="flex flex-wrap gap-3">
+            <Button variant="solid" disabled={held} onClick={() => act('approved')}>
+              Approve (A)
+            </Button>
+            <Button disabled={held} onClick={() => act('saved')}>
+              Save (L)
+            </Button>
+            <Button disabled={held} onClick={() => act('skipped')}>
+              Skip (S)
+            </Button>
+            {/* Reject opens the sheet rather than deciding, so it spends nothing itself — but
+                every button inside that sheet is held, and offering a sheet that can only be
+                cancelled is a worse answer than not opening it. */}
+            <Button variant="danger" disabled={held} onClick={() => onRejecting(true)}>
+              Reject (X)
+            </Button>
+            <a
+              href={applyUrl}
+              target="_blank"
+              rel="noreferrer noopener"
+              className="u-data border-rule text-dim hover:text-ink hover:border-rule-strong hover:bg-ink/[0.04] inline-flex items-center rounded border px-4 py-2 tracking-wide uppercase transition-colors"
+            >
+              Open posting
+              <ExternalLink aria-hidden size={14} />
+            </a>
+          </div>
+          {/* The second sentence is here because Save, Skip and Reject look like
+            three outcomes and behave like one. Each is written down as its own
+            decision on the server, and nothing in this interface reads any of
+            them back: there is no saved list, no decided view and no undo, so
+            someone who pressed Save meaning "come back to this" watched the
+            posting leave the queue for good and went looking for a screen that
+            does not exist. Say so until one does. */}
+          <p className="text-faint mt-4 u-prose text-sm">
+            Approving creates an application you review at gate G3. It does not submit anything —
+            you do that <em>yourself</em>, on the real page. Save and Skip both take the posting out
+            of the queue, as does Reject. Each is recorded as its own decision, but nothing here
+            reads any of them back yet, so treat all three as final.
+          </p>
+        </>
+      )}
+      {held && (
+        <p className="text-caution mt-4 u-prose text-sm">
+          {busy} — decisions are held until it finishes, by button and by key alike.
+        </p>
+      )}
+    </>
+  );
+}
+
+/**
+ * The stored description, and the truth about where it ends.
+ *
+ * The cut used to be silent: the text stopped and the summary above it went on saying "Full
+ * job description". Both halves of the honest version matter — the ellipsis, so the reader
+ * can see the sentence was severed, and the line underneath, so they know there is more and
+ * where to read it.
+ */
+export function FullDescription({ text, applyUrl }: { text: string; applyUrl: string }) {
+  const { shown, cutAt } = descriptionExcerpt(text);
+
+  // An empty description is its own claim. A feed that stored a posting with no body left
+  // this disclosure opening onto a blank box, which reads as a rendering fault rather than as
+  // "there was nothing to store".
+  if (text.trim() === '') {
+    return (
+      <p className="text-faint mt-4 u-prose text-sm">
+        This posting was stored without a description. The requirements above were read from
+        whatever the source did send.{' '}
+        <a
+          href={applyUrl}
+          target="_blank"
+          rel="noreferrer noopener"
+          className="text-dim hover:text-ink underline underline-offset-4"
+        >
+          Read it on the posting
+        </a>
+        .
+      </p>
+    );
+  }
+
+  return (
+    <>
+      <div className="text-dim mt-4 u-prose text-sm leading-relaxed whitespace-pre-wrap">
+        {shown}
+      </div>
+      {cutAt !== null && (
+        <p className="text-faint mt-3 u-prose text-sm">
+          Cut here, after {cutAt.toLocaleString()} characters of {text.length.toLocaleString()}. The
+          rest is on the posting, and a requirement stated in it is one this page has not shown you.{' '}
+          <a
+            href={applyUrl}
+            target="_blank"
+            rel="noreferrer noopener"
+            className="text-dim hover:text-ink underline underline-offset-4"
+          >
+            Read the whole thing
+          </a>
+          .
+        </p>
+      )}
+    </>
   );
 }

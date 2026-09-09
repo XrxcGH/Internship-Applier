@@ -129,7 +129,11 @@ this order:
    constructions that get flagged automatically.
 2. **VOICE** — `voiceInstructions(style)`: the measured metrics stated as sentences, never
    as adjectives. "Write naturally" is what every model already thinks it is doing.
-3. **LENGTH** — the form's word ceiling, or 120–200 words when it states none.
+3. **LENGTH** — the form's word ceiling, or 120–200 words when it states none. In practice
+   always the latter. The ceiling arrives as `maxWords` on the draft request, and nothing
+   carries a form's `maxLength` from the FormMap into that request: `Applications.tsx` calls
+   `draftAnswer(id)` with no second argument, so a caller driving the API by hand is the only
+   way a form's own limit ever reaches the prompt.
 4. **EVIDENCE** — the retrieved set, one fact per line, each tagged with its ref.
 5. **HOW THIS PERSON ACTUALLY WRITES** — up to three verbatim writing samples, each capped
    at 1200 characters.
@@ -158,7 +162,7 @@ sentences). Each claim is classified:
 | --- | --- | --- |
 | `supported` | Maps to a specific profile fact | Green underline; hover shows the evidence |
 | `inferred` | Reasonable restatement (e.g. "I enjoy backend work" from three backend projects) | Amber; shown with the inference stated |
-| `unsupported` | No profile basis | **Red. Blocks approval** until edited or explicitly acknowledged |
+| `unsupported` | No profile basis | **Red. Blocks approval** until the sentence is edited or the fact is added to the profile |
 | `overstated` | Supported fact, inflated (2 months → "extensive experience") | Red, with the original fact quoted alongside |
 
 Implementation, in the order the layers actually matter:
@@ -177,9 +181,31 @@ way round: semantic overstatement the regexes cannot reach — "I led the migrat
 evidence says "helped with the migration" — is caught by the human at G3 and by nothing
 else.
 
-`unsupported` and `overstated` flags are hard blockers on `approved_at`. The user can
-override by editing the text, or by clicking "this is true, it's just not on my resume" —
-which prompts them to add the fact to the profile, so the next answer knows it too.
+`unsupported` and `overstated` flags are hard blockers on `approved_at`, and there is no way
+to click past one. `POST /api/answers/:id/approve` re-verifies the text at approval time and
+answers 409 `UNVERIFIED_CLAIMS` while any blocking flag stands. It reads no body at all, so
+there is no parameter an override could arrive in, and `AnswerReview.tsx` renders the Approve
+button disabled rather than offering a second one.
+
+Two things clear a block, and both change what is being checked rather than who is checking:
+
+- **Edit the sentence** so it claims what the evidence supports. The next verification runs
+  on the edited text.
+- **Add the fact to your profile**, then approve again. The re-check runs against the profile
+  as it stands, so a true fact that was simply never on the resume clears the block here and
+  for every later answer. This is the route out of a false red, and it is the one the screen
+  names: *"Fix the flagged claims above, or add the missing facts to your profile."*
+
+> **Not built:** the "this is true, it's just not on my resume" acknowledgement this section
+> used to promise. It was the worst sentence in these documents, because the only reader who
+> ever reaches it is the one holding a false red — and it sent that reader hunting the
+> interface for a control that has never existed, on the one screen where being stuck is
+> already the problem. There is no such button, no request field, and no branch in the route.
+> docs/11 § M5 has said the opposite all along: "G3 enforced server-side with no override".
+> `answers.test.ts` asserts the bulk-approve half — three plausible approve-everything paths
+> all answer 404. The no-override half is true of the code and guarded by nothing: the
+> handler takes no body, so today there is no field an override could arrive in, and no test
+> would go red if one were added.
 
 ### ⑤ StyleCritic
 
@@ -285,13 +311,26 @@ Fixing one flag means editing the answer.
 
 Not a rubber stamp. The workspace shows, per question:
 
-- The question exactly as it appears on the form, with its length limit and a live counter.
+- The question exactly as it appears on the form, with a word count beside it. Two words this
+  bullet used to carry and should not have. **Not a *live* counter:** the badge is measured
+  off `answer.text`, the saved text, not off the textarea, so it sits still while you type
+  and moves when the edit is saved. **And no *length limit*:** `maxWords` is a parameter on
+  the draft call that `Applications.tsx` never sends, so no ceiling reaches the prompt from
+  the UI and none is displayed anywhere on the card. A form's own `maxLength` is read by the
+  FormMap and applied at fill time — `plan.ts` truncates to it — which is a later gate and a
+  different number.
 - The draft in an editor.
 - An evidence panel: every claim, its verdict, and the profile fact behind it.
-- Flags, each with an inline fix action.
-- An **edit distance meter.** If the user approves a draft with zero edits, the confirm
-  dialog says so: *"You haven't changed anything. Read it once more — you're the one
-  signing this."* It doesn't block, but it doesn't let the moment pass silently either.
+- Flags, each quoted with the span it refers to, in three lists — blocking claims, AI tells,
+  style drift. **Static lists:** there is no per-flag action, for the same reason § ⑥ gives
+  for the "rewrite this span" button that was never built. Fixing a flag means editing the
+  answer.
+- An **edit distance meter** — a bar and a sentence, always on the card, reading "Unedited so
+  far." until something changes. **Not a dialog:** there is no confirm step anywhere in
+  `apps/web/src`, so approving an untouched draft is one click like any other. What stands in
+  for it is the line beside the Approve button, shown whether or not anything was edited:
+  *"Read it once more. Approving means you stand behind every sentence."* Weaker than the
+  interruption this section used to describe, and the honest account of what happens.
 
 `approved_at` is set only by an explicit per-answer action. Form filling refuses to start
 while any answer is unapproved (doc 03, invariant 2).

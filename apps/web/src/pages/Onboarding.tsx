@@ -1205,6 +1205,27 @@ function UploadStep({
     }
   }
 
+  /**
+   * The same handover as `handle`, without the file or the model.
+   *
+   * Shares the one-at-a-time guard and the busy indicator, because it is the same screen
+   * leaving for the same next step; the only difference is how much of the profile is filled
+   * in when it gets there.
+   */
+  async function byHand() {
+    if (busy !== null) return;
+    onError('');
+    try {
+      setBusy('Setting up an empty profile…');
+      const started = await api.blankProfile();
+      onExtracted(started.profile, started.withdrawnApprovals);
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   return (
     <Section n="01" title="Your resume" step={3}>
       <button
@@ -1243,6 +1264,32 @@ function UploadStep({
         PDFs are sent to the model and read there rather than through a text-extraction library,
         because that copes with scans and multi-column layouts far better. A DOCX or a text file has
         its extracted text sent instead. <em>The copy that is kept lives on this machine.</em>
+      </p>
+
+      {/* The way past this screen for anyone the dropzone cannot serve.
+
+          Reading a resume is the one step here that needs a model, and without one this screen
+          was the end of the application: the upload failed with an error telling the user that
+          "profile fields must be entered by hand" — which is what GET /api/model-access has
+          always said — while offering nowhere to enter them. Everything downstream is gated on
+          G1, so a missing model did not reduce the tool, it stopped it.
+
+          Deliberately quiet, and deliberately not hidden behind a model-access check. It is
+          the slower road for everyone, so it should not compete with the dropzone; but a user
+          whose CLI is signed out, or whose extraction keeps failing, or who would simply
+          rather not send the file, all need the same door and none of them shows up in a
+          capability probe. */}
+      <p className="text-faint mt-6 text-sm">
+        No model on this machine, or would rather not send the file?{' '}
+        <button
+          type="button"
+          disabled={busy !== null}
+          onClick={() => void byHand()}
+          className="text-accent underline underline-offset-4 disabled:opacity-50"
+        >
+          Fill the profile in yourself
+        </button>
+        . Every box starts empty and flagged, and G1 still has to be passed the same way.
       </p>
     </Section>
   );

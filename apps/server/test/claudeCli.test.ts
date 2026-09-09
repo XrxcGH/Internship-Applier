@@ -27,6 +27,7 @@ import {
   claudeCliBackend,
   notLoggedInMessage,
   resetCliProbe,
+  silentFailure,
   usageLimitMessage,
 } from '../src/infra/llm/claudeCli';
 import { db, schema } from '../src/infra/db/client';
@@ -49,6 +50,8 @@ function writeFakeCli(
     | 'usage_limit'
     | 'garbage'
     | 'crash'
+    | 'silent_exit_1'
+    | 'silent_exit_0'
     | 'no_flag_but_mentions_a_limit'
     | 'no_cost'
     | 'silly_cost',
@@ -65,6 +68,10 @@ process.stdin.on('end', () => {
   const mode = ${JSON.stringify(behaviour)};
   if (mode === 'garbage') { process.stdout.write('<html>not json</html>'); process.exit(0); }
   if (mode === 'crash') { process.stderr.write('boom'); process.exit(3); }
+  // The failure measured on a real machine: exit 1, nothing on stdout, nothing on stderr.
+  if (mode === 'silent_exit_1') { process.exit(1); }
+  // The same emptiness wearing a success code, which used to be read as a format change.
+  if (mode === 'silent_exit_0') { process.exit(0); }
 
   const env = { type: 'result', subtype: 'success', session_id: 'x', num_turns: 1, total_cost_usd: 0.01, is_error: false, result: '' };
   if (mode === 'not_logged_in') { env.is_error = true; env.result = 'Not logged in · Please run /login'; }
@@ -377,6 +384,56 @@ describe('failures a person can act on', () => {
     expect(msg).toContain('boom');
   }, 60_000);
 
+  /**
+   * The run that produced this test, verbatim: the first resume extraction of the session
+   * failed after 57 seconds with exactly "The Claude CLI reported an error: exit code 1" —
+   * empty stdout, empty stderr, so the detail chain fell through to the exit code. The
+   * identical request worked forty seconds later. A number is not a cause, and the message
+   * did not mention the one thing that fixes a transient failure.
+   */
+  it('does not answer a silent failure with nothing but an exit code', async () => {
+    writeFakeCli('silent_exit_1');
+    const msg = await fails();
+
+    expect(msg).not.toBe('The Claude CLI reported an error: exit code 1');
+    expect(msg).toMatch(/without saying why/i);
+    expect(msg).toMatch(/try again/i);
+    // The code stays in — it is the only fact there is, and a bug report wants it.
+    expect(msg).toContain('exit code 1');
+    // And nothing beyond it. The process named no cause, so neither may this: a guess at
+    // credentials or the account is the wrong-diagnosis-with-a-confident-remedy failure
+    // this file already has three tests about.
+    expect(msg).not.toMatch(/signed in|sign in|usage limit|quota|api key/i);
+  }, 60_000);
+
+  it('says the same true thing on an empty exit 0, instead of blaming the output format', async () => {
+    // Exit 0 with no output at all landed in the unreadable branch and told the user their
+    // CLI "may have been updated to a different output format" — a confident claim about
+    // the shape of an answer that was never printed.
+    writeFakeCli('silent_exit_0');
+    const msg = await fails();
+
+    expect(msg).toMatch(/without saying why/i);
+    expect(msg).toMatch(/try again/i);
+    expect(msg).not.toMatch(/output format/i);
+  }, 60_000);
+
+  it('still prefers whatever the CLI did say, when it said anything', async () => {
+    // The other direction, and the one the change must not cost: stderr is a real detail
+    // and must not be replaced by the generic "it did not say why".
+    writeFakeCli('crash');
+    const msg = await fails();
+    expect(msg).toContain('boom');
+    expect(msg).not.toMatch(/without saying why/i);
+  }, 60_000);
+
+  it('still blames the output format when there WAS output it could not read', async () => {
+    writeFakeCli('garbage');
+    const msg = await fails();
+    expect(msg).toMatch(/different output format/i);
+    expect(msg).not.toMatch(/without saying why/i);
+  }, 60_000);
+
   it('says the CLI is missing, and how to install it', async () => {
     process.env['CLAUDE_CLI_PATH'] = path.join(dir, 'does-not-exist');
     resetCliProbe();
@@ -395,6 +452,20 @@ describe('the message matchers on their own', () => {
   it('recognises limit wording without swallowing ordinary prose', () => {
     expect(usageLimitMessage('Claude usage limit reached')).toBeTruthy();
     expect(usageLimitMessage('I have no limits on my availability')).toBeNull();
+  });
+
+  /**
+   * The sibling of the exit-code message, and the one a spawned test cannot reach portably:
+   * `code` is null when the child dies on a signal rather than exiting, and the string it
+   * was interpolated into rendered the literal word "null" — "exit code null", to a student
+   * mid-application.
+   */
+  it('never says "exit code null" for a process that was killed rather than exiting', () => {
+    expect(silentFailure(null)).not.toContain('null');
+    expect(silentFailure(null)).toMatch(/killed/i);
+    expect(silentFailure(1)).toContain('exit code 1');
+    // Both spellings still point at the action that actually clears a transient failure.
+    expect(silentFailure(null)).toMatch(/try again/i);
   });
 });
 
@@ -434,6 +505,15 @@ describe('why a model call failed', () => {
     ).rejects.toMatchObject({ reason: 'cli_error', isSetupProblem: false });
   });
 
+  it('marks a failure with no output as the CLI erroring, not as absent access', async () => {
+    // `isSetupProblem` is what webSearch.ts branches on, and a false here is how a
+    // transient crash ends up telling a signed-in student to set up model access.
+    writeFakeCli('silent_exit_1');
+    await expect(
+      claudeCliBackend.generate({ purpose: 'answer_draft', system: 's', user: 'u' }),
+    ).rejects.toMatchObject({ reason: 'cli_error', isSetupProblem: false });
+  });
+
   it('marks unreadable output as unreadable', async () => {
     writeFakeCli('garbage');
     await expect(
@@ -460,7 +540,14 @@ describe('why a model call failed', () => {
     // The type is a union and TypeScript checks the throw sites, but the two consumers pick
     // their wording off `isSetupProblem` — so a reason added later without a decision about
     // which side of that line it falls on would silently inherit "something went wrong".
-    for (const behaviour of ['not_logged_in', 'usage_limit', 'crash', 'garbage'] as const) {
+    for (const behaviour of [
+      'not_logged_in',
+      'usage_limit',
+      'crash',
+      'garbage',
+      'silent_exit_1',
+      'silent_exit_0',
+    ] as const) {
       writeFakeCli(behaviour);
       const err = await claudeCliBackend
         .generate({ purpose: 'answer_draft', system: 's', user: 'u' })

@@ -184,11 +184,61 @@ function userMessage(req: DraftRequest): string {
 /**
  * Goes through the provider seam rather than the SDK directly, so the same drafting code
  * runs against an API key or against the user's own Claude Code CLI.
+ *
+ * The whole result, not `res.text`. Returning the text alone is what discarded `stopReason`
+ * — see `incompleteReason`.
  */
-async function generate(system: string, user: string, maxTokens: number): Promise<string> {
-  const res = await llm.generate({ purpose: 'answer_draft', system, user, maxTokens });
-  return res.text;
+async function generate(
+  system: string,
+  user: string,
+  maxTokens: number,
+): Promise<llm.GenerateResult> {
+  return llm.generate({ purpose: 'answer_draft', system, user, maxTokens });
 }
+
+/** Why a generation cannot stand as an answer. */
+type Incomplete = 'cut_off' | 'declined' | 'empty';
+
+/**
+ * Was the model still writing when this came back?
+ *
+ * `stopReason` was read by nobody here. A model that exhausts its output budget stops
+ * mid-word — "the part I keep coming back to is the tooling nobody" — and that fragment was
+ * written to `draftText` AND `finalText`, cleared whatever approval the row already had, and
+ * arrived at G3 looking like a finished draft: no flag, no amber, nothing saying the sentence
+ * ends where the budget did. FactGuard cannot notice, because half of a true sentence is
+ * still true, and the style pass reads a cut-off answer as a terse one. `extractProfile.ts`
+ * has named `max_tokens` as its own failure since the resume path was written; drafting is
+ * the path where the cut text goes on to an employer under the user's name.
+ *
+ * Empty is the same defect one step further along: the row was overwritten with '', so the
+ * user opened G3 on a blank box, and the answer they had approved yesterday was gone. The
+ * approve endpoint then refuses the blank as empty — the right refusal to the wrong question.
+ *
+ * A refusal is named rather than left to fall into `empty`, because the two backends disagree
+ * about what it looks like: the API path can return the partial text it had written before it
+ * stopped, which is not empty and is not an answer either.
+ */
+function incompleteReason(res: llm.GenerateResult): Incomplete | null {
+  if (res.stopReason === 'max_tokens') return 'cut_off';
+  if (res.stopReason === 'refusal') return 'declined';
+  if (res.text.trim() === '') return 'empty';
+  return null;
+}
+
+/** What the user is told. Each one names the cause and an action that can change it. */
+const INCOMPLETE_MESSAGE: Record<Incomplete, string> = {
+  cut_off:
+    'The model ran out of room and stopped partway through this answer, so none of it was ' +
+    'kept — half a draft is worse than none at the review step. Draft it again, asking for ' +
+    'fewer words if the form allows a shorter answer.',
+  declined:
+    'The model declined to write this answer, so there is nothing to review. Write it ' +
+    'yourself and it will still be fact-checked against your profile.',
+  empty:
+    'The model returned nothing at all, so there is no draft to show. Try again, or write ' +
+    'the answer yourself.',
+};
 
 /**
  * What gets sent back when the first draft fails. Named claims and named tells only —
@@ -257,28 +307,69 @@ export async function draftAnswer(req: DraftRequest): Promise<DraftResult> {
 
   const contextNames = req.contextNames ?? [];
 
-  let text = await generate(system, user, maxTokens);
+  const first = await generate(system, user, maxTokens);
+
+  /**
+   * Nothing incomplete gets past here, and THROWING is the load-bearing part.
+   *
+   * Returning a fragment with a flag on it would not have been enough: the route writes the
+   * returned text over `draftText`, `finalText` and `approvedAt` before anything reads a
+   * flag, so the fragment replaces the answer the user approved yesterday. Failing before
+   * the row is touched leaves that answer exactly where it was, which is the outcome a
+   * student redrafting an approved answer needs.
+   */
+  const incomplete = incompleteReason(first);
+  if (incomplete) {
+    logger.error(
+      { stopReason: first.stopReason, chars: first.text.length, provider: first.provider },
+      'draft did not come back whole; nothing stored',
+    );
+    throw new Error(INCOMPLETE_MESSAGE[incomplete]);
+  }
+
+  let text = first.text;
   let guard = guardDraft(text, evidence, contextNames);
   let tells = findTells(text, scrub);
   let revised = false;
 
+  // `text.length > 0` used to guard this too. An empty draft now fails above, so the check
+  // was one that could no longer fire.
   const needsWork = guard.blocking.length > 0 || tells.length > 0;
-  if (needsWork && text.length > 0) {
+  if (needsWork) {
     revised = true;
     logger.info(
       { blocking: guard.blocking.length, tells: tells.length },
       'draft failed its own checks; requesting one revision',
     );
 
-    const revisedText = await generate(
+    const revision = await generate(
       system,
       `${user}\n\n<previous_draft>\n${text}\n</previous_draft>\n\n${buildRevisionMessage(guard, tells)}`,
       maxTokens,
     );
 
-    // Only keep the revision if it is actually better. A revision that trades two
-    // unsupported claims for three is not progress.
-    if (revisedText.length > 0) {
+    /**
+     * A revision that did not come back whole is thrown away rather than compared.
+     *
+     * The comparison below cannot see a cut, and it is biased towards one: `better` counts
+     * blocking claims and tells, and half an answer carries fewer of both. So a first draft
+     * with one unsupported sentence lost, every time, to a revision that stopped mid-word
+     * with none — and the fragment was what the user read at G3, with nothing flagged on it.
+     * The revision round exists to remove fabrications, not to shorten the answer until the
+     * checks run out of things to count.
+     *
+     * The old test here was `revisedText.length > 0`, which is the empty case of exactly this
+     * and is now covered by `incompleteReason` along with the cut and the refusal — including
+     * a revision of nothing but whitespace, which passed the length test.
+     */
+    const spoiled = incompleteReason(revision);
+    if (spoiled) {
+      logger.warn(
+        { reason: spoiled, stopReason: revision.stopReason },
+        'revision did not come back whole; keeping the first draft',
+      );
+    } else {
+      const revisedText = revision.text;
       const revisedGuard = guardDraft(revisedText, evidence, contextNames);
       const revisedTells = findTells(revisedText, scrub);
       const better =

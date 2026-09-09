@@ -139,6 +139,39 @@ const verdictOf = (claim: string): string | null =>
 // ───────────────────────────────────────────────────────────── the gate
 
 describe('adversarial: planted fabrications (release gate)', () => {
+  /**
+   * The same lie about the same two-month internship, written five ways.
+   *
+   * Only "for six years" was ever caught. The other four produced no duration claim at all,
+   * so the comparison never ran and each came back GREEN with the two-month entry quoted
+   * underneath as its proof. Kept together, in the release gate, because the point is that
+   * they must all fail: the moment one spelling is cheaper than another, the guard is a
+   * formality.
+   */
+  it('catches an inflated tenure however the number is spelled', () => {
+    for (const claim of [
+      'I worked at Kestrel Analytics for six years on their billing systems.',
+      'I worked at Kestrel Analytics from 2020 to 2026 on their billing systems.',
+      'I spent three summers at Kestrel Analytics.',
+      'I worked at Kestrel Analytics for a decade.',
+      'I interned at Kestrel Analytics for eight semesters.',
+    ]) {
+      const guard = guardDraft(claim, EVIDENCE);
+      expect(guard.blocking.length, claim).toBeGreaterThan(0);
+    }
+  });
+
+  it('leaves the honest version of each of those alone', () => {
+    // The other direction, in the same breath. A two-month summer internship really did run
+    // over a summer, and saying so must not cost the student a block.
+    for (const claim of [
+      'I interned at Kestrel Analytics over the summer.',
+      'I spent two months at Kestrel Analytics.',
+    ]) {
+      expect(guardDraft(claim, EVIDENCE).blocking, claim).toEqual([]);
+    }
+  });
+
   it('catches an invented employer', () => {
     const r = checkClaimDeterministically(
       'I spent last summer at Google working on search infrastructure.',
@@ -447,6 +480,48 @@ describe('duration extraction', () => {
     expect(extractDurations('10 weeks')[0]!.months).toBeCloseTo(2.3, 1);
   });
 
+  /**
+   * THE SPELLINGS THAT PRODUCED NO CLAIM AT ALL, AND SO WERE NEVER CHECKED.
+   *
+   * A number immediately followed by year/month/week was the only shape this saw, and no
+   * DurationClaim means the duration comparison is skipped in silence. Against the fixture's
+   * two-month Kestrel Analytics internship, "I spent three summers at Kestrel Analytics",
+   * "for a decade" and "from 2020 to 2026" all came back GREEN with that two-month entry
+   * printed underneath as the evidence, while the identical claim written "for six years"
+   * was correctly blocked. A guard anyone can walk around by writing the number a different
+   * way is not guarding.
+   */
+  it('reads a tenure written as a magnitude rather than a count', () => {
+    expect(extractDurations('for a decade')[0]!.months).toBe(120);
+    expect(extractDurations('three summers')[0]!.months).toBe(6);
+    expect(extractDurations('8 semesters')[0]!.months).toBe(32);
+    expect(extractDurations('two school years')[0]!.months).toBe(18);
+  });
+
+  it('reads a tenure written as the years it ran between', () => {
+    expect(extractDurations('from 2020 to 2026')[0]!.months).toBe(60);
+    expect(extractDurations('2019-2026')[0]!.months).toBe(72);
+  });
+
+  /**
+   * The half that keeps this from becoming a false RED.
+   *
+   * Bare years say nothing about months: a student really on the team from the autumn of
+   * 2024 to the spring of 2026 — twenty months — writes "from 2024 to 2026", and reading
+   * that as a full twenty-four would block a true sentence at a gate with no override. One
+   * whole year comes off the difference so no true span is ever measured as longer than it
+   * was, and "2020 to 2026" is still sixty months.
+   */
+  it('reads a year range as the shortest span those years allow', () => {
+    expect(extractDurations('from 2024 to 2026')[0]!.months).toBe(12);
+    expect(extractDurations('from 2025 to 2026')[0]!.months).toBe(1);
+  });
+
+  it('still refuses to read an age as a tenure', () => {
+    // The pre-existing rule, re-asserted because the new patterns run over the same text.
+    expect(extractDurations("I'm 19 years old and have been coding since high school")).toEqual([]);
+  });
+
   it('ignores vague quantities rather than guessing a number', () => {
     expect(extractDurations('several years of experience')).toEqual([]);
     expect(extractDurations('many months later')).toEqual([]);
@@ -748,6 +823,45 @@ describe('honors carry a rank, and an organisation is not an employer', () => {
     expect(
       checkClaimDeterministically('I won the Math League Championship.', awards).verdict,
     ).toBeNull();
+  });
+
+  /**
+   * THE WAYS OF CLAIMING FIRST WITHOUT THE WORD "FIRST".
+   *
+   * The win check fired for four fixed phrasings — won / first place / took first / champion
+   * of — so a student the profile records below first could claim the whole thing in any
+   * other words and come back GREEN with their own honorable mention quoted underneath as
+   * the proof. That is a fabricated win, carrying the profile's own evidence, on its way to
+   * an employer.
+   *
+   * The second block is the half that keeps this honest. Every one of those sentences can be
+   * literally true of somebody who placed below first, and G3 has no override, so a guard
+   * that reaches them costs the student a true sentence they cannot get back.
+   */
+  it('catches an outright win claimed in words other than "first"', () => {
+    for (const claim of [
+      'I swept the NSPA Feature Story of the Year award.',
+      'I topped the NSPA Feature Story of the Year award.',
+      'I came out on top at the NSPA Feature Story of the Year award.',
+      'I was the top finisher at the NSPA Feature Story of the Year award.',
+      'I beat everyone at the NSPA Feature Story of the Year award.',
+      'I was the best at the NSPA Feature Story of the Year award.',
+    ]) {
+      expect(checkClaimDeterministically(claim, awards).verdict, claim).toBe('overstated');
+    }
+  });
+
+  it('does not reach a sentence that claims no placing at all', () => {
+    for (const claim of [
+      // A third placing really can be the best in one school.
+      'I was the top finisher from my school at the NSPA Feature Story of the Year award.',
+      // What is topped here is a personal best, not the field.
+      'I topped my personal best at the NSPA Feature Story of the Year award.',
+      'I did my best at the NSPA Feature Story of the Year award.',
+      'I learned the most at the NSPA Feature Story of the Year award.',
+    ]) {
+      expect(checkClaimDeterministically(claim, awards).verdict, claim).toBeNull();
+    }
   });
 
   /**
@@ -1195,6 +1309,93 @@ describe('claim segmentation', () => {
     for (const c of splitClaims(text)) {
       expect(text.slice(c.span.start, c.span.end)).toBe(c.text);
     }
+  });
+
+  /**
+   * NOTHING THE WRITER WROTE MAY LEAVE THIS FUNCTION UNCHECKED.
+   *
+   * A part under twelve characters used to be skipped outright, and since the sentence was
+   * never re-checked whole, that text reached no layer of the guard: no claim, no verdict,
+   * no row in the G3 evidence panel. "I ran NASA." is eleven characters, so the one sentence
+   * naming an employer the profile has never heard of was the one sentence nobody looked at
+   * — and draft.ts asks the model for exactly these ("Put a four-word sentence next to a
+   * twenty-five-word one").
+   *
+   * The assertion is on COVERAGE rather than on a count, so it keeps holding however the
+   * splitting rules are tuned later.
+   */
+  it('leaves no letter of the draft outside every claim', () => {
+    for (const text of [
+      'I ran NASA.',
+      'I mentored two students at the Rutgers Learning Center. I ran NASA. I shipped the parser.',
+      'I built the parser, and I ran NASA.',
+      'Yes. I tutored algebra every week at the Rutgers Learning Center.',
+    ]) {
+      const covered = new Array(text.length).fill(false);
+      for (const c of splitClaims(text)) {
+        for (let i = c.span.start; i < c.span.end; i += 1) covered[i] = true;
+      }
+      const orphaned = [...text]
+        .map((ch, i) => (/\p{L}/u.test(ch) && !covered[i] ? ch : ''))
+        .join('');
+      // Only the conjunction a split consumes may fall outside a claim, and only then.
+      expect(orphaned.replace(/^(?:and|but|then)$/, ''), text).toBe('');
+    }
+  });
+
+  it('checks a sentence too short to survive the old floor', () => {
+    const guard = guardDraft('I ran NASA.', retrieveEvidence(fixture(), QUESTION, { limit: 20 }));
+    expect(guard.claims).toHaveLength(1);
+    expect(guard.blocking).toHaveLength(1);
+  });
+});
+
+/**
+ * A PERSON THE WRITER NAMES IS NOT AN ORGANISATION THEY CLAIM.
+ *
+ * "My physics teacher, Mrs. Delgado, pushed me to try robotics" came back BLOCKING with
+ * `"Mrs Delgado" does not appear anywhere on your profile` — a true sentence about the
+ * student's own life, refused at the gate that has no override, for a reason no amount of
+ * profile editing could ever satisfy: a resume lists organisations, not the people in them.
+ * The only way out was deleting the sentence. Mentor sentences are most of what a "why this
+ * field" answer is made of, so this was not a rare shape.
+ *
+ * The second block is the half that matters more. Exempting people must not exempt places,
+ * and a surname is one letter away from a company name.
+ */
+describe('a person the writer names', () => {
+  const evidence = () => retrieveEvidence(fixture(), QUESTION, { limit: 20 });
+
+  it('is not reported as an organisation missing from the profile', () => {
+    for (const claim of [
+      'My physics teacher, Mrs. Delgado, pushed me to try robotics.',
+      'My coach, Mr. Alvarez, encouraged me to keep going.',
+      'My mentor, Dr. Okafor, showed me how to read a datasheet.',
+      // The same sentence without the title, which is how half of them are written.
+      'My physics teacher, Delgado, pushed me to try robotics.',
+      'My manager, Whitfield, let me rewrite the intake form.',
+    ]) {
+      expect(guardDraft(claim, evidence()).blocking, claim).toEqual([]);
+    }
+  });
+
+  it('does not let a surname smuggle an employer through', () => {
+    // No honorific and no relationship word: this is a claim about where the writer worked,
+    // and the profile has never heard of it.
+    for (const claim of [
+      'I interned at Delgado Engineering last summer.',
+      'I spent two summers at Whitfield Labs.',
+      'My internship at Okafor Robotics ran from June to August.',
+    ]) {
+      expect(guardDraft(claim, evidence()).blocking.length, claim).toBeGreaterThan(0);
+    }
+  });
+
+  it('does not exempt a company merely because a relative is named elsewhere', () => {
+    // The relationship word has to introduce THIS name. Only the text before the name is
+    // read, so a company later in the sentence cannot borrow the exemption.
+    const claim = 'My father drove me to the interview, and I interned at Kestrel Robotics.';
+    expect(guardDraft(claim, evidence()).blocking.length).toBeGreaterThan(0);
   });
 
   /**

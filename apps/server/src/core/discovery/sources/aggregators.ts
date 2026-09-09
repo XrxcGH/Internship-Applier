@@ -1034,27 +1034,47 @@ export const githubList: JobSource = {
         unreadable++;
         continue;
       }
+
       /**
-       * `active: false` is the list saying this role has closed, and it was thrown away.
+       * The whole row under ONE net, the way every other adapter in this file reads a row.
        *
-       * The row was skipped and nothing else happened, so a posting stored by an earlier run
-       * stayed open — for forty-five days, until the staleness window expired it — and the
-       * queue went on offering a student an application they could no longer make. This is
-       * the best closure evidence in the whole pipeline: an explicit statement from the
-       * source, costing no request, where `refreshPostings` can only ask a URL whether it
-       * 404s and most closed postings answer 200 with "no longer accepting applications".
+       * The `active: false` branch below used to sit outside this try, and it calls
+       * canonicalUrl, which is `new URL()` underneath. The `startsWith('http')` gate above is
+       * far weaker than it looks: "https://" — a scheme with no host — passes it and throws
+       * "Invalid URL", and so does "https://exa mple.com/apply". One such row threw straight
+       * out of fetch() and took the entire community list with it, and on a fresh install
+       * that list IS the search: a live run read 3,141 of its 3,225 postings from here. All
+       * of them lost to one row that was closed anyway and would never have been shown to
+       * anybody.
+       *
+       * Skipped and COUNTED, like the isRecord and non-http guards above it, because the two
+       * branches lose different things and both are worth saying out loud: an active row we
+       * cannot read is a posting missing from these results, and a closed row we cannot read
+       * is the CLOSURE missing — a posting stored by an earlier run then stays open until the
+       * staleness window expires it and the queue goes on offering an application that can no
+       * longer be made, which is the exact failure the branch below exists to prevent.
        */
-      if (active === false) {
-        closed.push(canonicalUrl(link));
-        continue;
-      }
-
-      const title = String(row['title'] ?? '');
-      const company = String(row['company_name'] ?? '');
-      const locations = Array.isArray(row['locations']) ? (row['locations'] as string[]) : [];
-      const terms = Array.isArray(row['terms']) ? (row['terms'] as string[]) : [];
-
       try {
+        /**
+         * `active: false` is the list saying this role has closed, and it was thrown away.
+         *
+         * The row was skipped and nothing else happened, so a posting stored by an earlier run
+         * stayed open — for forty-five days, until the staleness window expired it — and the
+         * queue went on offering a student an application they could no longer make. This is
+         * the best closure evidence in the whole pipeline: an explicit statement from the
+         * source, costing no request, where `refreshPostings` can only ask a URL whether it
+         * 404s and most closed postings answer 200 with "no longer accepting applications".
+         */
+        if (active === false) {
+          closed.push(canonicalUrl(link));
+          continue;
+        }
+
+        const title = String(row['title'] ?? '');
+        const company = String(row['company_name'] ?? '');
+        const locations = Array.isArray(row['locations']) ? (row['locations'] as string[]) : [];
+        const terms = Array.isArray(row['terms']) ? (row['terms'] as string[]) : [];
+
         postings.push(
           build(
             {
@@ -1082,7 +1102,9 @@ export const githubList: JobSource = {
         // A malformed row is skipped rather than failing the whole source, but it is
         // counted. If the list changes date_posted from epoch seconds to an ISO string,
         // every dated row throws here — and reporting only the survivors made a run that
-        // lost hundreds of listings read as complete coverage of a very short list.
+        // lost hundreds of listings read as complete coverage of a very short list. The
+        // closed-row branch above is inside this net too now; there the loss was not partial
+        // but total, because that call was the one this catch did not cover.
         unreadable++;
       }
     }

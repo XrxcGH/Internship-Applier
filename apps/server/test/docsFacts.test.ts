@@ -1083,6 +1083,87 @@ describe('the two copies of ANSWERED_IN_WIZARD', () => {
  * assert the code declares it, so changing one without the other turns a test red — which is
  * the same contract the docs/04 sections above are held to.
  */
+/**
+ * The number of eligibility rules, bound to the array that decides it.
+ *
+ * docs/05 said "Twelve of them", listed twelve in its table, and closed the section with a
+ * blockquote asserting outright that "there is no thirteenth rule" — while `RULES` held
+ * thirteen. The missing one, `postdoctoral`, is the only rule in the file that infers a hard
+ * verdict from a posting's TITLE, so the one rule a false-ineligible report would most need
+ * to find was the one the documentation said did not exist. docs/14 repeated the wrong count
+ * in its own sentence about what runs without a model.
+ *
+ * Asserted against `RULES.length` rather than against the digit, so adding a rule is what
+ * turns this red — which is precisely what did not happen last time.
+ */
+describe('docs/05 — matching, § The rules', () => {
+  const DOC05 = read('docs/05-matching.md');
+  const NUMBER_WORDS = [
+    'zero',
+    'one',
+    'two',
+    'three',
+    'four',
+    'five',
+    'six',
+    'seven',
+    'eight',
+    'nine',
+    'ten',
+    'eleven',
+    'twelve',
+    'thirteen',
+    'fourteen',
+    'fifteen',
+    'sixteen',
+    'seventeen',
+    'eighteen',
+    'nineteen',
+    'twenty',
+  ];
+
+  /**
+   * The rule names, read out of the `RULES` declaration itself rather than listed again here.
+   * Adding a rule to the array is then what turns this red — which is exactly what failed to
+   * happen when `postdoctoral` was added.
+   */
+  const ruleNames = (): string[] => {
+    const src = read('apps/server/src/core/matching/eligibility.ts');
+    const block = /export const RULES = \[([\s\S]*?)\] as const;/.exec(src);
+    expect(block, 'the RULES declaration moved; this pin needs updating').not.toBeNull();
+    return block![1]!
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => /^[A-Za-z]\w*$/.test(s))
+      .map((s) => s.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`));
+  };
+
+  it('counts the rules the same way RULES does', () => {
+    const spelled = NUMBER_WORDS[ruleNames().length];
+    expect(spelled, `RULES holds ${ruleNames().length}, which this test cannot spell`).toBeTruthy();
+    expect(DOC05).toMatch(new RegExp(`^${spelled!} of them, in \`RULES\``, 'im'));
+    expect(read('docs/14-model-access.md')).toMatch(
+      new RegExp(`\\b${spelled!} eligibility rules\\b`, 'i'),
+    );
+  });
+
+  it('gives every rule in RULES a row of its own in the table', () => {
+    for (const name of ruleNames()) {
+      expect(DOC05, name).toContain(`| \`${name}\` |`);
+    }
+  });
+
+  /**
+   * The sentence that outlived the rule it denied. "There is no thirteenth rule" was written
+   * about Guardian mode's absent `age_work_permit`, and read as a promise that `RULES` was
+   * closed at twelve — so a reader chasing a false-ineligible had the documentation tell them
+   * the rule that caused it could not exist.
+   */
+  it('does not deny a rule by counting to one past the last one', () => {
+    expect(DOC05).not.toMatch(/there\s+is\s+no\s+\w+\s+rule/i);
+  });
+});
+
 describe('docs/10 — security & privacy, § Limits', () => {
   const DOC10 = flat(read('docs/10-security-privacy.md'));
   const fetcher = read('apps/server/src/infra/http/fetcher.ts');

@@ -8,7 +8,7 @@
  */
 import { config } from '../../config';
 import { logger } from '../logger';
-import { apiBackend } from './apiBackend';
+import { apiBackend, apiKeyRejected, resetApiProbe } from './apiBackend';
 import { hasApiKey } from './client';
 import { claudeCliBackend } from './claudeCli';
 import {
@@ -50,9 +50,17 @@ export async function resolveBackend(): Promise<Backend | null> {
   return resolved;
 }
 
-/** Forget the cached choice, so installing the CLI takes effect without a restart. */
+/**
+ * Forget the cached choice, so installing the CLI takes effect without a restart.
+ *
+ * The API key's live check is cached too, and it has to be dropped alongside the choice or
+ * the Test button cannot recover from a key the API rejected: the route calls this, then
+ * `describeAccess`, which would re-resolve against a verdict formed before the user pasted
+ * the corrected key and report the new key as rejected.
+ */
 export function resetBackend(): void {
   resolved = null;
+  resetApiProbe();
 }
 
 /**
@@ -69,7 +77,9 @@ export function resetBackend(): void {
 export function modelAccessLikely(): boolean {
   if (config.llm.provider === 'none') return false;
   if (resolved) return true;
-  if (config.llm.provider === 'api') return hasApiKey();
+  // Optimism has one limit: a key the API has already answered 401 for is not a maybe. Once
+  // that is known, offering the button is not hopeful, it is wrong.
+  if (config.llm.provider === 'api') return hasApiKey() && !apiKeyRejected();
   return true;
 }
 
@@ -90,7 +100,15 @@ export async function describeAccess(): Promise<ModelAccess> {
       description:
         config.llm.provider === 'none'
           ? 'Model calls are switched off (LLM_PROVIDER=none).'
-          : 'No model access configured.',
+          : // A key that the API refuses is not the same state as no key at all, and the
+            // difference is the whole of what the user has to do next. "No model access
+            // configured." in front of someone looking straight at the ANTHROPIC_API_KEY
+            // line they filled in reads as the app failing to notice it. Says the state
+            // only — every caller of this appends its own advice, and resumes.ts spells out
+            // why the two must not both say it.
+            apiKeyRejected()
+            ? 'ANTHROPIC_API_KEY is set, but the Anthropic API rejected it.'
+            : 'No model access configured.',
       limitations: [
         'Resume reading is unavailable, so profile fields must be entered by hand.',
         'Answer drafting is unavailable, so answers must be written by hand.',

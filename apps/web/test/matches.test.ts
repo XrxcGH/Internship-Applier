@@ -1,5 +1,23 @@
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
-import { daysUntil, locationLabel, payLabel, termLabel } from '../src/lib/matches';
+import {
+  daysUntil,
+  locationLabel,
+  payLabel,
+  REJECT_REASONS,
+  termLabel,
+  type MatchDetail,
+} from '../src/lib/matches';
+import {
+  DecisionRow,
+  descriptionExcerpt,
+  detailPaneState,
+  FullDescription,
+} from '../src/pages/Matches';
 
 /**
  * The four pure helpers behind the G2 queue. Each of them carries a docstring describing a
@@ -121,5 +139,171 @@ describe('payLabel, in currencies that are not dollars', () => {
 
   it('carries the currency across both ends of a range', () => {
     expect(payLabel({ min: 25, max: 35, period: 'hour', currency: 'GBP' })).toBe('£25–£35/hr');
+  });
+});
+
+/**
+ * The detail column, which had one state and needed three.
+ *
+ * It rendered on `current && detail`. `detail` is nulled the instant the selection moves and
+ * stays null when the fetch rejects, so the column was blank while a match loaded, blank
+ * forever after a match failed to load, and blank for a posting with nothing in it — three
+ * different facts drawn identically, beside a row the user had just clicked, at the gate
+ * where they are about to approve it.
+ */
+describe('detailPaneState', () => {
+  const loaded = {
+    match: {},
+    posting: {},
+    requirements: [],
+    decision: null,
+  } as unknown as MatchDetail;
+
+  it('tells a failure apart from a slow load, which is the whole point of it', () => {
+    expect(detailPaneState(null, null)).toBe('loading');
+    expect(detailPaneState(null, 'Failed to fetch')).toBe('failed');
+    expect(detailPaneState(null, null)).not.toBe(detailPaneState(null, 'Failed to fetch'));
+  });
+
+  it('calls a loaded posting ready, and lets a failure beat a detail left over from before', () => {
+    expect(detailPaneState(loaded, null)).toBe('ready');
+    expect(detailPaneState(loaded, 'Failed to fetch')).toBe('failed');
+  });
+});
+
+describe('the detail column itself', () => {
+  const page = readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), '../src/pages/Matches.tsx'),
+    'utf8',
+  );
+  const pane = page.slice(page.indexOf('{/* detail */}'), page.indexOf('<footer'));
+
+  it('draws something for each of the three states', () => {
+    expect(pane).toMatch(/detailPaneState\(detail, detailError\) === 'loading'/);
+    expect(pane).toMatch(/detailPaneState\(detail, detailError\) === 'failed'/);
+    expect(pane).toMatch(/Reading the posting/);
+    expect(pane).toMatch(/\{current && detail && \(/);
+  });
+
+  it('keeps the failure beside the hole rather than only in the page banner', () => {
+    // The catch used to set the page-level `error`, which sits above the band chips — so on a
+    // scrolled queue the pane went blank and the sentence explaining why was off the top.
+    expect(page).toMatch(/setDetailError\(e instanceof Error/);
+    expect(pane).toMatch(/\{detailError\}/);
+  });
+
+  it('offers a retry that re-runs the fetch that failed', () => {
+    expect(pane).toMatch(/setDetailAttempt\(\(n\) => n \+ 1\)/);
+    expect(page).toMatch(/\}, \[selected, detailAttempt\]\)/);
+  });
+});
+
+/**
+ * Gate G2's four decisions.
+ *
+ * `act` and `reject` both open with `if (!selected || busyRef.current) return`, and nothing
+ * on screen said so. During a Recompute — which re-extracts requirements with the model and
+ * takes as long as it takes — all four buttons stayed lit, and pressing Approve returned at
+ * that first line: no application created, no row removed, no message. The user approved a
+ * posting and the screen agreed that nothing had happened.
+ */
+describe('the G2 decision row', () => {
+  const row = (over: Partial<Parameters<typeof DecisionRow>[0]> = {}): string =>
+    renderToStaticMarkup(
+      createElement(DecisionRow, {
+        busy: null,
+        rejecting: false,
+        onRejecting: () => undefined,
+        act: () => undefined,
+        reject: () => undefined,
+        applyUrl: 'https://example.test/apply',
+        ...over,
+      }),
+    );
+
+  const disabledCount = (html: string): number => (html.match(/disabled=""/g) ?? []).length;
+
+  it('holds all four decisions while anything at all is running', () => {
+    const html = row({ busy: 'Recomputing' });
+    expect(disabledCount(html)).toBe(4);
+  });
+
+  it('names what is holding them, for the keys that cannot be greyed out', () => {
+    // a, s, l and the reject sheet go through the same guard and drop just as silently, so
+    // the reason has to be written where someone reaching for them will read it.
+    expect(row({ busy: 'Recomputing' })).toContain('Recomputing');
+    expect(row({ busy: 'Approving' })).toMatch(/decisions are held until it finishes/);
+  });
+
+  it('holds the reject sheet too, and leaves Cancel alive', () => {
+    const html = row({ busy: 'Recomputing', rejecting: true });
+    // Every reason button is a decision and no-ops the same way; Cancel asks the server for
+    // nothing, and a sheet whose only live control is missing is worse than not opening it.
+    expect(disabledCount(html)).toBe(REJECT_REASONS.length);
+    expect(html).toContain('Cancel');
+  });
+
+  it('leaves every control live when nothing is running', () => {
+    // The other direction, so this cannot be "fixed" into a queue nobody can triage.
+    expect(disabledCount(row())).toBe(0);
+    expect(disabledCount(row({ rejecting: true }))).toBe(0);
+    expect(row()).toContain('Approve (A)');
+    expect(row()).not.toMatch(/decisions are held/);
+  });
+});
+
+/**
+ * The description under the decision buttons.
+ *
+ * `slice(0, 8000)` with nothing after it: no ellipsis, no note, no link. The text stopped
+ * mid-sentence under a summary reading "Full job description" — and the paragraph an
+ * internship posting most often puts last is the one naming a hard requirement.
+ */
+describe('the full job description disclosure', () => {
+  it('leaves a description that fits exactly as it is', () => {
+    expect(descriptionExcerpt('Short posting.')).toEqual({ shown: 'Short posting.', cutAt: null });
+    // Exactly at the ceiling is not a cut, and adding an ellipsis there would say it was.
+    const atTheLimit = 'x'.repeat(8000);
+    expect(descriptionExcerpt(atTheLimit)).toEqual({ shown: atTheLimit, cutAt: null });
+  });
+
+  it('marks the cut where it makes one', () => {
+    const long = `${'x'.repeat(8000)}Must be a US citizen.`;
+    const { shown, cutAt } = descriptionExcerpt(long);
+    expect(cutAt).toBe(8000);
+    expect(shown.endsWith('…')).toBe(true);
+    expect(shown).not.toContain('Must be a US citizen.');
+  });
+
+  it('says where it stopped and where the rest is', () => {
+    const html = renderToStaticMarkup(
+      createElement(FullDescription, {
+        text: 'x'.repeat(9000),
+        applyUrl: 'https://example.test/apply',
+      }),
+    );
+    expect(html).toContain('Cut here');
+    expect(html).toContain(
+      `after ${(8000).toLocaleString()} characters of ${(9000).toLocaleString()}`,
+    );
+    expect(html).toContain('https://example.test/apply');
+  });
+
+  it('says nothing about cutting when nothing was cut', () => {
+    const html = renderToStaticMarkup(
+      createElement(FullDescription, {
+        text: 'A short posting body.',
+        applyUrl: 'https://example.test/apply',
+      }),
+    );
+    expect(html).toContain('A short posting body.');
+    expect(html).not.toContain('Cut here');
+  });
+
+  it('does not open onto a blank box for a posting stored without a body', () => {
+    const html = renderToStaticMarkup(
+      createElement(FullDescription, { text: '   ', applyUrl: 'https://example.test/apply' }),
+    );
+    expect(html).toMatch(/stored without a description/);
   });
 });

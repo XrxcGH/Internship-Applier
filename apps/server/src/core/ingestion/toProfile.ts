@@ -608,7 +608,36 @@ function splitLocation(raw: string | null | undefined): {
     if (country) parts.pop();
   }
 
-  return { city: parts[0] ?? '', region: parts[1] ?? '', ...(country ? { country } : {}) };
+  return {
+    city: parts[0] ?? '',
+    region: withoutPostcode(parts[1] ?? ''),
+    ...(country ? { country } : {}),
+  };
+}
+
+/**
+ * The state, without the postcode printed beside it.
+ *
+ * "Portland, OR 97214" is the ordinary way a US resume writes its header, and splitting on
+ * the comma alone put the whole of "OR 97214" in the REGION. That value is not only stored:
+ * `valueFor` in core/filling/plan.ts falls back to `locationPrefs.base.region` for a form's
+ * State field, so the tool typed "OR 97214" into a control that wanted "OR" — a state no
+ * dropdown offers and no employer recognises, asserted in the user's name.
+ *
+ * Only a postcode at the END of the part goes, and only where something precedes it, so a
+ * region that is nothing but a postcode is left for the user rather than emptied. Nothing
+ * here invents a region: a part that is not "STATE 12345" comes back exactly as it went in.
+ *
+ * The postcode itself is dropped rather than moved. `locationPrefs.base` has nowhere to put
+ * one, and `address` is the block the user fills in at G1 — writing a postcode there would
+ * be this file asserting a piece of the user's address that nobody has checked.
+ */
+function withoutPostcode(region: string): string {
+  // US ZIP or ZIP+4, and Canada's "A1A 1A1", each with a real region in front of it.
+  return region
+    .replace(/\s+\d{5}(?:-\d{4})?$/, '')
+    .replace(/\s+[A-Za-z]\d[A-Za-z][ -]?\d[A-Za-z]\d$/, '')
+    .trim();
 }
 
 export function toDraftProfile(x: ResumeExtraction, now: Date = new Date()): CandidateProfile {

@@ -11,6 +11,11 @@
  * `globalThis.fetch` is swapped for a fixture router, the same way sources.test.ts drives
  * the Greenhouse adapter.
  *
+ * The community list is here for the same row-reading rules and nothing else, because that
+ * is where breaking them is most expensive: on a fresh install it carries almost every
+ * posting a run finds, so a single row that throws is the difference between a full queue
+ * and an empty one.
+ *
  * Two module-level caches in the fetcher decide the shape of these tests. Response bodies
  * are cached by URL for the life of the process, and robots.txt verdicts by origin, and both
  * keyless adapters now begin at a fixed URL — Remotive's `search=` parameter is gone because
@@ -100,7 +105,7 @@ function feedCalls(fetched: string[]): string[] {
 
 /** A source instance whose fetcher has an empty body cache and an empty robots cache. */
 async function freshSource(
-  kind: 'arbeitnow' | 'remotive' | 'adzuna' | 'usajobs',
+  kind: 'arbeitnow' | 'remotive' | 'adzuna' | 'usajobs' | 'githubList',
 ): Promise<JobSource> {
   vi.resetModules();
   const mod = await import('../src/core/discovery/sources/aggregators');
@@ -153,6 +158,24 @@ function remotiveJob(over: Record<string, unknown> = {}): Record<string, unknown
 
 function remotiveBody(jobs: unknown[], count?: number): Record<string, unknown> {
   return { 'job-count': count ?? jobs.length, jobs };
+}
+
+const LIST_REPO = 'SimplifyJobs/Summer2027-Internships';
+const LIST_URL = `https://raw.githubusercontent.com/${LIST_REPO}/dev/.github/scripts/listings.json`;
+
+/** A row shaped like the community list's own listings.json entries. */
+function listRow(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 'a1',
+    title: 'Software Engineer Intern',
+    company_name: 'Acme',
+    url: 'https://acme.example.com/careers/a1',
+    active: true,
+    locations: ['Austin, TX'],
+    terms: ['Summer 2027'],
+    date_posted: 1755400000,
+    ...over,
+  };
 }
 
 // ---------------------------------------------------------------- arbeitnow
@@ -649,6 +672,109 @@ describe('remotive', () => {
     const { postings, gaps } = await source.fetch({ board: '' });
     expect(postings).toEqual([]);
     expect(gaps?.join(' ')).toMatch(/not a list of postings/);
+  });
+});
+
+// ---------------------------------------------------------------- community list
+
+/**
+ * The same rule as "a row that cannot be read" above, on the source where breaking it costs
+ * the most.
+ *
+ * On a fresh install this list IS the search — a live run pulled 3,141 of its 3,225 postings
+ * from here — so the gap between "one row skipped and counted" and "the source threw" is the
+ * gap between a full queue and an empty one. The closed-row branch was the one place left in
+ * the file that called canonicalUrl outside the row's own try, and `startsWith('http')` is
+ * not the URL check it looks like: "https://" and "https://exa mple.com/apply" both pass it
+ * and both throw "Invalid URL".
+ */
+describe('the community list', () => {
+  it('parses an active row and reports nothing missed', async () => {
+    const source = await freshSource('githubList');
+    serve([[(u) => u === LIST_URL, [listRow()]]]);
+    const { postings, notes, gaps, closed } = await source.fetch({ board: LIST_REPO });
+
+    expect(postings.map((p) => p.externalId)).toEqual(['a1']);
+    expect(postings[0]!.canonicalUrl).toBe('https://acme.example.com/careers/a1');
+    expect(postings[0]!.postedAt).toBe(new Date(1755400000 * 1000).toISOString());
+    expect(closed).toEqual([]);
+    expect(gaps).toEqual([]);
+    expect(notes.join(' ')).toMatch(/1 active listings/);
+  });
+
+  it('a closed row whose url will not parse costs that row, never the board', async () => {
+    const source = await freshSource('githubList');
+    serve([
+      [
+        (u) => u === LIST_URL,
+        [
+          listRow({ id: 'open-1' }),
+          // A scheme with no host, and a host with a space in it. Both start with "http", so
+          // both reach canonicalUrl, and both throw. One of these used to end the run here:
+          // fetch() rejected with "Invalid URL" and every readable sibling went with it.
+          listRow({ id: 'closed-empty-host', active: false, url: 'https://' }),
+          listRow({
+            id: 'closed-spaced-host',
+            active: false,
+            url: 'https://exa mple.com/apply',
+          }),
+          listRow({ id: 'open-2' }),
+        ],
+      ],
+    ]);
+    const { postings, notes, gaps, closed } = await source.fetch({ board: LIST_REPO });
+
+    expect(postings.map((p) => p.externalId)).toEqual(['open-1', 'open-2']);
+    // Nothing is claimed to have closed on the strength of a link nobody could read.
+    expect(closed).toEqual([]);
+    // Counted out loud, not skipped in silence: a closed row we could not read is a closure
+    // we did not record, and the posting an earlier run stored stays open without it.
+    expect(gaps?.join(' ')).toMatch(new RegExp(`skipped 2 rows in ${LIST_REPO} `));
+    expect(gaps?.join(' ')).toMatch(/could not be read/);
+    expect(notes.join(' ')).toMatch(/2 active listings/);
+  });
+
+  it('still records the closures it can read, and reports no gap when none was lost', async () => {
+    const source = await freshSource('githubList');
+    serve([
+      [
+        (u) => u === LIST_URL,
+        [
+          listRow({ id: 'open-1' }),
+          listRow({
+            id: 'closed-1',
+            active: false,
+            // Canonicalised on the way into `closed`, tracking parameter and all, because
+            // that is the form the stored posting is matched against.
+            url: 'https://WWW.Acme.example.com/careers/closed-1?utm_source=Simplify',
+          }),
+        ],
+      ],
+    ]);
+    const { postings, gaps, closed } = await source.fetch({ board: LIST_REPO });
+
+    expect(postings.map((p) => p.externalId)).toEqual(['open-1']);
+    expect(closed).toEqual(['https://acme.example.com/careers/closed-1']);
+    expect(gaps).toEqual([]);
+  });
+
+  /**
+   * The other half of the pair. This one already passed — the active branch has always been
+   * inside the try — and it is pinned so the two branches cannot drift apart again: the same
+   * unreadable link now costs one row whichever side of `active` it arrives on.
+   */
+  it('an active row with the same unparseable url is skipped and counted too', async () => {
+    const source = await freshSource('githubList');
+    serve([
+      [
+        (u) => u === LIST_URL,
+        [listRow({ id: 'open-1' }), listRow({ id: 'open-bad', url: 'https://' })],
+      ],
+    ]);
+    const { postings, gaps } = await source.fetch({ board: LIST_REPO });
+
+    expect(postings.map((p) => p.externalId)).toEqual(['open-1']);
+    expect(gaps?.join(' ')).toMatch(new RegExp(`skipped 1 row in ${LIST_REPO} `));
   });
 });
 

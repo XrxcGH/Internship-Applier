@@ -465,6 +465,161 @@ function statedAsPreferred(text: string, index: number, length: number): boolean
 }
 
 /**
+ * The people the applicant will work WITH, whose qualifications are nobody's requirement.
+ *
+ * "You will be mentored by engineers with 10+ years of experience" produced
+ * `experience_years min:10 required` on a posting whose previous line read "No prior
+ * experience necessary; we teach everything on the job", and "You will work alongside PhD
+ * researchers" produced `education_level ['doctorate'] required` on a summer internship.
+ * Neither sentence states a requirement at all — they are the "what you'll do" paragraph
+ * describing the team — and each one is a false `ineligible`, which docs/11 calls the worst
+ * bug this app can have and which the user cannot override at G3.
+ *
+ * The lead-in carries the whole signal, because every one of these sentences puts the
+ * applicant in the subject and the qualified stranger in the object, so the marker always
+ * sits between the start of the clause and the phrase. `clauseBounds` is what keeps that
+ * honest and is the reason this can be applied so widely: in "You will work alongside our
+ * researchers, and you must be enrolled in a PhD programme" the comma and the "and" are
+ * hard breaks, so the enrolment and the doctorate are both read with an empty lead-in and
+ * both survive.
+ *
+ * A marker is not enough on its own, though — see `APPLICANT_REINTRODUCED`.
+ */
+const THIRD_PARTY_LEAD =
+  /\b(?:mentor(?:ed|ing)?|manag(?:ed|ing)|supervis(?:ed|ing)|advis(?:ed|ing)|coach(?:ed|ing)?|guid(?:ed|ing)|taught|train(?:ed|ing)|support(?:ed|ing)|surrounded|accompanied|host(?:ed|ing)|led|run|headed|founded|staffed|backed|built|review(?:ed|ing)|overseen|inspired)\s+by\b|\bwork(?:s|ing)?\s+(?:closely\s+|directly\s+|hand[\s-]in[\s-]hand\s+|side[\s-]by[\s-]side\s+|day[\s-]to[\s-]day\s+)?(?:alongside|under|for|beside|next\s+to)\b|\balongside\b|\bjoin(?:s|ing)?\s+(?:a|an|our|the|this)?\s*(?:team|group|lab|cohort|squad|division|organi[sz]ation|org|community|network|studio|practice|department|office)\b|\b(?:team|group|cohort|network|community|staff|faculty|roster|bench|pool|panel|board)\s+of\b|\breport(?:s|ing)?\s+(?:directly\s+)?(?:to|into)\b|\bunder\s+the\s+(?:guidance|mentorship|supervision|direction|tutelage|leadership)\s+of\b|\bour\s+(?:\w+\s+){0,2}(?:team|teams|engineers?|scientists?|researchers?|developers?|designers?|analysts?|staff|mentors?|advisors?|advisers?|managers?|leaders?|founders?|employees?|people|instructors?|faculty|alumni|clients?|customers?|partners?)\b|\bthe\s+team(?:'|’)?s\b/gi;
+
+/**
+ * "with" and "from", which are only about people when people follow them.
+ *
+ * These are split out of `THIRD_PARTY_LEAD` because "work with" is the one marker on the
+ * list that is equally at home in a requirement: "Experience working with Java for 3+ years"
+ * is a real three-year rule, and reading its "working with" as a description of the team
+ * threw the rule away and put a posting the student cannot get back in the queue — the
+ * overcorrection, in the same sentence shape as the bug. What "you will work with senior
+ * engineers" has and that sentence has not is a PERSON immediately after the preposition,
+ * and the object of one of these markers is short enough to look at directly.
+ */
+const THIRD_PARTY_WITH =
+  /\b(?:work(?:s|ing)?|collaborat\w+|partner(?:s|ed|ing)?|pair(?:s|ed|ing)?|embed(?:s|ded|ding)?|sit(?:s|ting)?|learn(?:s|ing)?|shadow(?:s|ed|ing)?|meet(?:s|ing)?|interact(?:s|ing)?)\s+(?:closely\s+|directly\s+|hand[\s-]in[\s-]hand\s+|side[\s-]by[\s-]side\s+|day[\s-]to[\s-]day\s+)?(?:with|from)\b/gi;
+
+/**
+ * Who a "with" has to be about. Only the object of one of those markers is tested against
+ * it, so the list does not have to be exhaustive about job titles in general — it has to
+ * cover the people an internship posting says the intern will be standing next to.
+ */
+const PEOPLE_NOUN =
+  /\b(?:engineers?|scientists?|researchers?|developers?|designers?|analysts?|mentors?|advisors?|advisers?|managers?|directors?|leaders?|founders?|executives?|staff|teams?|colleagues?|peers?|professionals?|experts?|specialists?|practitioners?|instructors?|professors?|faculty|physicians?|doctors?|nurses?|attorneys?|lawyers?|alumni|students?|interns?|postdocs?|phds?|technicians?|architects?|recruiters?|clients?|customers?|partners?|citizens?|nationals?|people|folks|everyone|others?)\b/i;
+
+/**
+ * The words that put the APPLICANT back in the sentence after a third-party lead-in.
+ *
+ * `THIRD_PARTY_LEAD` alone is far too eager, because the phrases employers use for their own
+ * staff are also how they introduce the vacancy: "Our team is looking for a candidate with 5
+ * years of experience" and "Our engineering team requires a Bachelor's degree" both open with
+ * a marker and then state a real requirement, and suppressing those would fill the queue with
+ * postings the student cannot get — the overcorrection docs/11 warns about in the same breath
+ * as the false `ineligible`.
+ *
+ * So the marker only holds while nothing between it and the phrase names the applicant or
+ * asks for anything. "…mentored by engineers with 10+ years" has only "engineers with" in
+ * that gap and stays suppressed; "…team is looking for a candidate with 5 years" has
+ * "looking for" in it and does not.
+ *
+ * The bare nouns for a person — "students", "candidates", "interns" — are deliberately NOT
+ * on this list, however much they look like they belong. They are exactly what a marker
+ * takes as its own object: "you will be mentored by graduate students enrolled in a PhD
+ * programme" is the lab, not the entry bar, and listing "students" cancelled the suppression
+ * on the sentence that needed it most. What actually reintroduces the applicant is the
+ * second person, or a verb that asks for something.
+ */
+const APPLICANT_REINTRODUCED =
+  /\b(?:you|your|yourself|successful|ideal|seek\w*|look(?:s|ing)\s+for|hir(?:e|es|ing)|want(?:s|ed)?|must|shall|should|need(?:s|ed)?|requir\w*|expect\w*|qualif\w*|prerequisite)\b/i;
+
+/**
+ * Whether the phrase at `index` is describing somebody other than the applicant.
+ *
+ * The nearest marker governs: "Our team is looking for someone who will work alongside PhD
+ * researchers" is a sentence about the team even though it opened by naming the vacancy.
+ */
+function describesSomeoneElse(text: string, index: number, length: number): boolean {
+  const [from] = clauseBounds(text, index, length);
+  const lead = text.slice(from, index);
+
+  const last = lastMatch(THIRD_PARTY_LEAD, lead);
+
+  /**
+   * The "work with" family, admitted only when people follow it.
+   *
+   * Kept apart from the unambiguous markers above because "working with" is equally at home
+   * in a real requirement: "Experience working with Java for 3+ years" states a genuine
+   * three-year rule, and reading its "working with" as a description of the team would throw
+   * that rule away — the overcorrection, in the very same sentence shape as the bug. What
+   * "you will work with senior engineers who have 10+ years" has and that sentence has not is
+   * a PERSON straight after the preposition, so only the object is tested, and only within
+   * the couple of words a determiner and an adjective take up.
+   */
+  const withMarker = lastMatch(THIRD_PARTY_WITH, lead);
+  const withNames =
+    withMarker !== null && namesPeople(text, from + withMarker.index + withMarker[0].length)
+      ? withMarker
+      : null;
+
+  // The nearest marker governs, whichever list it came from: a sentence that opens by naming
+  // the vacancy and then hands off to the team is about the team by the time it gets here.
+  const governing =
+    last === null || (withNames !== null && withNames.index > last.index) ? withNames : last;
+  if (governing === null) return false;
+  return !APPLICANT_REINTRODUCED.test(lead.slice(governing.index + governing[0].length));
+}
+
+/**
+ * Whether the words just after `at` name people.
+ *
+ * Read out of the FULL description rather than out of the lead-in, because the object of a
+ * "work with" is usually the very phrase being classified — in "You will collaborate with
+ * U.S. citizens on classified work" the citizenship phrase IS the object, so it sits at the
+ * end of the lead and one character past it. Looking only at the lead found an empty string
+ * and let the sentence through as a citizenship rule that hard-fails every non-citizen.
+ *
+ * Three words is the window: a determiner and an adjective ahead of the noun and no further,
+ * so a person named here cannot reach across a clause to vouch for something else.
+ */
+function namesPeople(text: string, at: number): boolean {
+  const after = text.slice(at, at + 80).trimStart();
+  return PEOPLE_NOUN.test(after.split(/\s+/).slice(0, 3).join(' '));
+}
+
+/** The last match of a sticky global pattern in `text`, with `lastIndex` left clean. */
+function lastMatch(re: RegExp, text: string): RegExpExecArray | null {
+  re.lastIndex = 0;
+  let last: RegExpExecArray | null = null;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) last = m;
+  re.lastIndex = 0;
+  return last;
+}
+
+/**
+ * A posting saying outright that the role needs no experience at all.
+ *
+ * "No prior experience necessary; we teach everything on the job." sat one line above the
+ * ten-year sentence in `describesSomeoneElse`, and a posting whose entire point is that it
+ * wants beginners cannot also be read as demanding a decade. A softener has to share the
+ * sentence to count — `softenerWindow` clips to the line and the full stop deliberately, so
+ * that a "plus" from one bullet cannot soften the next — and this disclaimer never does: it
+ * is its own sentence, and usually its own heading line. It is therefore looked for across
+ * the whole description, which is the scope the claim itself has.
+ *
+ * The wording is deliberately narrow: nothing may sit between "experience" and the word that
+ * waives it except a copula. "No prior experience WITH KUBERNETES is necessary" waives one
+ * tool and not the years, and a posting that says that can still require three years of
+ * software engineering two lines later — reading it as a blanket waiver would be the
+ * overcorrection, not a fix.
+ */
+const EXPERIENCE_WAIVED =
+  /\bno\s+(?:prior\s+|previous\s+|past\s+|formal\s+|professional\s+|work\s+|working\s+|industry\s+|relevant\s+|coding\s+|programming\s+|technical\s+)*experience\s*(?:is\s+|are\s+)?(?:necessary|required|needed|expected|mandatory|essential)\b|\b(?:prior\s+|previous\s+|past\s+|professional\s+|work\s+)*experience\s+is\s+not\s+(?:necessary|required|needed|expected|mandatory|essential)\b|\b(?:do(?:es)?\s+not|don'?t|doesn'?t|will\s+not|won'?t)\s+(?:require|expect)\s+(?:any\s+)?(?:prior\s+|previous\s+|past\s+|professional\s+|work\s+)*experience\b|\b(?:do(?:es)?\s+not|don'?t|doesn'?t)\s+need\s+(?:any\s+)?(?:prior\s+|previous\s+|past\s+|professional\s+|work\s+)*experience\b/i;
+
+/**
  * The ways a posting names someone who may work here without being a citizen.
  *
  * Green cards are only half of it. "Must be a U.S. citizen or otherwise authorized to work
@@ -972,13 +1127,27 @@ export function deterministicRequirements(description: string): Candidate[] {
   // user authenticated through the Claude Code CLI gets deterministic extraction only, and
   // this is the pass that decides whether a 16-year-old sees a posting written for them.
   for (const hit of ageRequirements(description)) {
+    // Somebody else's age is not a gate on the applicant — see `describesSomeoneElse`. The
+    // age patterns already refuse "you will join a team of 20+ engineers" by demanding a
+    // "be"/"aged" lead-in for a bare "N+", but that guard only covers the one marker with no
+    // age word in it; "you will work alongside staff 21 years of age and over" carries its
+    // own age word and had nothing standing in front of it.
+    if (describesSomeoneElse(description, hit.index, hit.length)) continue;
     out.push({
       kind: 'age',
       // An unnumbered gate records no threshold, so "min" would be a lie about what the
       // posting said; it is the presence of a gate that is being recorded.
       operator: hit.necessity === 'unclear' ? 'present' : 'min',
       value: { min: hit.min },
-      necessity: hit.necessity,
+      // One place rather than the three inside `ageRequirements` that push a hit, because
+      // every one of them hardcoded `required` and an age can be a wish like anything else:
+      // an "18 years of age or older" bullet sitting under "Preferred qualifications" was a
+      // hard rejection of the 16-year-old this module exists for. `unclear` is left alone —
+      // it is already the softest reading there is.
+      necessity:
+        hit.necessity === 'required' && statedAsPreferred(description, hit.index, hit.length)
+          ? 'preferred'
+          : hit.necessity,
       confidence: hit.confidence,
       sourceQuote: sentenceAround(description, hit.index, hit.length),
     });
@@ -1017,7 +1186,13 @@ export function deterministicRequirements(description: string): Candidate[] {
         kind: 'work_auth',
         operator: 'equals',
         value: { sponsorshipUnavailable: true },
-        necessity: 'required',
+        // "We would prefer candidates who do not require sponsorship" is a wish, and
+        // hardcoding `required` here meant the deterministic pass could never produce
+        // anything else. workAuthorization() in eligibility.ts already has the branch for
+        // it — "the posting would rather you did not, but it does not rule it out" — and no
+        // input could reach it without an API key, so a student who needs a visa was
+        // hard-failed on wording that never closed the door.
+        necessity: statedAsPreferred(description, at, m[0].length) ? 'preferred' : 'required',
         confidence: 0.9,
       },
       m,
@@ -1033,7 +1208,9 @@ export function deterministicRequirements(description: string): Candidate[] {
         kind: 'work_auth',
         operator: 'equals',
         value: { requiresExistingAuthorization: true },
-        necessity: 'required',
+        necessity: statedAsPreferred(description, m.index ?? 0, m[0].length)
+          ? 'preferred'
+          : 'required',
         confidence: 0.85,
       },
       m,
@@ -1066,6 +1243,18 @@ export function deterministicRequirements(description: string): Candidate[] {
   )) {
     const [from, to] = clauseBounds(description, m.index ?? 0, m[0].length);
     if (NEGATED.test(description.slice(from, to))) continue;
+    // "You will work alongside U.S. citizens holding active clearances" describes the desk
+    // next to yours. Read as a rule it hard-fails every applicant who is not a US citizen —
+    // the single most expensive false `ineligible` this file can produce.
+    if (describesSomeoneElse(description, m.index ?? 0, m[0].length)) continue;
+
+    // Whether the posting insists is decided once, for both branches below. "U.S.
+    // citizenship preferred." was the reported case: the softener is right there in the
+    // sentence, `statedAsPreferred` has read it since it was written, and this call site
+    // was one of the ten that never asked. citizenship() in eligibility.ts keeps a
+    // preferred nationality out of the list it fails people against, so the same sentence
+    // now widens the verdict instead of closing it.
+    const wish = statedAsPreferred(description, m.index ?? 0, m[0].length);
 
     // "U.S. citizenship or permanent residency is required" welcomes green-card holders,
     // and "or otherwise authorized to work in the United States" welcomes anyone with a
@@ -1081,7 +1270,7 @@ export function deterministicRequirements(description: string): Candidate[] {
           kind: 'work_auth',
           operator: 'equals',
           value: { requiresExistingAuthorization: true },
-          necessity: 'required',
+          necessity: wish ? 'preferred' : 'required',
           confidence: 0.7,
         },
         m,
@@ -1094,7 +1283,7 @@ export function deterministicRequirements(description: string): Candidate[] {
         kind: 'citizenship',
         operator: 'one_of',
         value: { countries: ['US'] },
-        necessity: 'required',
+        necessity: wish ? 'preferred' : 'required',
         confidence: 0.85,
       },
       m,
@@ -1126,7 +1315,14 @@ export function deterministicRequirements(description: string): Candidate[] {
         kind: 'citizenship',
         operator: 'equals',
         value: { clearanceRequired: true },
-        necessity: 'required',
+        // "Preferred qualifications: an active clearance is required for some projects" is a
+        // wish, not a gate. citizenship() in eligibility.ts reads `clearanceRequired` off
+        // every clause however it is worded, so today this only changes what the user is
+        // shown rather than the verdict — but a hardcoded `required` was a lie about the
+        // posting either way, and the model pass can already produce the softer reading.
+        necessity: statedAsPreferred(description, m.index ?? 0, m[0].length)
+          ? 'preferred'
+          : 'required',
         confidence: 0.85,
       },
       m,
@@ -1139,6 +1335,9 @@ export function deterministicRequirements(description: string): Candidate[] {
   )) {
     const from = MONTHS[m[1]!.toLowerCase()];
     const to = MONTHS[m[3]!.toLowerCase()];
+    // "You will work alongside analysts graduating between May 2026 and June 2027" is the
+    // cohort you are joining, not the window you have to land in.
+    if (describesSomeoneElse(description, m.index ?? 0, m[0].length)) continue;
     if (from && to) {
       push(
         {
@@ -1148,7 +1347,13 @@ export function deterministicRequirements(description: string): Candidate[] {
             from: `${m[2]}-${String(from).padStart(2, '0')}`,
             to: `${m[4]}-${String(to).padStart(2, '0')}`,
           },
-          necessity: 'required',
+          // "Ideally graduating between December 2027 and June 2028" — the same softener
+          // the experience clause has honoured all along. A graduation window is the one
+          // requirement a student can do absolutely nothing about, so reading a preference
+          // as a rule takes the posting away permanently.
+          necessity: statedAsPreferred(description, m.index ?? 0, m[0].length)
+            ? 'preferred'
+            : 'required',
           confidence: 0.85,
         },
         m,
@@ -1179,12 +1384,22 @@ export function deterministicRequirements(description: string): Candidate[] {
   )) {
     const [from] = clauseBounds(description, m.index ?? 0, m[0].length);
     if (NEGATED.test(description.slice(from, m.index ?? 0))) continue;
+    // "You will be mentored by graduate students enrolled in our PhD programme" says who is
+    // in the lab, not who may apply, and it hard-failed the recent graduate this same block
+    // was already rewritten once to protect.
+    if (describesSomeoneElse(description, m.index ?? 0, m[0].length)) continue;
     push(
       {
         kind: 'enrollment',
         operator: 'equals',
         value: { required: true },
-        necessity: 'required',
+        // "Preferably currently enrolled in a degree program." was the reported case, and
+        // enrollment() in eligibility.ts already says in a comment that "preferably still
+        // enrolled" must not filter recent graduates out — it just had no way to hear it,
+        // because this line said `required` whatever the posting said.
+        necessity: statedAsPreferred(description, m.index ?? 0, m[0].length)
+          ? 'preferred'
+          : 'required',
         confidence: 0.8,
       },
       m,
@@ -1215,6 +1430,12 @@ export function deterministicRequirements(description: string): Candidate[] {
   // undergraduates on postings that had just told them to apply anyway.
   for (const [re, level] of DEGREES) {
     for (const m of description.matchAll(re)) {
+      // "You will work alongside PhD researchers" is the team, not the bar — and the `break`
+      // below makes this the difference between softening the requirement and never seeing
+      // the real one: skipping the match keeps the loop hunting, so a posting that mentions
+      // the lab's doctorates first and its own bachelor's requirement second still records
+      // the bachelor's.
+      if (describesSomeoneElse(description, m.index ?? 0, m[0].length)) continue;
       push(
         {
           kind: 'education_level',
@@ -1232,19 +1453,39 @@ export function deterministicRequirements(description: string): Candidate[] {
   }
 
   // Professional experience — the clause that catches "internships" wanting 3+ years.
+  //
+  // Read once, not once per match. `EXPERIENCE_WAIVED` scans the whole description, and this
+  // loop runs once per "N years of experience" in it — the exact O(n) inside O(matches) shape
+  // this file has already had to unpick twice, most recently at 16.4 seconds for a 180KB
+  // posting on a single-threaded server.
+  const experienceWaived = EXPERIENCE_WAIVED.test(description);
   for (const m of description.matchAll(
     /\b(\d{1,2})\+?\s*(?:-\s*\d{1,2}\s*)?years?\s+(?:of\s+)?(?:professional\s+|relevant\s+|industry\s+|work\s+)?experience\b/gi,
   )) {
     const min = Number(m[1]);
+    // Whose ten years? "You will be mentored by engineers with 10+ years of experience" is
+    // the sentence that motivated `describesSomeoneElse`, and it produced a hard ten-year
+    // minimum on an internship — a decade of experience is the one requirement no student
+    // in this population can ever clear, so it is a permanent rejection.
+    if (describesSomeoneElse(description, m.index ?? 0, m[0].length)) continue;
     if (min >= 1 && min <= 20) {
       push(
         {
           kind: 'experience_years',
           operator: 'min',
           value: { min },
+          // A posting that says outright "No prior experience necessary" and then names a
+          // number of years is contradicting itself, and the student is the only one who
+          // can settle which line is aimed at her: `unclear` routes to eligibility's
+          // `unknown` — "check the posting" — rather than to a silent pass or the hard fail
+          // this used to be. An ordinary softener still reads as a plain `preferred`, so
+          // "5 years preferred" beside "no experience required" is not turned into a
+          // question it does not deserve.
           necessity: statedAsPreferred(description, m.index ?? 0, m[0].length)
             ? 'preferred'
-            : 'required',
+            : experienceWaived
+              ? 'unclear'
+              : 'required',
           confidence: 0.8,
         },
         m,

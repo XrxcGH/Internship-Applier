@@ -10,10 +10,18 @@ them has tests — `npm test` prints how many, which is a more honest answer tha
 written down here and left to rot. See [`docs/11-roadmap.md`](docs/11-roadmap.md) for what
 each milestone covers and, more usefully, what is still untested.
 
-Two gaps worth knowing before you rely on it: none of the per-vendor ATS adapters
-(Greenhouse, Lever, Ashby, Workday) is built, so every form is filled by the generic
-label-driven mapper, which has never been pointed at a real posting from any of them; and
-answer drafting has not been exercised against a live model.
+Two gaps worth knowing before you rely on it. Both are on the *filling* side, not the
+finding side: discovery has six vendor adapters — Greenhouse, Lever, Ashby, Workday,
+SmartRecruiters and Workable — and a live run has returned real postings through them. This
+paragraph used to say no Workday adapter existed, which read as a hole in the search when
+the search is the part that has been exercised against the real internet.
+
+The gaps: none of the per-vendor ATS adapters is built **for filling a form**, so every form
+is filled by the generic label-driven mapper, which has never been pointed at a real posting
+from any of those vendors — `core/filling` holds the mapper and no vendor file. And answer
+drafting has not been exercised against a live model. That one is untried rather than
+unavailable: the Claude Code CLI backend exists and both resume extraction and discovery have
+run through it, so drafting could be run the same way and simply has not been.
 
 ## Running it
 
