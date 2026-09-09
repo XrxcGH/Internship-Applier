@@ -78,9 +78,20 @@ export function refusal(err: unknown, status: string): string {
   // the user tried to record is that they sent it. Anywhere past that, saying this would
   // be telling someone their application has not been submitted when it plainly has.
   const notSentYet = status === 'submitted' && allowed.some((n) => BEFORE_SENDING.includes(n));
+  /**
+   * This sentence used to end "even when you sent it on the employer's own site", and that
+   * was true of the interface and false of the server.
+   *
+   * `canTransition` lets a USER walk answers_ready to filled to awaiting_submit to submitted
+   * — it refuses only the one-move jump from draft, which is the stray-POST guard, and the
+   * same moves made by the tool. So a student whose fill was refused (an aggregator redirect,
+   * a login wall, a run that filled nothing) and who then applied on the employer's site by
+   * hand could always have recorded it; nothing offered them the way. `recordSubmittedByHand`
+   * below is that way, and this sentence now points at it instead of denying it.
+   */
   const why = notSentYet
-    ? 'A submission can only be recorded once the application has been through the fill step, ' +
-      'even when you sent it on the employer’s own site. '
+    ? 'A submission is recorded through the fill steps, so this one has to walk through them ' +
+      'first — “I submitted it” does that for you if you sent it on the employer’s own site. '
     : '';
 
   const alternatives = REPORTABLE.filter((r) => allowed.includes(r.value)).map((r) => r.label);
@@ -100,4 +111,39 @@ export function refusal(err: unknown, status: string): string {
     return `${opening}${why}The one status you can report for it now is "${String(alternatives[0])}".`;
   }
   return `${opening}${why}What you can report for it now: ${alternatives.map((a) => `"${a}"`).join(', ')}.`;
+}
+
+/**
+ * Recording an application the student sent themselves, from wherever it stands.
+ *
+ * G4 is the whole point of this product — the student presses Submit on the real page — and
+ * the case it happens in most is the one where this tool could NOT fill the form: an
+ * aggregator redirect it refuses to open, a login wall, a bot check, a run that filled
+ * nothing. All of those leave the application short of `awaiting_submit`, and the status menu
+ * offered one hop, so "I submitted it" was refused and the only pickable status was
+ * "Withdrawn" — for an application the student had actually sent.
+ *
+ * The server has always allowed this: `canTransition` permits a USER to walk answers_ready →
+ * filled → awaiting_submit → submitted, and refuses only the single jump from `draft` (the
+ * stray-POST guard) and the same moves attempted by the tool. So this walks the hops in order
+ * rather than asking for a new endpoint, and NOTHING is weakened — every hop is the same call
+ * the menu already makes, and routes/tracker.ts still applies the G3 answers-approved check
+ * on the way through.
+ *
+ * The first refusal stops the walk and is thrown as-is, so a student who genuinely cannot
+ * take a hop — answers not approved at G3 — gets that reason rather than a generic failure
+ * from three calls later.
+ */
+const TO_SUBMITTED = ['answers_ready', 'filled', 'awaiting_submit', 'submitted'] as const;
+
+export async function recordSubmittedByHand(
+  id: string,
+  from: string,
+  post: (id: string, status: string) => Promise<unknown>,
+): Promise<void> {
+  const at = TO_SUBMITTED.indexOf(from as (typeof TO_SUBMITTED)[number]);
+  // A status already past the walk, or one the walk does not pass through, is not this
+  // function's business — the caller's ordinary single hop is.
+  const hops = at === -1 ? TO_SUBMITTED : TO_SUBMITTED.slice(at + 1);
+  for (const hop of hops) await post(id, hop);
 }

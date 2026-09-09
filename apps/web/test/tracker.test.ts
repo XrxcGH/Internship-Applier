@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ApiError } from '../src/lib/api';
-import { allowedFrom, refusal, REPORTABLE } from '../src/lib/tracker';
+import { allowedFrom, recordSubmittedByHand, refusal, REPORTABLE } from '../src/lib/tracker';
 
 /** What the tracker route sends when the status machine says no. */
 function refused(reason: string): ApiError {
@@ -81,5 +81,67 @@ describe('allowedFrom', () => {
     expect(allowedFrom(`Cannot go from x to y. From here: ${listed}.`)).toEqual(
       REPORTABLE.map((r) => r.value),
     );
+  });
+});
+
+/**
+ * Recording an application the student sent themselves — which is what G4 is.
+ *
+ * The case it happens in most is the one where this tool could NOT fill the form: an
+ * aggregator redirect it refuses to open, a login wall, a bot check, a run that filled
+ * nothing. All of those leave the application short of `awaiting_submit`, the status menu
+ * asked for a single hop, and the server refused it — so the only status a student could pick
+ * for an application they had actually sent was "Withdrawn".
+ *
+ * The server always allowed the walk: `canTransition` lets a USER go answers_ready → filled →
+ * awaiting_submit → submitted, refusing only the one-move jump from `draft` (the stray-POST
+ * guard) and the same moves made by the tool. Nothing here weakens that — each hop is the same
+ * call the menu already made, and routes/tracker.ts still applies the G3 answers-approved
+ * check on the way through.
+ */
+describe('recording a submission made by hand', () => {
+  it('walks the fill steps in order from wherever the application stands', async () => {
+    const posted: string[] = [];
+    await recordSubmittedByHand('app-1', 'answers_ready', (_id, status) => {
+      posted.push(status);
+      return Promise.resolve();
+    });
+    expect(posted).toEqual(['filled', 'awaiting_submit', 'submitted']);
+  });
+
+  it('starts from the beginning of the walk for a status outside it', async () => {
+    // `draft` is not on the path — the server refuses draft → submitted outright as the
+    // stray-POST guard — so the walk offers the first legal hop and lets the server judge it.
+    const posted: string[] = [];
+    await recordSubmittedByHand('app-1', 'draft', (_id, status) => {
+      posted.push(status);
+      return Promise.resolve();
+    });
+    expect(posted[0]).toBe('answers_ready');
+    expect(posted.at(-1)).toBe('submitted');
+  });
+
+  it('asks for nothing when the application is already there', async () => {
+    const posted: string[] = [];
+    await recordSubmittedByHand('app-1', 'submitted', (_id, status) => {
+      posted.push(status);
+      return Promise.resolve();
+    });
+    expect(posted).toEqual([]);
+  });
+
+  it('stops at the first refusal, so the student sees the reason for it', async () => {
+    // A hop the student genuinely cannot take — answers not approved at G3 — has to surface
+    // as itself, not as a generic failure from three calls later.
+    const posted: string[] = [];
+    await expect(
+      recordSubmittedByHand('app-1', 'answers_ready', (_id, status) => {
+        posted.push(status);
+        return status === 'filled'
+          ? Promise.reject(new Error('Every answer needs your approval at gate G3.'))
+          : Promise.resolve();
+      }),
+    ).rejects.toThrow(/gate G3/);
+    expect(posted).toEqual(['filled']);
   });
 });

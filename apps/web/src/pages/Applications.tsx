@@ -185,7 +185,13 @@ function Detail({
   const [notes, setNotes] = useState<
     Record<
       string,
-      { styleNote?: string | null; unresolved?: boolean; reusedFrom?: Answer['reusedFrom'] }
+      {
+        styleNote?: string | null;
+        unresolved?: boolean;
+        reusedFrom?: Answer['reusedFrom'];
+        /** Carried from the response of whichever call last re-checked this text. */
+        verified?: boolean;
+      }
     >
   >({});
 
@@ -321,7 +327,11 @@ function Detail({
                     const drafted = await draftAnswer(a.id);
                     setNotes((n) => ({
                       ...n,
-                      [a.id]: { styleNote: drafted.styleNote, unresolved: drafted.unresolved },
+                      [a.id]: {
+                        styleNote: drafted.styleNote,
+                        unresolved: drafted.unresolved,
+                        verified: drafted.verified,
+                      },
                     }));
                   })
                 }
@@ -331,7 +341,15 @@ function Detail({
                     // The whole entry is replaced rather than merged: the user has just
                     // rewritten the text, so whatever the model failed to resolve in its
                     // own draft is no longer a statement about what is on screen.
-                    setNotes((n) => ({ ...n, [a.id]: { styleNote: saved.styleNote } }));
+                    // `verified` comes back on this response and on the draft's, and it is
+                    // the only place it is ever sent: the list payload reports stored rows and
+                    // cannot know whether the check has run on the text now on screen. Dropped
+                    // here, G3 showed "no claims are listed against this text" — which reads as
+                    // "checked, nothing to flag" — about an edit nothing had looked at.
+                    setNotes((n) => ({
+                      ...n,
+                      [a.id]: { styleNote: saved.styleNote, verified: saved.verified },
+                    }));
                   })
                 }
                 onApprove={() => void run(`approve:${a.id}`, () => approveAnswer(a.id))}

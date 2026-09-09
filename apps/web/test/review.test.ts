@@ -324,3 +324,42 @@ describe('the evidence column as it renders', () => {
     expect(html).not.toContain('nothing here says which');
   });
 });
+
+/**
+ * The flag that says whether THIS text has been read against the profile.
+ *
+ * `verified` is sent by the two routes that re-check an answer — PATCH /api/answers/:id and
+ * the draft endpoint — and deliberately not by the list payload, which reports stored rows
+ * and cannot know whether the check has run on the text now on screen.
+ *
+ * The client had no field for it, so an edit that came back `verified: false` was dropped on
+ * the way through and `wasChecked` fell back to its "cannot tell" branch. G3 then printed "No
+ * claims are listed against this text" — the wording that means "checked, and nothing needed
+ * backing" — about text nothing had looked at, on the screen whose only job is telling the
+ * student what has been checked before they stand behind it.
+ */
+describe('the verified flag on an edited answer', () => {
+  it('reports an unchecked edit as unchecked, not as "nothing to check"', () => {
+    // An edit clears the stored evidence and flags, so nothing else in the payload can tell
+    // the two states apart — this flag is the whole signal.
+    expect(wasChecked({ evidence: [], flags: [], verified: false })).toBe(false);
+    expect(
+      evidenceNote({ text: 'I rewrote this myself.', evidence: [], flags: [], verified: false })
+        .state,
+    ).toBe('unchecked');
+  });
+
+  it('reports a checked answer that needed no backing as checked', () => {
+    expect(wasChecked({ evidence: [], flags: [], verified: true })).toBe(true);
+    expect(
+      evidenceNote({ text: 'Some text.', evidence: [], flags: [], verified: true }).state,
+    ).toBe('checked');
+  });
+
+  it('still says it cannot tell when the flag is absent', () => {
+    // The list payload does not send it, and inventing an answer for that case is what the
+    // three-state wording exists to avoid.
+    expect(wasChecked({ evidence: [], flags: [] })).toBeNull();
+    expect(evidenceNote({ text: 'Some text.', evidence: [], flags: [] }).state).toBe('unknown');
+  });
+});

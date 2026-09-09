@@ -266,6 +266,19 @@ export interface AnswerEvidence {
 export interface Answer {
   id: string;
   applicationId: string;
+  /**
+   * Whether this exact text has been read against the profile.
+   *
+   * Sent by the two routes that RE-CHECK an answer — PATCH /api/answers/:id and the draft
+   * endpoint — and deliberately absent from the list payload, which reports stored rows and
+   * cannot know whether the check has run on the text now on screen. Undeclared, it was
+   * dropped on the way through: an edit came back `verified: false`, the field had no home in
+   * this type, and G3's evidence panel fell back to its "no claims are listed" wording — the
+   * reading that means "this may have been checked and found clean", about text nothing had
+   * looked at. `wasChecked` in AnswerReview.tsx distinguishes the three states; it needs to be
+   * given the flag to do it.
+   */
+  verified?: boolean;
   questionText: string;
   fieldKey: string;
   answerType: string;

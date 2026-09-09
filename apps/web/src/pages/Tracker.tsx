@@ -9,7 +9,7 @@ import {
   type TrackedApp,
   type TrackerView,
 } from '../lib/api';
-import { refusal, REPORTABLE } from '../lib/tracker';
+import { recordSubmittedByHand, refusal, REPORTABLE } from '../lib/tracker';
 import { Page, RunningHead, Section } from '../components/Chrome';
 import { Badge, Button, Empty, Notice } from '../components/Controls';
 
@@ -158,11 +158,28 @@ export function Tracker({ onOpenQueue }: { onOpenQueue?: () => void }) {
 
   useEffect(refresh, [refresh]);
 
-  const report = async (id: string, status: string): Promise<void> => {
+  const report = async (id: string, status: string, from: string): Promise<void> => {
     setBusy(id);
     setError(null);
     try {
-      await setStatus(id, status);
+      /**
+       * "I submitted it" walks the fill steps rather than asking for one hop it cannot take.
+       *
+       * G4 is the point of the product — the student presses Submit on the real page — and
+       * the case that happens in most is the one where this tool could NOT fill the form: an
+       * aggregator redirect it refuses to open, a login wall, a bot check, a run that filled
+       * nothing. Every one of those leaves the application short of `awaiting_submit`, so the
+       * single hop was refused and the only status the student could pick for an application
+       * they had actually sent was "Withdrawn".
+       *
+       * The server always allowed the walk — see `recordSubmittedByHand`. Only this button
+       * did not know how to ask.
+       */
+      if (status === 'submitted') {
+        await recordSubmittedByHand(id, from, setStatus);
+      } else {
+        await setStatus(id, status);
+      }
       refresh();
     } catch (err) {
       setError(refusal(err, status));
@@ -302,7 +319,7 @@ export function Tracker({ onOpenQueue }: { onOpenQueue?: () => void }) {
                             app={a}
                             column={col}
                             busy={busy === a.id}
-                            onStatus={(s) => void report(a.id, s)}
+                            onStatus={(s) => void report(a.id, s, a.status)}
                             onDraft={() => void showDraft(a.id)}
                           />
                         ))}
