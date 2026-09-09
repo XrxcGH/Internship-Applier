@@ -7,7 +7,7 @@
  * this path is supposed to leave a field null rather than guess it; these tests hold that
  * line, because the guess was previously hardcoded in four separate places.
  */
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { adzuna, usajobs } from '../src/core/discovery/sources/aggregators';
 import {
   ashby,
@@ -938,6 +938,88 @@ describe('workday fetch', () => {
 });
 
 describe('smartrecruiters', () => {
+  /**
+   * The host says no, and this tool does what a host says.
+   *
+   * `api.smartrecruiters.com/robots.txt` reads `User-agent: LinkedInBot / Allow:
+   * /v1/companies/` and then `User-agent: * / Disallow: /` — the one path this adapter uses,
+   * allowed to somebody else. It was read anyway for a long time, and nobody chose that:
+   * `fetchJson` defaults `isDocumentedApi` to true and so skips the robots check, while the
+   * Remotive adapter passes false. Two hosts published the same refusal and got opposite
+   * answers depending on which default an adapter inherited.
+   *
+   * Three things are pinned, the same three the Remotive tests pin: the file is consulted,
+   * the API itself is never asked, and the refusal lands in `gaps` — so run.ts marks the
+   * source degraded and names it in `skipped`, rather than the student reading "0 found" as
+   * a company with no internships.
+   */
+  const SR_ROBOTS =
+    'User-agent: LinkedInBot\nAllow: /v1/companies/\n\nUser-agent: *\nDisallow: /\n';
+
+  /**
+   * A SmartRecruiters adapter with no cached robots verdict.
+   *
+   * The fetcher caches robots.txt answers by ORIGIN for the life of the process, and the
+   * board tests above already fetched api.smartrecruiters.com under the stub's allow-all
+   * default — so without resetting the module registry these tests would read that cached
+   * yes and never consult the file they are about.
+   *
+   * IT HAS TO RUN BEFORE THE STUB IS INSTALLED. The fetcher notices a replaced
+   * `globalThis.fetch` by comparing it against the one it saw at module load, so a module
+   * reloaded while the stub is already in place takes the stub AS the baseline, decides
+   * nothing has been replaced, and goes to the real network instead.
+   */
+  const freshSmartrecruiters = async (): Promise<typeof smartrecruiters> => {
+    vi.resetModules();
+    const mod = await import('../src/core/discovery/sources/ats');
+    return mod.smartrecruiters;
+  };
+
+  it('is not read when its robots.txt refuses, and the run says why', async () => {
+    const source = await freshSmartrecruiters();
+    const stub = stubFetch((url) =>
+      url.endsWith('/robots.txt')
+        ? new Response(SR_ROBOTS, { status: 200, headers: { 'content-type': 'text/plain' } })
+        : { totalFound: 1, content: [{ id: '1', name: 'Software Engineering Intern' }] },
+    );
+    try {
+      const result = await source.fetch({ board: 'robotsfixture' });
+
+      // The postings endpoint is never asked for — only the file that said not to.
+      expect(stub.calls.map((c) => c.url).filter((u) => u.includes('/postings'))).toEqual([]);
+      expect(stub.calls.some((c) => c.url.endsWith('/robots.txt'))).toBe(true);
+      expect(result.postings).toEqual([]);
+
+      // A gap, not a note: a source the tool chose not to read is a different thing from a
+      // board that answered nothing, and only one of them is honest as "0 found".
+      expect(result.gaps).toHaveLength(1);
+      expect(result.gaps?.[0]).toMatch(/robots\.txt asks automated clients to stay off/);
+      expect(result.gaps?.[0]).toMatch(/paste a job URL directly/);
+      expect(result.notes ?? []).toEqual([]);
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it('says the refusal once, not once per search', async () => {
+    // robots.txt answers for the ORIGIN, so the five searches after the first would each ask
+    // the same question and get the same no. Reported per-search it would print six times
+    // and, worse, read as "these searches could not be read" — which says the board broke.
+    const source = await freshSmartrecruiters();
+    const stub = stubFetch((url) =>
+      url.endsWith('/robots.txt')
+        ? new Response(SR_ROBOTS, { status: 200, headers: { 'content-type': 'text/plain' } })
+        : { totalFound: 0, content: [] },
+    );
+    try {
+      const result = await source.fetch({ board: 'robotsonce' });
+      expect(result.gaps).toHaveLength(1);
+      expect(result.gaps?.join(' ')).not.toMatch(/could not be read/);
+    } finally {
+      stub.restore();
+    }
+  });
+
   it('reports a missing company identifier as a gap', async () => {
     const result = await smartrecruiters.fetch({ board: '' });
     expect(result.postings).toEqual([]);

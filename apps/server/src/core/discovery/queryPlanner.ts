@@ -357,8 +357,17 @@ export function termTokens(filters: SearchFilters): string[] {
  * while: `ensureSource` fires once per persisted posting inside a run, so nothing built a
  * row from a resolution, and this sentence described a route into the plan that no Workday
  * board could take.
+ *
+ * SmartRecruiters is absent for a different reason, and the same one that keeps Remotive out
+ * of the default plan (see § Sourcing policy): `api.smartrecruiters.com` answers
+ * `User-agent: * / Disallow: /`, the adapter honours that, and a guessed target there can
+ * therefore only ever come back refused. Planning it would put "This search was not complete"
+ * on every run that pins any company, about a source that cannot contribute until the site
+ * changes its mind — and a standing refusal is not a coverage gap anyone can act on, it is
+ * noise that teaches the user to stop reading the warnings that matter. The adapter stays,
+ * as honest as ever, for anyone who adds the board by hand.
  */
-const GUESSABLE_VENDORS = ['greenhouse', 'lever', 'ashby', 'smartrecruiters', 'workable'] as const;
+const GUESSABLE_VENDORS = ['greenhouse', 'lever', 'ashby', 'workable'] as const;
 
 /** How the reason strings spell each vendor, since the kind is a lowercase identifier. */
 const VENDOR_NAMES: Partial<Record<PlannedTarget['source'], string>> = {
@@ -502,9 +511,11 @@ export function planQueries(
     }
     notes.push(
       `"${c}" has no resolved board yet, so its name was guessed as "${slug}" on ` +
-        'Greenhouse, Lever, Ashby, SmartRecruiters and Workable. A Workday board cannot be ' +
-        'guessed from a name, so if this company hires through Workday, resolve it in ' +
-        'Discover to find the right board.',
+        'Greenhouse, Lever, Ashby and Workable. A Workday board cannot be guessed from a ' +
+        'name, so if this company hires through Workday, resolve it in Discover to find the ' +
+        'right board. SmartRecruiters is not guessed at all: it asks automated clients to ' +
+        'stay off its API and this tool does what it asks, so if this company hires there, ' +
+        'open its board yourself and paste a job URL.',
     );
   }
 

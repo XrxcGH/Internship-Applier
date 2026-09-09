@@ -42,11 +42,28 @@ reports the refusal as a coverage gap in plain words — a source the tool chose
 is a different thing from a source that searched and found nothing, and only one of them is
 honest as "0 found".
 
-**SmartRecruiters is not yet held to that rule.** Its adapter and the resolver probe both go
-through `fetchJson`, whose `isDocumentedApi` default skips the robots check, so the tool
-reads a host that has asked it not to. Nobody has made that call deliberately; it is written
-down here rather than left implicit in a default, so that whoever decides it is deciding
-rather than inheriting.
+**SmartRecruiters is now held to the same rule.** It used not to be: its adapter and the
+resolver probe both went through `fetchJson`, whose `isDocumentedApi` default skips the
+robots check, so two hosts published the same refusal and got opposite answers depending on
+which default each adapter happened to inherit. Both now pass `isDocumentedApi: false`, so
+the file decides. A refusal ends the whole source rather than each of its six searches in
+turn — `robots.txt` answers for the origin, and reporting it per-search would print the same
+no six times dressed as "these searches could not be read", which says the board broke when
+it did not. The company probe files it under `unproven` instead of logging a failure, for the
+same reason: being told not to look is not a vendor being unreachable.
+
+The other four ATS hosts were asked under the agent string this tool sends and permit the
+paths their adapters use — `boards-api.greenhouse.io` disallows only `/embed/`,
+`api.lever.co` answers `Allow: /`, `apply.workable.com` an empty `Disallow:`, and
+`api.ashbyhq.com` answers 401, which RFC 9309 § 2.3.1 and this codebase both read as
+allow-all. Their `isDocumentedApi` is deliberately left alone rather than flipped on the
+strength of one reading: for a host that permits, asking changes nothing today and quietly
+makes four more sources fail closed if one of those files ever changes shape.
+
+What it costs, stated plainly: SmartRecruiters is not in the keyless default plan — it is a
+guessable vendor, so it only runs once a company is named or resolved — but on one real
+installation 201 of 2,709 stored postings had come through it. That coverage is now gone,
+and the run says so rather than showing a clean zero.
 
 **Tier B — the live web, searched through the user's own model access. Built.** The
 `web_search` source (`core/discovery/sources/webSearch.ts`) asks the model to search the web
@@ -191,9 +208,15 @@ QueryPlan {
 `targets` is the part that costs requests, and companies the user pinned by name go in
 first and survive the cap. Slicing one concatenated list dropped them silently as soon as
 the pinned list alone exceeded 40 — losing exactly the boards that had been asked for by
-name. A pinned company with no resolved board is guessed on the five vendors whose board
-address is just a slug — Greenhouse, Lever, Ashby, SmartRecruiters and Workable — with a
-note saying the guess is unverified so it can be pointed at the resolve endpoint. Workday
+name. A pinned company with no resolved board is guessed on the four vendors whose board
+address is just a slug — Greenhouse, Lever, Ashby and Workable — with a
+note saying the guess is unverified so it can be pointed at the resolve endpoint.
+SmartRecruiters shares that address shape and is deliberately not among them: its host
+refuses this tool (see § Sourcing policy), so a guess there could only ever come back
+refused, and planning one would put "This search was not complete" on every run that pins
+any company. The plan note says so, because a user who pinned a company that really does
+hire through SmartRecruiters needs to be told to go and paste a URL rather than left to
+read the silence as "nothing open". Workday
 is never guessed: its board address includes an arbitrary site name, so a "guess" would be
 a blind walk over hosts and site names inside a discovery run, and a Workday target enters
 the plan only through an actual resolution, which reaches it as the `source` row the resolve
@@ -491,9 +514,10 @@ Implemented once in `infra/http`, used by every adapter:
 - User-Agent: `internship-applier/0.1 (+local personal job-search tool)`.
 - `robots.txt` fetched and cached per origin for every page fetch — the manual paste-a-URL
   path and the refresh URL check. Documented API endpoints opt out with `isDocumentedApi`,
-  which `fetchJson` defaults on; the two keyless feed adapters pass `isDocumentedApi: false`
-  and let each host answer for itself (§ Sourcing policy says which hosts say what, and
-  which endpoint is still opted out of a rule it should be held to).
+  which `fetchJson` defaults on; the two keyless feed adapters and the SmartRecruiters board
+  adapter pass `isDocumentedApi: false` and let each host answer for itself (§ Sourcing
+  policy says which hosts say what). The SmartRecruiters company probe in
+  `resolveCompany.ts` asks too, through its own `asksRobots` flag.
   A disallowed path raises a 403, which surfaces in the run summary rather than being
   silently skipped. `Allow:` is deliberately unimplemented: ignoring one can only make this
   refuse a fetch it could have made, which is the direction to be wrong in. A robots.txt

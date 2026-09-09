@@ -473,8 +473,20 @@ describe('pinned companies', () => {
     expect(sources).toContain('greenhouse');
     expect(sources).toContain('lever');
     expect(sources).toContain('ashby');
-    expect(sources).toContain('smartrecruiters');
     expect(sources).toContain('workable');
+    /**
+     * NOT SmartRecruiters, and the note has to say why.
+     *
+     * `api.smartrecruiters.com` answers `User-agent: * / Disallow: /`, the adapter honours
+     * that, so a guessed target there can only ever come back refused — and planning one
+     * would put "This search was not complete" on every run that pins any company, about a
+     * source that cannot contribute. Silently dropping it would be its own bug: a user who
+     * pinned a company that really does hire through SmartRecruiters needs to be told to go
+     * and paste a URL, not left to conclude the company has nothing open.
+     */
+    expect(sources).not.toContain('smartrecruiters');
+    expect(plan.notes.join(' ')).toMatch(/SmartRecruiters is not guessed at all/);
+    expect(plan.notes.join(' ')).toMatch(/paste a job URL/);
     expect(plan.notes.join(' ')).toMatch(/no resolved board yet/i);
   });
 
@@ -509,7 +521,9 @@ describe('pinned companies', () => {
       known,
       { maxTargets: 4 },
     );
-    expect(plan.targets.filter((t) => t.reason.startsWith('company you pinned'))).toHaveLength(5);
+    // Four, not five: Greenhouse, Lever, Ashby and Workable. SmartRecruiters is no longer
+    // guessed, because its host refuses this tool and a guess there could only ever refuse.
+    expect(plan.targets.filter((t) => t.reason.startsWith('company you pinned'))).toHaveLength(4);
     // The guesses and the defaults survive; the cap falls entirely on the known boards.
     expect(plan.targets.filter((t) => t.reason === 'known')).toHaveLength(0);
     expect(plan.notes.join(' ')).toMatch(/\d+ targets did not fit the cap of \d+/);

@@ -20,6 +20,7 @@ import {
 } from '../normalize';
 import {
   decodeEntities,
+  robotsRefusal,
   stripHtml,
   type JobSource,
   type NormalizedPosting,
@@ -1129,7 +1130,18 @@ export const smartrecruiters: JobSource = {
         for (let offset = 0; ; offset += SR_PAGE) {
           const data = await fetchJson<{ totalFound?: unknown; content?: unknown }>(
             `${listBase}?limit=${SR_PAGE}&offset=${offset}&q=${encodeURIComponent(term)}`,
-            { rps: 2, timeoutMs: 15_000 },
+            // isDocumentedApi: false, so api.smartrecruiters.com's own robots.txt decides
+            // whether this runs — the same rule the Remotive adapter follows, and the reason
+            // it exists. That file reads `User-agent: LinkedInBot / Allow: /v1/companies/`
+            // and then `User-agent: * / Disallow: /`: the one path this adapter uses is
+            // allowed, and allowed to somebody else. An Allow scoped to a named bot is an
+            // allowlist, and this tool is not on it.
+            //
+            // It was read anyway for a long time, and nobody decided that: `fetchJson`
+            // defaults `isDocumentedApi` to true, and the adapter inherited the default while
+            // Remotive passed false. Two hosts said the same thing and got opposite answers
+            // depending on which default an adapter happened to take.
+            { rps: 2, timeoutMs: 15_000, isDocumentedApi: false },
           );
           const drift = wrongShape('smartrecruiters', data.content);
           if (drift) {
@@ -1156,6 +1168,17 @@ export const smartrecruiters: JobSource = {
           }
         }
       } catch (err) {
+        /**
+         * A refusal ends the whole source, not this one search.
+         *
+         * robots.txt answers for the origin, so the five searches after this one would each
+         * ask the same question and get the same no. Reporting it per-search would print the
+         * refusal six times and, worse, dress it as "these searches could not be read" —
+         * which says the board broke. It did not: this tool was asked not to read it, and
+         * that is a different sentence with a different thing for the student to do about it.
+         */
+        const refusal = robotsRefusal('smartrecruiters', err);
+        if (refusal !== null) return { postings: [], notes: [], gaps: [refusal] };
         firstError ??= err;
         unreadable.push(term);
       }
@@ -1263,9 +1286,14 @@ export const smartrecruiters: JobSource = {
     for (const r of toFetch) {
       const id = idOf(r.id)!;
       try {
+        // Same host, same answer, so the same rule as the list walk above. Reaching here at
+        // all means robots allowed the walk, but the flag belongs on every call to the origin
+        // rather than on the ones somebody remembered — a default that decides politeness is
+        // exactly what put this adapter on the wrong side of it.
         const detail = await fetchJson<unknown>(`${listBase}/${encodeURIComponent(id)}`, {
           rps: 2,
           timeoutMs: 15_000,
+          isDocumentedApi: false,
         });
         if (isRow(detail)) details.set(id, detail as SrDetail);
         else unreadableDetails++;

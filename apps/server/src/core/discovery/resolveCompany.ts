@@ -16,6 +16,7 @@
  */
 import type { SourceKind } from '@ia/shared';
 import { fetchJson, HttpError } from '../../infra/http/fetcher';
+import { robotsRefusal } from './sources/types';
 import { logger } from '../../infra/logger';
 
 /**
@@ -118,6 +119,20 @@ const PROBES: Array<{
   source: ResolvedVendor;
   url: (slug: string) => string;
   read: (data: unknown) => ProbeAnswer;
+  /**
+   * Ask this host's robots.txt before probing it.
+   *
+   * Only SmartRecruiters, because it is the only one of these that says no:
+   * `api.smartrecruiters.com` answers `User-agent: * / Disallow: /`, its single
+   * `Allow: /v1/companies/` being scoped to LinkedInBot. The other four were asked under the
+   * agent string this tool sends and permit the paths used — `boards-api.greenhouse.io`
+   * disallows only `/embed/`, `api.lever.co` answers `Allow: /`, `apply.workable.com` an
+   * empty `Disallow:`, and `api.ashbyhq.com` 401s, which RFC 9309 and this repo both read as
+   * allow-all. Their flag is left alone rather than flipped on the strength of one reading:
+   * turning politeness on for a host that permits changes nothing today and quietly makes
+   * four more sources fail closed if one of those files ever changes shape.
+   */
+  asksRobots?: boolean;
 }> = [
   {
     source: 'greenhouse',
@@ -147,6 +162,7 @@ const PROBES: Array<{
     // 100 — the same wrong-number-shown-to-the-caller mistake the Lever comment above
     // records — while the true total rides along on a one-row page.
     url: (s) => `https://api.smartrecruiters.com/v1/companies/${s}/postings?limit=1`,
+    asksRobots: true,
     read: (d) => {
       const total = (d as { totalFound?: unknown } | null)?.totalFound;
       if (typeof total !== 'number') return { kind: 'unproven', note: null };
@@ -273,7 +289,11 @@ export async function resolveCompany(name: string): Promise<ResolveResult> {
   for (const slug of candidates) {
     for (const probe of PROBES) {
       try {
-        const data = await fetchJson<unknown>(probe.url(slug), { rps: 2, timeoutMs: 8000 });
+        const data = await fetchJson<unknown>(probe.url(slug), {
+          rps: 2,
+          timeoutMs: 8000,
+          isDocumentedApi: probe.asksRobots !== true,
+        });
         const answer = probe.read(data);
         if (answer.kind === 'board') {
           // A board that answered but has nothing posted today still answers the question
@@ -299,6 +319,21 @@ export async function resolveCompany(name: string): Promise<ResolveResult> {
           );
         }
       } catch (err) {
+        /**
+         * Being told not to look is not a failure, and must not be logged as one.
+         *
+         * With `asksRobots` on, a refusal arrives as the same 403 a broken host would send,
+         * and the branch below would file it under "company board probe failed" — a sentence
+         * about the vendor being unreachable, when the vendor is fine and this tool chose not
+         * to ask. It goes to `unproven` instead, which is the channel that already carries
+         * "no SmartRecruiters board is listed above for this name" to the user, so the reason
+         * reaches the screen rather than only the log.
+         */
+        const refusal = robotsRefusal(probe.source, err);
+        if (refusal !== null) {
+          unproven.set(probe.source, refusal);
+          continue;
+        }
         // A 404 is the ordinary answer to "does this company use this vendor?" and needs
         // no comment. Anything else — DNS failure, timeout, a 503, a rate limit that
         // outlasted the retries — means the vendor was never actually checked, and the

@@ -409,10 +409,13 @@ describe('docs/04 — job discovery, § Sourcing policy and § Normalization', (
    * Which adapters let robots.txt answer for the host, and which opt out of asking.
    *
    * § Sourcing policy makes three claims a reader would act on: that the two keyless feed
-   * adapters ask, that Remotive is refused when it does, and that SmartRecruiters is still
-   * reading a host whose robots.txt disallows every agent but LinkedInBot. The third is an
-   * admission, and an admission has to die with the bug it describes — if the adapter is
-   * fixed and this test goes red, the paragraph comes out rather than the assertion.
+   * adapters ask, that Remotive is refused when it does, and that SmartRecruiters asks too.
+   *
+   * The third used to be an ADMISSION — SmartRecruiters read a host whose robots.txt
+   * disallows every agent but LinkedInBot — and this test carried the instruction that an
+   * admission has to die with the bug it describes. It did: the adapter and the company probe
+   * both pass `isDocumentedApi: false` now, so the assertion below pins the fix instead of
+   * the confession, and the paragraph it guarded says the opposite of what it used to.
    *
    * The host files themselves cannot be checked here: a unit test that fetched robots.txt
    * would be a network test, and this suite has none. What is checkable is which side of
@@ -431,17 +434,23 @@ describe('docs/04 — job discovery, § Sourcing policy and § Normalization', (
 
     expect(asks).toContain('arbeitnow');
     expect(asks).toContain('remotive');
-    expect(FLAT_DOC04).toMatch(/the two keyless feed adapters pass `isDocumentedApi: false`/);
-    expect(asks.size).toBe(2);
+    expect(asks).toContain('smartrecruiters');
+    expect(FLAT_DOC04).toMatch(
+      /the two keyless feed adapters and the SmartRecruiters board\s+adapter pass `isDocumentedApi: false`/,
+    );
+    expect(asks.size).toBe(3);
 
     // The refusal is reported rather than thrown, which is what makes it a coverage gap the
     // student reads instead of a source error.
     expect(source).toMatch(/robotsRefusal\('remotive', err\)/);
     expect(FLAT_DOC04).toMatch(/Not actually read — its robots\.txt refuses us/);
 
-    // ...and the outstanding one. Remove the paragraph when this stops being true.
-    expect(asks.has('smartrecruiters')).toBe(false);
-    expect(FLAT_DOC04).toMatch(/\*\*SmartRecruiters is not yet held to that rule\.\*\*/);
+    // The refusal ends the source rather than each of its six searches, and the company
+    // probe records it as `unproven` rather than logging a vendor failure.
+    expect(source).toMatch(/robotsRefusal\('smartrecruiters', err\)/);
+    expect(read('apps/server/src/core/discovery/resolveCompany.ts')).toMatch(/asksRobots: true/);
+    expect(FLAT_DOC04).toMatch(/\*\*SmartRecruiters is now held to the same rule\.\*\*/);
+    expect(FLAT_DOC04).not.toMatch(/is not yet held to that rule/);
   });
 
   /**

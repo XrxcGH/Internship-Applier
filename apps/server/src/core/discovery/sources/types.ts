@@ -1,4 +1,5 @@
 import type { SourceKind } from '@ia/shared';
+import { HttpError } from '../../../infra/http/fetcher';
 
 /** A posting as it comes off a source, before eligibility or scoring. */
 export interface NormalizedPosting {
@@ -359,4 +360,32 @@ function findTag(html: string, tag: string, from: number): number {
     if (html.slice(at, at + tag.length).toLowerCase() === tag) return at;
   }
   return -1;
+}
+
+/**
+ * Whether a failed fetch is robots.txt refusing us, put into words for the student.
+ *
+ * Lives here rather than beside one adapter because three sources now need it: Remotive,
+ * whose feed the host disallows, and the SmartRecruiters board adapter and company probe,
+ * which read a host answering `User-agent: * / Disallow: /`. A second copy is how the two
+ * would come to word the same refusal differently.
+ *
+ * politeFetch raises both robots outcomes as a 403 — the path is disallowed, or the file
+ * could not be read and so nothing may be assumed — and a 403 the server itself sent is
+ * also a 403, so the message is what separates them. Returning null for anything else lets
+ * a real HTTP failure travel on to the runner's own error handling, which already reports
+ * it; only the robots case needs saying differently, because "we chose not to ask" is not
+ * the same story as "we asked and it broke".
+ */
+export function robotsRefusal(source: string, err: unknown): string | null {
+  if (!(err instanceof HttpError) || err.status !== 403) return null;
+  if (!/robots\.txt/i.test(err.message)) return null;
+  if (/disallow/i.test(err.message)) {
+    return (
+      `${source}: not read. This site's robots.txt asks automated clients to stay off the ` +
+      'address this source uses, and this tool does what a site asks, so nothing from it is ' +
+      'in these results. You can search the site yourself and paste a job URL directly.'
+    );
+  }
+  return `${source}: not read this run. ${err.message}`;
 }
